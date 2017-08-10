@@ -11,12 +11,12 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Matt Tracy (matt@cockroachlabs.com)
 
 package sql
 
 import (
+	"golang.org/x/net/context"
+
 	"github.com/cockroachdb/cockroach/pkg/internal/client"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
@@ -39,25 +39,49 @@ var _ sqlutil.InternalExecutor = InternalExecutor{}
 // ExecuteStatementInTransaction executes the supplied SQL statement as part of
 // the supplied transaction. Statements are currently executed as the root user.
 func (ie InternalExecutor) ExecuteStatementInTransaction(
-	opName string, txn *client.Txn, statement string, qargs ...interface{},
+	ctx context.Context, opName string, txn *client.Txn, statement string, qargs ...interface{},
 ) (int, error) {
 	p := makeInternalPlanner(opName, txn, security.RootUser, ie.LeaseManager.memMetrics)
 	defer finishInternalPlanner(p)
-	p.leaseMgr = ie.LeaseManager
-	return p.exec(statement, qargs...)
+	p.session.tables.leaseMgr = ie.LeaseManager
+	return p.exec(ctx, statement, qargs...)
+}
+
+// QueryRowInTransaction executes the supplied SQL statement as part of the
+// supplied transaction and returns the result. Statements are currently
+// executed as the root user.
+func (ie InternalExecutor) QueryRowInTransaction(
+	ctx context.Context, opName string, txn *client.Txn, statement string, qargs ...interface{},
+) (parser.Datums, error) {
+	p := makeInternalPlanner(opName, txn, security.RootUser, ie.LeaseManager.memMetrics)
+	defer finishInternalPlanner(p)
+	p.session.tables.leaseMgr = ie.LeaseManager
+	return p.QueryRow(ctx, statement, qargs...)
+}
+
+// QueryRowsInTransaction executes the supplied SQL statement as part of the
+// supplied transaction and returns the resulting rows. Statements are currently
+// executed as the root user.
+func (ie InternalExecutor) QueryRowsInTransaction(
+	ctx context.Context, opName string, txn *client.Txn, statement string, qargs ...interface{},
+) ([]parser.Datums, error) {
+	p := makeInternalPlanner(opName, txn, security.RootUser, ie.LeaseManager.memMetrics)
+	defer finishInternalPlanner(p)
+	p.session.tables.leaseMgr = ie.LeaseManager
+	return p.queryRows(ctx, statement, qargs...)
 }
 
 // GetTableSpan gets the key span for a SQL table, including any indices.
 func (ie InternalExecutor) GetTableSpan(
-	user string, txn *client.Txn, dbName, tableName string,
+	ctx context.Context, user string, txn *client.Txn, dbName, tableName string,
 ) (roachpb.Span, error) {
 	// Lookup the table ID.
 	p := makeInternalPlanner("get-table-span", txn, user, ie.LeaseManager.memMetrics)
 	defer finishInternalPlanner(p)
-	p.leaseMgr = ie.LeaseManager
+	p.session.tables.leaseMgr = ie.LeaseManager
 
 	tn := parser.TableName{DatabaseName: parser.Name(dbName), TableName: parser.Name(tableName)}
-	tableID, err := getTableID(p, &tn)
+	tableID, err := getTableID(ctx, p, &tn)
 	if err != nil {
 		return roachpb.Span{}, err
 	}
@@ -70,7 +94,7 @@ func (ie InternalExecutor) GetTableSpan(
 }
 
 // getTableID retrieves the table ID for the specified table.
-func getTableID(p *planner, tn *parser.TableName) (sqlbase.ID, error) {
+func getTableID(ctx context.Context, p *planner, tn *parser.TableName) (sqlbase.ID, error) {
 	if err := tn.QualifyWithDatabase(p.session.Database); err != nil {
 		return 0, err
 	}
@@ -83,19 +107,19 @@ func getTableID(p *planner, tn *parser.TableName) (sqlbase.ID, error) {
 		return virtual.GetID(), nil
 	}
 
-	dbID, err := p.getDatabaseID(tn.Database())
+	dbID, err := p.session.tables.databaseCache.getDatabaseID(ctx, p.txn, p.getVirtualTabler(), tn.Database())
 	if err != nil {
 		return 0, err
 	}
 
 	nameKey := tableKey{dbID, tn.Table()}
 	key := nameKey.Key()
-	gr, err := p.txn.Get(key)
+	gr, err := p.txn.Get(ctx, key)
 	if err != nil {
 		return 0, err
 	}
 	if !gr.Exists() {
-		return 0, sqlbase.NewUndefinedTableError(parser.AsString(tn))
+		return 0, sqlbase.NewUndefinedRelationError(tn)
 	}
 	return sqlbase.ID(gr.ValueInt()), nil
 }

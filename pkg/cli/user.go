@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Marc Berhault (marc@cockroachlabs.com)
 
 package cli
 
@@ -22,6 +20,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/cockroachdb/cockroach/pkg/security"
+	"github.com/cockroachdb/cockroach/pkg/sql"
 )
 
 var password bool
@@ -33,8 +32,7 @@ var getUserCmd = &cobra.Command{
 	Long: `
 Fetches and displays the user for <username>.
 `,
-	SilenceUsage: true,
-	RunE:         MaybeDecorateGRPCError(runGetUser),
+	RunE: MaybeDecorateGRPCError(runGetUser),
 }
 
 func runGetUser(cmd *cobra.Command, args []string) error {
@@ -47,7 +45,7 @@ func runGetUser(cmd *cobra.Command, args []string) error {
 	}
 	defer conn.Close()
 	return runQueryAndFormatResults(conn, os.Stdout,
-		makeQuery(`SELECT * FROM system.users WHERE username=$1`, args[0]), cliCtx.prettyFmt)
+		makeQuery(`SELECT * FROM system.users WHERE username=$1`, args[0]))
 }
 
 // A lsUsersCmd command displays a list of users.
@@ -57,8 +55,7 @@ var lsUsersCmd = &cobra.Command{
 	Long: `
 List all users.
 `,
-	SilenceUsage: true,
-	RunE:         MaybeDecorateGRPCError(runLsUsers),
+	RunE: MaybeDecorateGRPCError(runLsUsers),
 }
 
 func runLsUsers(cmd *cobra.Command, args []string) error {
@@ -71,7 +68,7 @@ func runLsUsers(cmd *cobra.Command, args []string) error {
 	}
 	defer conn.Close()
 	return runQueryAndFormatResults(conn, os.Stdout,
-		makeQuery(`SELECT username FROM system.users`), cliCtx.prettyFmt)
+		makeQuery(`SELECT username FROM system.users`))
 }
 
 // A rmUserCmd command removes the user for the specified username.
@@ -81,8 +78,7 @@ var rmUserCmd = &cobra.Command{
 	Long: `
 Remove an existing user by username.
 `,
-	SilenceUsage: true,
-	RunE:         MaybeDecorateGRPCError(runRmUser),
+	RunE: MaybeDecorateGRPCError(runRmUser),
 }
 
 func runRmUser(cmd *cobra.Command, args []string) error {
@@ -95,7 +91,7 @@ func runRmUser(cmd *cobra.Command, args []string) error {
 	}
 	defer conn.Close()
 	return runQueryAndFormatResults(conn, os.Stdout,
-		makeQuery(`DELETE FROM system.users WHERE username=$1`, args[0]), cliCtx.prettyFmt)
+		makeQuery(`DELETE FROM system.users WHERE username=$1`, args[0]))
 }
 
 // A setUserCmd command creates a new or updates an existing user.
@@ -105,9 +101,12 @@ var setUserCmd = &cobra.Command{
 	Long: `
 Create or update a user for the specified username, prompting
 for the password.
+
+Valid usernames contain 1 to 63 alphanumeric characters. They must
+begin with either a letter or an underscore. Subsequent characters
+may be letters, numbers, or underscores.
 `,
-	SilenceUsage: true,
-	RunE:         MaybeDecorateGRPCError(runSetUser),
+	RunE: MaybeDecorateGRPCError(runSetUser),
 }
 
 // runSetUser prompts for a password, then inserts the user and hash
@@ -119,10 +118,13 @@ func runSetUser(cmd *cobra.Command, args []string) error {
 		return usageAndError(cmd)
 	}
 	var err error
+	var username string
+	if username, err = sql.NormalizeAndValidateUsername(args[0]); err != nil {
+		return err
+	}
 	var hashed []byte
 	if password {
-		hashed, err = security.PromptForPasswordAndHash()
-		if err != nil {
+		if hashed, err = security.PromptForPasswordAndHash(); err != nil {
 			return err
 		}
 	}
@@ -135,7 +137,7 @@ func runSetUser(cmd *cobra.Command, args []string) error {
 	// TODO(asubiotto): Implement appropriate server-side authorization rules
 	// for users to be able to change their own passwords.
 	return runQueryAndFormatResults(conn, os.Stdout,
-		makeQuery(`UPSERT INTO system.users VALUES ($1, $2)`, args[0], hashed), cliCtx.prettyFmt)
+		makeQuery(`UPSERT INTO system.users VALUES ($1, $2)`, username, hashed))
 }
 
 var userCmds = []*cobra.Command{

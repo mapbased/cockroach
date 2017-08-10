@@ -11,14 +11,14 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Tobias Schottdorf
 
 package log
 
 import (
 	"fmt"
+	"io"
 	"net/http"
+	"strings"
 
 	"golang.org/x/net/context"
 )
@@ -50,28 +50,6 @@ func FatalOnPanic() {
 	}
 }
 
-// EnableLogFileOutput turns on logging using the specified directory.
-// For unittesting only.
-func EnableLogFileOutput(dir string) error {
-	logging.mu.Lock()
-	defer logging.mu.Unlock()
-	logging.toStderr = false
-	logging.stderrThreshold = Severity_INFO
-	return logDir.Set(dir)
-}
-
-// DisableLogFileOutput turns off logging. For unittesting only.
-func DisableLogFileOutput() {
-	logging.mu.Lock()
-	defer logging.mu.Unlock()
-	if err := logging.removeFilesLocked(); err != nil {
-		logging.exit(err)
-	}
-	logDir.clear()
-	logging.toStderr = true
-	logging.stderrThreshold = Severity_NONE
-}
-
 // SetExitFunc allows setting a function that will be called to exit the
 // process when a Fatal message is generated.
 func SetExitFunc(f func(int)) {
@@ -86,6 +64,16 @@ func SetExitFunc(f func(int)) {
 func logDepth(ctx context.Context, depth int, sev Severity, format string, args []interface{}) {
 	// TODO(tschottdorf): logging hooks should have their entry point here.
 	addStructured(ctx, sev, depth+1, format, args)
+}
+
+// Shout logs to the specified severity's log, and also to the real
+// stderr if logging is currently redirected to a file.
+func Shout(ctx context.Context, sev Severity, args ...interface{}) {
+	logDepth(ctx, 1, sev, "", args)
+	if stderrRedirected {
+		fmt.Fprintf(OrigStderr, "*\n* %s: %s\n*\n", sev.String(),
+			strings.Replace(MakeMessage(ctx, "", args), "\n", "\n* ", -1))
+	}
 }
 
 // Infof logs to the INFO log.
@@ -195,4 +183,12 @@ func FatalfDepth(ctx context.Context, depth int, format string, args ...interfac
 // higher.
 func V(level level) bool {
 	return VDepth(level, 1)
+}
+
+// Format writes the log entry to the specified writer.
+func (e Entry) Format(w io.Writer) error {
+	buf := formatLogEntry(e, nil, nil)
+	defer logging.putBuffer(buf)
+	_, err := w.Write(buf.Bytes())
+	return err
 }

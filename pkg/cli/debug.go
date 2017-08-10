@@ -12,23 +12,25 @@
 // implied. See the License for the specific language governing
 // permissions and limitations under the License. See the AUTHORS file
 // for names of contributors.
-//
-// Author: Ben Darnell
 
 package cli
 
 import (
 	"bytes"
-	"errors"
 	"fmt"
+	"os"
+	"sort"
 	"strconv"
+	"strings"
 
 	"golang.org/x/net/context"
 
 	"github.com/cockroachdb/cockroach/pkg/config"
+	"github.com/cockroachdb/cockroach/pkg/gossip"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/server"
+	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/storage/engine"
 	"github.com/cockroachdb/cockroach/pkg/storage/engine/enginepb"
@@ -38,9 +40,12 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
+	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"github.com/coreos/etcd/raft/raftpb"
+	"github.com/gogo/protobuf/jsonpb"
 	"github.com/gogo/protobuf/proto"
 	"github.com/kr/pretty"
+	"github.com/pkg/errors"
 	"github.com/spf13/cobra"
 )
 
@@ -72,11 +77,12 @@ func openStore(cmd *cobra.Command, dir string, stopper *stop.Stopper) (*engine.R
 		return nil, err
 	}
 	db, err := engine.NewRocksDB(
-		roachpb.Attributes{},
-		dir,
+		engine.RocksDBConfig{
+			RocksDBSettings: serverCfg.Settings.RocksDBSettings,
+			Dir:             dir,
+			MaxOpenFiles:    maxOpenFiles,
+		},
 		cache,
-		0,
-		maxOpenFiles,
 	)
 	if err != nil {
 		return nil, err
@@ -95,7 +101,7 @@ func printKey(kv engine.MVCCKeyValue) (bool, error) {
 }
 
 func printKeyValue(kv engine.MVCCKeyValue) (bool, error) {
-	if kv.Key.Timestamp != hlc.ZeroTimestamp {
+	if kv.Key.Timestamp != (hlc.Timestamp{}) {
 		fmt.Printf("%s %s: ", kv.Key.Timestamp, kv.Key.Key)
 	} else {
 		fmt.Printf("%s: ", kv.Key.Key)
@@ -125,7 +131,7 @@ func printKeyValue(kv engine.MVCCKeyValue) (bool, error) {
 
 func runDebugKeys(cmd *cobra.Command, args []string) error {
 	stopper := stop.NewStopper()
-	defer stopper.Stop()
+	defer stopper.Stop(stopperContext(stopper))
 
 	if len(args) != 1 {
 		return errors.New("one argument required: dir")
@@ -157,7 +163,7 @@ state like the raft HardState. With --replicated, only includes data covered by
 
 func runDebugRangeData(cmd *cobra.Command, args []string) error {
 	stopper := stop.NewStopper()
-	defer stopper.Stop()
+	defer stopper.Stop(stopperContext(stopper))
 
 	if len(args) != 2 {
 		return errors.New("two arguments required: dir range_id")
@@ -179,7 +185,12 @@ func runDebugRangeData(cmd *cobra.Command, args []string) error {
 	}
 
 	iter := storage.NewReplicaDataIterator(&desc, db, debugCtx.replicated)
-	for ; iter.Valid(); iter.Next() {
+	for ; ; iter.Next() {
+		if ok, err := iter.Valid(); err != nil {
+			return err
+		} else if !ok {
+			break
+		}
 		if _, err := printKeyValue(engine.MVCCKeyValue{
 			Key:   iter.Key(),
 			Value: iter.Value(),
@@ -187,7 +198,7 @@ func runDebugRangeData(cmd *cobra.Command, args []string) error {
 			return err
 		}
 	}
-	return iter.Error()
+	return nil
 }
 
 var debugRangeDescriptorsCmd = &cobra.Command{
@@ -239,7 +250,7 @@ func tryTxn(kv engine.MVCCKeyValue) (string, error) {
 }
 
 func tryRangeIDKey(kv engine.MVCCKeyValue) (string, error) {
-	if kv.Key.Timestamp != hlc.ZeroTimestamp {
+	if kv.Key.Timestamp != (hlc.Timestamp{}) {
 		return "", fmt.Errorf("range ID keys shouldn't have timestamps: %s", kv.Key)
 	}
 	_, _, suffix, _, err := keys.DecodeRangeIDKey(kv.Key.Key)
@@ -359,7 +370,7 @@ func loadRangeDescriptor(
 ) (roachpb.RangeDescriptor, error) {
 	var desc roachpb.RangeDescriptor
 	handleKV := func(kv engine.MVCCKeyValue) (bool, error) {
-		if kv.Key.Timestamp == hlc.ZeroTimestamp {
+		if kv.Key.Timestamp == (hlc.Timestamp{}) {
 			// We only want values, not MVCCMetadata.
 			return false, nil
 		}
@@ -390,7 +401,7 @@ func loadRangeDescriptor(
 
 func runDebugRangeDescriptors(cmd *cobra.Command, args []string) error {
 	stopper := stop.NewStopper()
-	defer stopper.Stop()
+	defer stopper.Stop(stopperContext(stopper))
 
 	if len(args) != 1 {
 		return errors.New("one argument required: dir")
@@ -429,7 +440,7 @@ func tryRaftLogEntry(kv engine.MVCCKeyValue) (string, error) {
 				return "", err
 			}
 			ent.Data = nil
-			return fmt.Sprintf("%s by %s\n%s\n%s\n", &ent, cmd.OriginLease, cmd.BatchRequest, &cmd), nil
+			return fmt.Sprintf("%s by %s\n%s\n", &ent, cmd.ProposerLease, &cmd), nil
 		}
 		return fmt.Sprintf("%s: EMPTY\n", &ent), nil
 	} else if ent.Type == raftpb.EntryConfChange {
@@ -462,7 +473,7 @@ func printRaftLogEntry(kv engine.MVCCKeyValue) (bool, error) {
 
 func runDebugRaftLog(cmd *cobra.Command, args []string) error {
 	stopper := stop.NewStopper()
-	defer stopper.Stop()
+	defer stopper.Stop(stopperContext(stopper))
 
 	if len(args) != 2 {
 		return errors.New("two arguments required: dir range_id")
@@ -501,18 +512,21 @@ Uses a hard-coded GC policy with a 24 hour TTL for old versions.
 
 func runDebugGCCmd(cmd *cobra.Command, args []string) error {
 	stopper := stop.NewStopper()
-	defer stopper.Stop()
-
-	if len(args) != 1 {
-		return errors.New("one argument required: dir")
-	}
+	defer stopper.Stop(stopperContext(stopper))
 
 	var rangeID roachpb.RangeID
-	if len(args) == 2 {
+	switch len(args) {
+
+	}
+	switch len(args) {
+	case 2:
 		var err error
 		if rangeID, err = parseRangeID(args[1]); err != nil {
 			return err
 		}
+	case 1:
+	default:
+		return errors.New("arguments: dir [range_id]")
 	}
 
 	db, err := openStore(cmd, args[0], stopper)
@@ -587,7 +601,7 @@ type replicaCheckInfo struct {
 
 func runDebugCheckStoreCmd(cmd *cobra.Command, args []string) error {
 	stopper := stop.NewStopper()
-	defer stopper.Stop()
+	defer stopper.Stop(stopperContext(stopper))
 
 	if len(args) != 1 {
 		return errors.New("one required argument: dir")
@@ -669,6 +683,23 @@ func runDebugCheckStoreCmd(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
+var debugRocksDBCmd = &cobra.Command{
+	Use:   "rocksdb",
+	Short: "run the RocksDB 'ldb' tool",
+	Long: `
+Runs the RocksDB 'ldb' tool, which provides various subcommands for examining
+raw store data. 'cockroach debug rocksdb' accepts the same arguments and flags
+as 'ldb'.
+
+https://github.com/facebook/rocksdb/wiki/Administration-and-Data-Access-Tool#ldb-tool
+`,
+	// LDB does its own flag parsing.
+	DisableFlagParsing: true,
+	Run: func(cmd *cobra.Command, args []string) {
+		engine.RunLDB(args)
+	},
+}
+
 var debugEnvCmd = &cobra.Command{
 	Use:   "env",
 	Short: "output environment settings",
@@ -692,7 +723,7 @@ Compact the sstables in a store.
 
 func runDebugCompact(cmd *cobra.Command, args []string) error {
 	stopper := stop.NewStopper()
-	defer stopper.Stop()
+	defer stopper.Stop(stopperContext(stopper))
 
 	if len(args) != 1 {
 		return errors.New("one argument is required")
@@ -735,7 +766,7 @@ and TiB.
 
 func runDebugSSTables(cmd *cobra.Command, args []string) error {
 	stopper := stop.NewStopper()
-	defer stopper.Stop()
+	defer stopper.Stop(stopperContext(stopper))
 
 	if len(args) != 1 {
 		return errors.New("one argument is required")
@@ -750,6 +781,114 @@ func runDebugSSTables(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
+var debugGossipValuesCmd = &cobra.Command{
+	Use:   "gossip-values [directory]",
+	Short: "dump all the values in a node's gossip instance",
+	Long: `
+Pretty-prints the values in a node's gossip instance.
+
+Can connect to a running server to get the values or can be provided with
+a JSON file captured from a node's /_status/gossip/ debug endpoint.
+`,
+	RunE: MaybeDecorateGRPCError(runDebugGossipValues),
+}
+
+func runDebugGossipValues(cmd *cobra.Command, args []string) error {
+	// If a file is provided, use it. Otherwise, try talking to the running node.
+	var gossipInfo *gossip.InfoStatus
+	if debugCtx.inputFile != "" {
+		file, err := os.Open(debugCtx.inputFile)
+		if err != nil {
+			return err
+		}
+		defer file.Close()
+		gossipInfo = new(gossip.InfoStatus)
+		if err := jsonpb.Unmarshal(file, gossipInfo); err != nil {
+			return errors.Wrap(err, "failed to parse provided file as gossip.InfoStatus")
+		}
+	} else {
+		conn, _, stopper, err := getClientGRPCConn()
+		if err != nil {
+			return err
+		}
+		ctx := stopperContext(stopper)
+		defer stopper.Stop(ctx)
+
+		status := serverpb.NewStatusClient(conn)
+		gossipInfo, err = status.Gossip(ctx, &serverpb.GossipRequest{})
+		if err != nil {
+			return errors.Wrap(err, "failed to retrieve gossip from server")
+		}
+	}
+
+	output, err := parseGossipValues(gossipInfo)
+	if err != nil {
+		return err
+	}
+	fmt.Println(output)
+	return nil
+}
+
+func parseGossipValues(gossipInfo *gossip.InfoStatus) (string, error) {
+	var output []string
+	for key, info := range gossipInfo.Infos {
+		bytes, err := info.Value.GetBytes()
+		if err != nil {
+			return "", errors.Wrapf(err, "failed to extract bytes for key %q", key)
+		}
+		if key == gossip.KeyClusterID || key == gossip.KeySentinel {
+			clusterID, err := uuid.FromBytes(bytes)
+			if err != nil {
+				return "", errors.Wrapf(err, "failed to parse value for key %q", key)
+			}
+			output = append(output, fmt.Sprintf("%q: %v", key, clusterID))
+		} else if key == gossip.KeySystemConfig {
+			if debugCtx.printSystemConfig {
+				var config config.SystemConfig
+				if err := proto.Unmarshal(bytes, &config); err != nil {
+					return "", errors.Wrapf(err, "failed to parse value for key %q", key)
+				}
+				output = append(output, fmt.Sprintf("%q: %+v", key, config))
+			} else {
+				output = append(output, fmt.Sprintf("%q: omitted", key))
+			}
+		} else if key == gossip.KeyFirstRangeDescriptor {
+			var desc roachpb.RangeDescriptor
+			if err := proto.Unmarshal(bytes, &desc); err != nil {
+				return "", errors.Wrapf(err, "failed to parse value for key %q", key)
+			}
+			output = append(output, fmt.Sprintf("%q: %v", key, desc))
+		} else if gossip.IsNodeIDKey(key) {
+			var desc roachpb.NodeDescriptor
+			if err := proto.Unmarshal(bytes, &desc); err != nil {
+				return "", errors.Wrapf(err, "failed to parse value for key %q", key)
+			}
+			output = append(output, fmt.Sprintf("%q: %+v", key, desc))
+		} else if strings.HasPrefix(key, gossip.KeyStorePrefix) {
+			var desc roachpb.StoreDescriptor
+			if err := proto.Unmarshal(bytes, &desc); err != nil {
+				return "", errors.Wrapf(err, "failed to parse value for key %q", key)
+			}
+			output = append(output, fmt.Sprintf("%q: %+v", key, desc))
+		} else if strings.HasPrefix(key, gossip.KeyNodeLivenessPrefix) {
+			var liveness storage.Liveness
+			if err := proto.Unmarshal(bytes, &liveness); err != nil {
+				return "", errors.Wrapf(err, "failed to parse value for key %q", key)
+			}
+			output = append(output, fmt.Sprintf("%q: %+v", key, liveness))
+		} else if strings.HasPrefix(key, gossip.KeyDeadReplicasPrefix) {
+			var deadReplicas roachpb.StoreDeadReplicas
+			if err := proto.Unmarshal(bytes, &deadReplicas); err != nil {
+				return "", errors.Wrapf(err, "failed to parse value for key %q", key)
+			}
+			output = append(output, fmt.Sprintf("%q: %+v", key, deadReplicas))
+		}
+	}
+
+	sort.Strings(output)
+	return strings.Join(output, "\n"), nil
+}
+
 func init() {
 	debugCmd.AddCommand(debugCmds...)
 }
@@ -761,13 +900,13 @@ var debugCmds = []*cobra.Command{
 	debugRaftLogCmd,
 	debugGCCmd,
 	debugCheckStoreCmd,
+	debugRocksDBCmd,
 	debugCompactCmd,
 	debugSSTablesCmd,
-	kvCmd,
+	debugGossipValuesCmd,
 	rangeCmd,
 	debugEnvCmd,
-	backupCmd,
-	restoreCmd,
+	debugZipCmd,
 }
 
 var debugCmd = &cobra.Command{

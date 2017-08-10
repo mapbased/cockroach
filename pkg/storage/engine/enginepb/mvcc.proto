@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Tamir Duberstein (tamird@gmail.com)
 
 // Cannot be proto3 because we depend on absent-vs-empty distinction.
 syntax = "proto2";
@@ -33,6 +31,7 @@ enum IsolationType {
 
 // TxnMeta is the metadata of a Transaction record.
 message TxnMeta {
+  option (gogoproto.equal) = true;
   option (gogoproto.populate) = true;
 
   // id is a unique UUID value which identifies the transaction.
@@ -47,6 +46,13 @@ message TxnMeta {
   optional uint32 epoch = 4 [(gogoproto.nullable) = false];
   // The proposed timestamp for the transaction. This starts as
   // the current wall time on the txn coordinator.
+  // This is the timestamp at which all of the transaction's writes are
+  // performed: even if intents have been laid down at different timestamps,
+  // the process of resolving them (e.g. when the txn commits) will bump them to
+  // this timestamp. SERIALIZABLE transactions only commit when timestamp ==
+  // orig_timestamp. SNAPSHOT transactions can commit even when they've
+  // performed their reads (at orig_timestamp) at a different timestamp than
+  // their writes (at timestamp).
   optional util.hlc.Timestamp timestamp = 5 [(gogoproto.nullable) = false];
   optional int32 priority = 6 [(gogoproto.nullable) = false];
   // A one-indexed sequence number which is increased on each batch
@@ -111,6 +117,7 @@ message MVCCMetadata {
 // so that it can predict its own impact on the size of the system-local
 // kv-pairs.
 message MVCCStats {
+  option (gogoproto.equal) = true;
   option (gogoproto.populate) = true;
 
   // contains_estimates indicates that the MVCCStats object contains values
@@ -129,13 +136,12 @@ message MVCCStats {
   // data included in key_bytes and val_bytes, but not live_bytes).
   // See the comment on MVCCStats.
   optional sfixed64 gc_bytes_age = 3 [(gogoproto.nullable) = false, (gogoproto.customname) = "GCBytesAge"];
-
   // live_bytes is the number of bytes stored in keys and values which can in
-  // principle be read by means of a Scan or Get, including intents but not
-  // deletion tombstones (or their intents). Note that the size of the meta kv
-  // pair (which could be explicit or implicit) is included in this.
-  // Only the meta kv pair counts for the actual length of the encoded key
-  // (regular pairs only count the timestamp suffix).
+  // principle be read by means of a Scan or Get in the far future, including
+  // intents but not deletion tombstones (or their intents). Note that the
+  // size of the meta kv pair (which could be explicit or implicit) is
+  // included in this. Only the meta kv pair counts for the actual length of
+  // the encoded key (regular pairs only count the timestamp suffix).
   optional sfixed64 live_bytes = 4 [(gogoproto.nullable) = false];
   // live_count is the number of meta keys tracked under live_bytes.
   optional sfixed64 live_count = 5 [(gogoproto.nullable) = false];

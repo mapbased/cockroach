@@ -11,14 +11,14 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Marc Berhault (marc@cockroachlabs.com)
 
 package parser
 
 import (
 	"reflect"
 	"testing"
+
+	"golang.org/x/net/context"
 
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 )
@@ -30,15 +30,15 @@ func TestUnresolvedNameString(t *testing.T) {
 	}{
 		{"*", `"*"`},
 		// Non-reserved keyword.
-		{"DATABASE", `DATABASE`},
-		{"dAtAbAse", `dAtAbAse`},
+		{"DATABASE", `"DATABASE"`},
+		{"dAtAbAse", `"dAtAbAse"`},
 		// Reserved keyword.
 		{"SELECT", `"SELECT"`},
 		{"sElEcT", `"sElEcT"`},
 		// Ident format: starts with [a-zA-Z_] or extended ascii,
 		// and is then followed by [a-zA-Z0-9$_] or extended ascii.
 		{"foo$09", "foo$09"},
-		{"_Ab10", "_Ab10"},
+		{"_Ab10", `"_Ab10"`},
 		// Everything else quotes the string and escapes double quotes.
 		{".foobar", `".foobar"`},
 		{`".foobar"`, `""".foobar"""`},
@@ -76,7 +76,7 @@ func TestNormalizeNameInExpr(t *testing.T) {
 	}
 
 	for _, tc := range testCases {
-		stmt, err := ParseOneTraditional("SELECT " + tc.in)
+		stmt, err := ParseOne("SELECT " + tc.in)
 		if err != nil {
 			t.Fatalf("%s: %v", tc.in, err)
 		}
@@ -150,9 +150,10 @@ func TestExprString(t *testing.T) {
 		`(a OR (g BETWEEN (h+i) AND (j+k))) AND b`,
 		`(1 >= 2) IS OF (BOOL)`,
 		`(1 >= 2) = (2 IS OF (BOOL))`,
+		`count(1) FILTER (WHERE true)`,
 	}
 	for _, exprStr := range testExprs {
-		expr, err := ParseExprTraditional(exprStr)
+		expr, err := ParseExpr(exprStr)
 		if err != nil {
 			t.Fatalf("%s: %v", exprStr, err)
 		}
@@ -162,7 +163,7 @@ func TestExprString(t *testing.T) {
 		}
 		// str may differ than exprStr (we may be adding some parens).
 		str := typedExpr.String()
-		expr2, err := ParseExprTraditional(str)
+		expr2, err := ParseExpr(str)
 		if err != nil {
 			t.Fatalf("%s: %v", exprStr, err)
 		}
@@ -177,7 +178,8 @@ func TestExprString(t *testing.T) {
 			t.Errorf("Print/parse/print cycle changes the string: `%s` vs `%s`", str, str2)
 		}
 		// Compare the normalized expressions.
-		ctx := &EvalContext{}
+		ctx := NewTestingEvalContext()
+		defer ctx.Mon.Stop(context.Background())
 		normalized, err := ctx.NormalizeExpr(typedExpr)
 		if err != nil {
 			t.Fatalf("%s: %v", exprStr, err)
@@ -207,7 +209,7 @@ func TestStripParens(t *testing.T) {
 		{`((1) + (2))`, `(1) + (2)`},
 	}
 	for i, test := range testExprs {
-		expr, err := ParseExprTraditional(test.in)
+		expr, err := ParseExpr(test.in)
 		if err != nil {
 			t.Fatalf("%d: %v", i, err)
 		}

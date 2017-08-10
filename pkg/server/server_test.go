@@ -11,15 +11,15 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Andrew Bonventre (andybons@gmail.com)
 
 package server
 
 import (
 	"bytes"
 	"compress/gzip"
+	"fmt"
 	"io"
+	"io/ioutil"
 	"net"
 	"net/http"
 	"net/url"
@@ -34,7 +34,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/config"
 	"github.com/cockroachdb/cockroach/pkg/internal/client"
 	"github.com/cockroachdb/cockroach/pkg/keys"
-	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
@@ -45,10 +44,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/httputil"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
-	"github.com/cockroachdb/cockroach/pkg/util/log"
-	"github.com/cockroachdb/cockroach/pkg/util/metric"
-	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/gogo/protobuf/jsonpb"
+	"github.com/pkg/errors"
 )
 
 var nodeTestBaseContext = testutils.NewNodeTestBaseContext()
@@ -61,7 +58,7 @@ func TestSelfBootstrap(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer s.Stopper().Stop()
+	defer s.Stopper().Stop(context.TODO())
 }
 
 // TestServerStartClock tests that a server's clock is not pushed out of thin
@@ -82,7 +79,7 @@ func TestServerStartClock(t *testing.T) {
 		},
 	}
 	s, _, _ := serverutils.StartServer(t, params)
-	defer s.Stopper().Stop()
+	defer s.Stopper().Stop(context.TODO())
 
 	// Run a command so that we are sure to touch the timestamp cache. This is
 	// actually not needed because other commands run during server
@@ -114,16 +111,16 @@ func TestPlainHTTPServer(t *testing.T) {
 		// The default context uses embedded certs.
 		Insecure: true,
 	})
-	defer s.Stopper().Stop()
+	defer s.Stopper().Stop(context.TODO())
 
-	var data serverpb.HealthResponse
+	var data serverpb.JSONResponse
 	testutils.SucceedsSoon(t, func() error {
-		return getAdminJSONProto(s, "health", &data)
+		return getStatusJSONProto(s, "metrics/local", &data)
 	})
 
 	ctx := s.RPCContext()
 	ctx.Insecure = false
-	if err := getAdminJSONProto(s, "health", &data); !testutils.IsError(err, "http: server gave HTTP response to HTTPS client") {
+	if err := getStatusJSONProto(s, "metrics/local", &data); !testutils.IsError(err, "http: server gave HTTP response to HTTPS client") {
 		t.Fatalf("unexpected error %v", err)
 	}
 }
@@ -131,12 +128,16 @@ func TestPlainHTTPServer(t *testing.T) {
 func TestSecureHTTPRedirect(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
-	defer s.Stopper().Stop()
+	defer s.Stopper().Stop(context.TODO())
 	ts := s.(*TestServer)
 
 	httpClient, err := s.GetHTTPClient()
 	if err != nil {
 		t.Fatal(err)
+	}
+	// Avoid automatically following redirects.
+	httpClient.CheckRedirect = func(_ *http.Request, _ []*http.Request) error {
+		return http.ErrUseLastResponse
 	}
 
 	origURL := "http://" + ts.Cfg.HTTPAddr
@@ -171,13 +172,13 @@ func TestSecureHTTPRedirect(t *testing.T) {
 	}
 }
 
-// TestAcceptEncoding hits the health endpoint while explicitly
-// disabling decompression on a custom client's Transport and setting
-// it conditionally via the request's Accept-Encoding headers.
+// TestAcceptEncoding hits the server while explicitly disabling
+// decompression on a custom client's Transport and setting it
+// conditionally via the request's Accept-Encoding headers.
 func TestAcceptEncoding(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
-	defer s.Stopper().Stop()
+	defer s.Stopper().Stop(context.TODO())
 	client, err := s.GetHTTPClient()
 	if err != nil {
 		t.Fatal(err)
@@ -203,7 +204,7 @@ func TestAcceptEncoding(t *testing.T) {
 		},
 	}
 	for _, d := range testData {
-		req, err := http.NewRequest("GET", s.AdminURL()+adminPrefix+"health", nil)
+		req, err := http.NewRequest("GET", s.AdminURL()+statusPrefix+"metrics/local", nil)
 		if err != nil {
 			t.Fatalf("could not create request: %s", err)
 		}
@@ -219,7 +220,7 @@ func TestAcceptEncoding(t *testing.T) {
 			t.Fatalf("unexpected content encoding: '%s' != '%s'", ce, d.acceptEncoding)
 		}
 		r := d.newReader(resp.Body)
-		var data serverpb.HealthResponse
+		var data serverpb.JSONResponse
 		if err := jsonpb.Unmarshal(r, &data); err != nil {
 			t.Error(err)
 		}
@@ -230,27 +231,12 @@ func TestAcceptEncoding(t *testing.T) {
 // ranges are carried out properly.
 func TestMultiRangeScanDeleteRange(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
-	defer s.Stopper().Stop()
+	s, _, db := serverutils.StartServer(t, base.TestServerArgs{})
+	defer s.Stopper().Stop(context.TODO())
 	ts := s.(*TestServer)
-	retryOpts := base.DefaultRetryOptions()
-	retryOpts.Closer = ts.stopper.ShouldQuiesce()
-	ds := kv.NewDistSender(kv.DistSenderConfig{
-		Clock:           s.Clock(),
-		RPCContext:      s.RPCContext(),
-		RPCRetryOptions: &retryOpts,
-	}, ts.Gossip())
-	ambient := log.AmbientContext{Tracer: tracing.NewTracer()}
-	tds := kv.NewTxnCoordSender(
-		ambient,
-		ds,
-		s.Clock(),
-		ts.Cfg.Linearizable,
-		ts.stopper,
-		kv.MakeTxnMetrics(metric.TestSampleInterval),
-	)
+	tds := db.GetSender()
 
-	if err := ts.node.storeCfg.DB.AdminSplit(context.TODO(), "m"); err != nil {
+	if err := ts.node.storeCfg.DB.AdminSplit(context.TODO(), "m", "m"); err != nil {
 		t.Fatal(err)
 	}
 	writes := []roachpb.Key{roachpb.Key("a"), roachpb.Key("z")}
@@ -303,7 +289,7 @@ func TestMultiRangeScanDeleteRange(t *testing.T) {
 	}
 
 	scan := roachpb.NewScan(writes[0], writes[len(writes)-1].Next())
-	txn := &roachpb.Transaction{Name: "MyTxn"}
+	txn := roachpb.NewTransaction("MyTxn", nil, 0, 0, s.Clock().Now(), 0)
 	reply, err = client.SendWrappedWith(context.Background(), tds, roachpb.Header{Txn: txn}, scan)
 	if err != nil {
 		t.Fatal(err)
@@ -333,28 +319,13 @@ func TestMultiRangeScanWithMaxResults(t *testing.T) {
 	}
 
 	for i, tc := range testCases {
-		s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
-		defer s.Stopper().Stop()
+		s, _, db := serverutils.StartServer(t, base.TestServerArgs{})
+		defer s.Stopper().Stop(context.TODO())
 		ts := s.(*TestServer)
-		retryOpts := base.DefaultRetryOptions()
-		retryOpts.Closer = ts.stopper.ShouldQuiesce()
-		ds := kv.NewDistSender(kv.DistSenderConfig{
-			Clock:           s.Clock(),
-			RPCContext:      s.RPCContext(),
-			RPCRetryOptions: &retryOpts,
-		}, ts.Gossip())
-		ambient := log.AmbientContext{Tracer: tracing.NewTracer()}
-		tds := kv.NewTxnCoordSender(
-			ambient,
-			ds,
-			ts.Clock(),
-			ts.Cfg.Linearizable,
-			ts.stopper,
-			kv.MakeTxnMetrics(metric.TestSampleInterval),
-		)
+		tds := db.GetSender()
 
 		for _, sk := range tc.splitKeys {
-			if err := ts.node.storeCfg.DB.AdminSplit(context.TODO(), sk); err != nil {
+			if err := ts.node.storeCfg.DB.AdminSplit(context.TODO(), sk, sk); err != nil {
 				t.Fatal(err)
 			}
 		}
@@ -390,8 +361,10 @@ func TestMultiRangeScanWithMaxResults(t *testing.T) {
 
 func TestSystemConfigGossip(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	t.Skip("#12351")
+
 	s, _, kvDB := serverutils.StartServer(t, base.TestServerArgs{})
-	defer s.Stopper().Stop()
+	defer s.Stopper().Stop(context.TODO())
 	ts := s.(*TestServer)
 	ctx := context.TODO()
 
@@ -411,93 +384,198 @@ func TestSystemConfigGossip(t *testing.T) {
 		t.Fatal("did not receive gossip message")
 	}
 
-	// Try a plain KV write first.
-	if err := kvDB.Put(ctx, key, valAt(0)); err != nil {
-		t.Fatal(err)
-	}
-
-	// Now do it as part of a transaction, but without the trigger set.
-	if err := kvDB.Txn(ctx, func(txn *client.Txn) error {
-		return txn.Put(key, valAt(1))
-	}); err != nil {
-		t.Fatal(err)
-	}
-
-	// Gossip channel should be dormant.
-	// TODO(tschottdorf): This test is likely flaky. Why can't some other
-	// process trigger gossip? It seems that a new range lease being
-	// acquired will gossip a new system config since the hash changed and fail
-	// the test (seen in practice during some buggy WIP).
-	var systemConfig config.SystemConfig
-	select {
-	case <-resultChan:
-		systemConfig, _ = ts.gossip.GetSystemConfig()
-		t.Fatalf("unexpected message received on gossip channel: %v", systemConfig)
-
-	case <-time.After(50 * time.Millisecond):
-	}
-
-	// This time mark the transaction as having a Gossip trigger.
-	if err := kvDB.Txn(ctx, func(txn *client.Txn) error {
-		txn.SetSystemConfigTrigger()
-		return txn.Put(key, valAt(2))
-	}); err != nil {
-		t.Fatal(err)
-	}
-
-	// New system config received.
-	select {
-	case <-resultChan:
-		systemConfig, _ = ts.gossip.GetSystemConfig()
-
-	case <-time.After(500 * time.Millisecond):
-		t.Fatal("did not receive gossip message")
-	}
-
-	// Now check the new config.
-	var val *roachpb.Value
-	for _, kv := range systemConfig.Values {
-		if bytes.Equal(key, kv.Key) {
-			val = &kv.Value
-			break
+	// Write a system key with the transaction marked as having a Gossip trigger.
+	if err := kvDB.Txn(ctx, func(ctx context.Context, txn *client.Txn) error {
+		if err := txn.SetSystemConfigTrigger(); err != nil {
+			return err
 		}
-	}
-	if val == nil {
-		t.Fatal("key not found in gossiped info")
-	}
-
-	// Make sure the returned value is valAt(2).
-	got := new(sqlbase.DatabaseDescriptor)
-	if err := val.GetProto(got); err != nil {
+		return txn.Put(ctx, key, valAt(2))
+	}); err != nil {
 		t.Fatal(err)
 	}
-	if expected := valAt(2); !reflect.DeepEqual(got, expected) {
-		t.Fatalf("mismatch: expected %+v, got %+v", *expected, *got)
-	}
-}
 
-func checkOfficialize(t *testing.T, network, oldAddrString, newAddrString, expAddrString string) {
-	resolvedAddr := util.NewUnresolvedAddr(network, newAddrString)
+	// This has to be wrapped in a SucceedSoon because system migrations on the
+	// testserver's startup can trigger system config updates without the key we
+	// wrote.
+	testutils.SucceedsSoon(t, func() error {
+		// New system config received.
+		var systemConfig config.SystemConfig
+		select {
+		case <-resultChan:
+			systemConfig, _ = ts.gossip.GetSystemConfig()
 
-	if unresolvedAddr, err := officialAddr(oldAddrString, resolvedAddr); err != nil {
-		t.Fatal(err)
-	} else if retAddrString := unresolvedAddr.String(); retAddrString != expAddrString {
-		t.Errorf("officialAddr(%s, %s) was %s; expected %s", oldAddrString, newAddrString, retAddrString, expAddrString)
-	}
+		case <-time.After(500 * time.Millisecond):
+			return errors.Errorf("did not receive gossip message")
+		}
+
+		// Now check the new config.
+		var val *roachpb.Value
+		for _, kv := range systemConfig.Values {
+			if bytes.Equal(key, kv.Key) {
+				val = &kv.Value
+				break
+			}
+		}
+		if val == nil {
+			return errors.Errorf("key not found in gossiped info")
+		}
+
+		// Make sure the returned value is valAt(2).
+		got := new(sqlbase.DatabaseDescriptor)
+		if err := val.GetProto(got); err != nil {
+			return err
+		}
+		if expected := valAt(2); !reflect.DeepEqual(got, expected) {
+			return errors.Errorf("mismatch: expected %+v, got %+v", *expected, *got)
+		}
+		return nil
+	})
 }
 
 func TestOfficializeAddr(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
-	hostname, err := os.Hostname()
+	host, err := os.Hostname()
+	if err != nil {
+		t.Fatal(err)
+	}
+	addrs, err := net.DefaultResolver.LookupHost(context.TODO(), host)
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	for _, network := range []string{"tcp", "tcp4", "tcp6"} {
-		checkOfficialize(t, network, "hellow.world:0", "127.0.0.1:1234", "hellow.world:1234")
-		checkOfficialize(t, network, "hellow.world:1234", "127.0.0.1:2345", "hellow.world:1234")
-		checkOfficialize(t, network, ":1234", "127.0.0.1:2345", net.JoinHostPort(hostname, "1234"))
-		checkOfficialize(t, network, ":0", "127.0.0.1:2345", net.JoinHostPort(hostname, "2345"))
+		t.Run(fmt.Sprintf("network=%s", network), func(t *testing.T) {
+			for _, tc := range []struct {
+				cfgAddr, lnAddr, expAddr string
+			}{
+				{"localhost:0", "127.0.0.1:1234", "localhost:1234"},
+				{"localhost:1234", "127.0.0.1:2345", "localhost:2345"},
+				{":1234", net.JoinHostPort(addrs[0], "2345"), net.JoinHostPort(host, "2345")},
+				{":0", net.JoinHostPort(addrs[0], "2345"), net.JoinHostPort(host, "2345")},
+			} {
+				t.Run(tc.cfgAddr, func(t *testing.T) {
+					lnAddr := util.NewUnresolvedAddr(network, tc.lnAddr)
+
+					if unresolvedAddr, err := officialAddr(context.TODO(), tc.cfgAddr, lnAddr, os.Hostname); err != nil {
+						t.Fatal(err)
+					} else if retAddrString := unresolvedAddr.String(); retAddrString != tc.expAddr {
+						t.Errorf("officialAddr(%s, %s) was %s; expected %s", tc.cfgAddr, tc.lnAddr, retAddrString, tc.expAddr)
+					}
+				})
+			}
+		})
 	}
+
+	osHostnameError := errors.New("some error")
+
+	t.Run("osHostnameError", func(t *testing.T) {
+		if _, err := officialAddr(
+			context.TODO(),
+			":0",
+			util.NewUnresolvedAddr("tcp", "0.0.0.0:1234"),
+			func() (string, error) { return "", osHostnameError },
+		); errors.Cause(err) != osHostnameError {
+			t.Fatalf("unexpected error %v", err)
+		}
+	})
+
+	t.Run("LookupHostError", func(t *testing.T) {
+		if _, err := officialAddr(
+			context.TODO(),
+			"notarealhost.local.:0",
+			util.NewUnresolvedAddr("tcp", "0.0.0.0:1234"),
+			os.Hostname,
+		); !testutils.IsError(err, "lookup notarealhost.local.(?: on .+)?: no such host") {
+			// On Linux but not on macOS, the error returned from
+			// (*net.Resolver).LookupHost reports the DNS server used; permit
+			// both.
+			t.Fatalf("unexpected error %v", err)
+		}
+	})
+}
+
+func TestListenURLFileCreation(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	file, err := ioutil.TempFile(os.TempDir(), t.Name())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	s, err := serverutils.StartServerRaw(base.TestServerArgs{
+		ListeningURLFile: file.Name(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Stopper().Stop(context.TODO())
+	defer func() {
+		if err := os.Remove(file.Name()); err != nil {
+			t.Error(err)
+		}
+	}()
+
+	data, err := ioutil.ReadFile(file.Name())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	u, err := url.Parse(string(data))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if s.ServingAddr() != u.Host {
+		t.Fatalf("expected URL %s to match host %s", u, s.ServingAddr())
+	}
+}
+
+func TestHeartbeatCallbackForDecommissioning(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	defer s.Stopper().Stop(context.TODO())
+	ts := s.(*TestServer)
+	nodeLiveness := ts.nodeLiveness
+
+	for {
+		// Morally this loop only runs once. However, early in the boot
+		// sequence, the own liveness record may not yet exist. This
+		// has not been observed in this test, but was the root cause
+		// of #16656, so consider this part of its documentation.
+		liveness, err := nodeLiveness.Self()
+		if err != nil {
+			if errors.Cause(err) == storage.ErrNoLivenessRecord {
+				continue
+			}
+			t.Fatal(err)
+		}
+		if liveness.Decommissioning {
+			t.Fatal("Decommissioning set already")
+		}
+		if liveness.Draining {
+			t.Fatal("Draining set already")
+		}
+		break
+	}
+	if err := nodeLiveness.SetDecommissioning(context.Background(), ts.nodeIDContainer.Get(), true); err != nil {
+		t.Fatal(err)
+	}
+
+	// Node should realize it is decommissioning after next heartbeat update.
+	testutils.SucceedsSoon(t, func() error {
+		nodeLiveness.PauseHeartbeat(false) // trigger immediate heartbeat
+		if liveness, err := nodeLiveness.Self(); err != nil {
+			// Record must exist at this point, so any error is fatal now.
+			t.Fatal(err)
+		} else if !liveness.Decommissioning {
+			return errors.Errorf("not decommissioning")
+		} else if !liveness.Draining {
+			return errors.Errorf("not draining")
+		}
+		return nil
+	})
 }

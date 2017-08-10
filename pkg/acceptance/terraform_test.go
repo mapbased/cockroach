@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Tobias Schottdorf (tobias.schottdorf@gmail.com)
 
 package acceptance
 
@@ -22,6 +20,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/cockroachdb/cockroach/pkg/util/log"
+
 	"golang.org/x/net/context"
 )
 
@@ -30,9 +30,17 @@ import (
 // the `terrafarm` package.
 func TestBuildBabyCluster(t *testing.T) {
 	t.Skip("only enabled during testing")
+
+	s := log.Scope(t)
+	defer s.Close(t)
+
 	ctx := context.Background()
 	f := MakeFarmer(t, "baby", stopper)
-	defer f.CollectLogs()
+	defer func() {
+		if err := f.CollectLogs(); err != nil {
+			t.Logf("error collecting cluster logs: %s\n", err)
+		}
+	}()
 	if err := f.Resize(1); err != nil {
 		t.Fatal(err)
 	}
@@ -50,14 +58,25 @@ func TestBuildBabyCluster(t *testing.T) {
 //	 TESTS=FiveNodesAndWriters \
 //	 TESTFLAGS='-v -remote -key-name google_compute_engine -cwd terraform'
 func TestFiveNodesAndWriters(t *testing.T) {
+	s := log.Scope(t)
+	defer s.Close(t)
+
 	ctx := context.Background()
 	deadline := time.After(*flagDuration)
 	f := MakeFarmer(t, "write-5n5w", stopper)
 	defer f.MustDestroy(t)
 	assertClusterUp := func() {
 		f.Assert(ctx, t)
-		for _, host := range f.Nodes() {
-			f.AssertState(ctx, t, host, "block_writer", "RUNNING")
+		for i := 0; i < f.NumNodes(); i++ {
+			if ch := f.GetProcDone(i, "block_writer"); ch == nil {
+				t.Fatalf("block writer not running on node %d", i)
+			} else {
+				select {
+				case err := <-ch:
+					t.Fatalf("block writer exited on node %d: %s", i, err)
+				default:
+				}
+			}
 		}
 	}
 
@@ -74,7 +93,9 @@ func TestFiveNodesAndWriters(t *testing.T) {
 	if err := f.WaitReady(3 * time.Minute); err != nil {
 		t.Fatal(err)
 	}
-	CheckGossip(ctx, t, f, longWaitTime, HasPeers(size))
+	if err := CheckGossip(ctx, f, longWaitTime, HasPeers(size)); err != nil {
+		t.Fatal(err)
+	}
 
 	c := make(chan os.Signal, 1)
 	signal.Notify(c, os.Interrupt)

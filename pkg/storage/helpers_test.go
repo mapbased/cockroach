@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Tamir Duberstein (tamird@gmail.com)
 
 // This file includes test-only helper methods added to types in
 // package storage. These methods are only linked in to tests in this
@@ -23,6 +21,7 @@ package storage
 
 import (
 	"fmt"
+	"sync/atomic"
 	"time"
 
 	"golang.org/x/net/context"
@@ -30,8 +29,14 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/config"
 	"github.com/cockroachdb/cockroach/pkg/internal/client"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/settings"
+	"github.com/cockroachdb/cockroach/pkg/storage/engine"
 	"github.com/cockroachdb/cockroach/pkg/storage/engine/enginepb"
+	"github.com/cockroachdb/cockroach/pkg/storage/storagebase"
+	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/pkg/errors"
 )
 
 // AddReplica adds the replica to the store's replica map and to the sorted
@@ -87,6 +92,12 @@ func (s *Store) ForceReplicaGCScanAndProcess() {
 	forceScanAndProcess(s, s.replicaGCQueue.baseQueue)
 }
 
+// ForceSplitScanAndProcess iterates over all ranges and enqueues any that
+// may need to be split.
+func (s *Store) ForceSplitScanAndProcess() {
+	forceScanAndProcess(s, s.splitQueue.baseQueue)
+}
+
 // ForceRaftLogScanAndProcess iterates over all ranges and enqueues any that
 // need their raft logs truncated and then process each of them.
 func (s *Store) ForceRaftLogScanAndProcess() {
@@ -98,6 +109,13 @@ func (s *Store) ForceRaftLogScanAndProcess() {
 // maintenance queue.
 func (s *Store) ForceTimeSeriesMaintenanceQueueProcess() {
 	forceScanAndProcess(s, s.tsMaintenanceQueue.baseQueue)
+}
+
+// ForceRaftSnapshotQueueProcess iterates over all ranges, enqueuing
+// any that need raft snapshots, then processes the raft snapshot
+// queue.
+func (s *Store) ForceRaftSnapshotQueueProcess() {
+	forceScanAndProcess(s, s.raftSnapshotQueue.baseQueue)
 }
 
 // ConsistencyQueueShouldQueue invokes the shouldQueue method on the
@@ -113,24 +131,16 @@ func (s *Store) GetDeadReplicas() roachpb.StoreDeadReplicas {
 	return s.deadReplicas()
 }
 
-// LeaseExpiration returns an int64 to increment a manual clock with to
-// make sure that all active range leases expire.
-func (s *Store) LeaseExpiration(clock *hlc.Clock) int64 {
-	// Due to lease extensions, the remaining interval can be longer than just
-	// the sum of the offset (=length of stasis period) and the active
-	// duration, but definitely not by 2x.
-	return 2 * int64(s.cfg.RangeLeaseActiveDuration+clock.MaxOffset())
-}
-
 // LogReplicaChangeTest adds a fake replica change event to the log for the
 // range which contains the given key.
 func (s *Store) LogReplicaChangeTest(
+	ctx context.Context,
 	txn *client.Txn,
 	changeType roachpb.ReplicaChangeType,
 	replica roachpb.ReplicaDescriptor,
 	desc roachpb.RangeDescriptor,
 ) error {
-	return s.logChange(txn, changeType, replica, desc)
+	return s.logChange(ctx, txn, changeType, replica, desc)
 }
 
 // ReplicateQueuePurgatoryLength returns the number of replicas in replicate
@@ -154,15 +164,23 @@ func (s *Store) SetSplitQueueActive(active bool) {
 	s.setSplitQueueActive(active)
 }
 
-// SetConsistencyQueueActive enables or disables the consistency queue.
-func (s *Store) SetConsistencyQueueActive(active bool) {
-	s.setConsistencyQueueActive(active)
+// SetRaftSnapshotQueueActive enables or disables the raft snapshot queue.
+func (s *Store) SetRaftSnapshotQueueActive(active bool) {
+	s.setRaftSnapshotQueueActive(active)
 }
 
 // SetReplicaScannerActive enables or disables the scanner. Note that while
 // inactive, removals are still processed.
 func (s *Store) SetReplicaScannerActive(active bool) {
 	s.setScannerActive(active)
+}
+
+func (s *Store) SetRebalancesDisabled(v bool) {
+	var i int32
+	if v {
+		i = 1
+	}
+	atomic.StoreInt32(&s.rebalancesDisabled, i)
 }
 
 // EnqueueRaftUpdateCheck enqueues the replica for a Raft update check, forcing
@@ -195,6 +213,52 @@ func (s *Store) ReservationCount() int {
 	return len(s.snapshotApplySem)
 }
 
+func NewTestStorePool(cfg StoreConfig) *StorePool {
+	return NewStorePool(
+		cfg.AmbientCtx,
+		cfg.Settings,
+		cfg.Gossip,
+		cfg.Clock,
+		func(roachpb.NodeID, time.Time, time.Duration) nodeStatus {
+			return nodeStatusLive
+		},
+		settings.TestingDuration(TestTimeUntilStoreDeadOff),
+		/* deterministic */ false,
+	)
+}
+
+func (r *Replica) ReplicaIDLocked() roachpb.ReplicaID {
+	return r.mu.replicaID
+}
+
+func (r *Replica) DescLocked() *roachpb.RangeDescriptor {
+	return r.mu.state.Desc
+}
+
+// GetGCThreshold returns the range's GCThreshold, acquiring a replica lock in
+// the process.
+func (r *Replica) GetGCThreshold() hlc.Timestamp {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.mu.state.GCThreshold
+}
+
+// GetTxnSpanGCThreshold returns the range's TxnSpanGCThreshold, acquiring a replica lock in
+// the process.
+func (r *Replica) GetTxnSpanGCThreshold() hlc.Timestamp {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.mu.state.TxnSpanGCThreshold
+}
+
+func (r *Replica) AssertState(ctx context.Context, reader engine.Reader) {
+	r.raftMu.Lock()
+	defer r.raftMu.Unlock()
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.assertStateLocked(ctx, reader)
+}
+
 func (r *Replica) RaftLock() {
 	r.raftMu.Lock()
 }
@@ -208,21 +272,68 @@ func (r *Replica) RaftUnlock() {
 func (r *Replica) GetLastIndex() (uint64, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	return r.LastIndex()
+	return r.raftLastIndexLocked()
 }
 
 // GetLease exposes replica.getLease for tests.
 // If you just need information about the lease holder, consider issuing a
 // LeaseInfoRequest instead of using this internal method.
-func (r *Replica) GetLease() (*roachpb.Lease, *roachpb.Lease) {
+func (r *Replica) GetLease() (roachpb.Lease, *roachpb.Lease) {
 	return r.getLease()
+}
+
+// SetQuotaPool allows the caller to set a replica's quota pool initialized to
+// a given quota. Additionally it initializes the replica's quota release queue
+// and its command sizes map. Only safe to call on the replica that is both
+// lease holder and raft leader.
+func (r *Replica) InitQuotaPool(quota int64) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	r.mu.proposalQuotaBaseIndex = r.mu.lastIndex
+	if r.mu.proposalQuota != nil {
+		r.mu.proposalQuota.close()
+	}
+	r.mu.proposalQuota = newQuotaPool(quota)
+	r.mu.quotaReleaseQueue = nil
+	r.mu.commandSizes = make(map[storagebase.CmdIDKey]int)
+}
+
+// QuotaAvailable returns the quota available in the replica's quota pool. Only
+// safe to call on the replica that is both lease holder and raft leader.
+func (r *Replica) QuotaAvailable() int64 {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.mu.proposalQuota.approximateQuota()
+}
+
+func (r *Replica) QuotaReleaseQueueLen() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return len(r.mu.quotaReleaseQueue)
+}
+
+func (r *Replica) CommandSizesLen() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return len(r.mu.commandSizes)
 }
 
 // GetTimestampCacheLowWater returns the timestamp cache low water mark.
 func (r *Replica) GetTimestampCacheLowWater() hlc.Timestamp {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	return r.mu.tsCache.lowWater
+	r.store.tsCacheMu.Lock()
+	defer r.store.tsCacheMu.Unlock()
+	t := r.store.tsCacheMu.cache.lowWater
+	// Bump the per-Store low-water mark using the per-range read and write info.
+	start := roachpb.Key(r.Desc().StartKey)
+	end := roachpb.Key(r.Desc().EndKey)
+	if r, _, ok := r.store.tsCacheMu.cache.GetMaxRead(start, end); !ok && t.Less(r) {
+		t = r
+	}
+	if w, _, ok := r.store.tsCacheMu.cache.GetMaxWrite(start, end); !ok && t.Less(w) {
+		t = w
+	}
+	return t
 }
 
 // GetRaftLogSize returns the raft log size.
@@ -232,14 +343,131 @@ func (r *Replica) GetRaftLogSize() int64 {
 	return r.mu.raftLogSize
 }
 
-// StorePoolNodeLivenessTrue is a NodeLivenessFunc which always returns true.
-func StorePoolNodeLivenessTrue(_ roachpb.NodeID, _ time.Time, _ time.Duration) bool {
+func (r *Replica) IsRaftGroupInitialized() bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.mu.internalRaftGroup != nil
+}
+
+// HasQuorum returns true iff the range that this replica is part of
+// can achieve quorum.
+func (r *Replica) HasQuorum() bool {
+	desc := r.Desc()
+	liveReplicas, _ := r.store.allocator.storePool.liveAndDeadReplicas(desc.RangeID, desc.Replicas)
+	quorum := computeQuorum(len(desc.Replicas))
+	return len(liveReplicas) >= quorum
+}
+
+// GetStoreList exposes getStoreList for testing only, but with a hardcoded
+// storeFilter of storeFilterNone.
+func (sp *StorePool) GetStoreList(rangeID roachpb.RangeID) (StoreList, int, int) {
+	return sp.getStoreList(rangeID, storeFilterNone)
+}
+
+// Stores returns a copy of sl.stores.
+func (sl *StoreList) Stores() []roachpb.StoreDescriptor {
+	stores := make([]roachpb.StoreDescriptor, len(sl.stores))
+	copy(stores, sl.stores)
+	return stores
+}
+
+const (
+	sideloadBogusIndex = 12345
+	sideloadBogusTerm  = 67890
+)
+
+func (r *Replica) PutBogusSideloadedData() {
+	r.raftMu.Lock()
+	defer r.raftMu.Unlock()
+	if err := r.raftMu.sideloaded.PutIfNotExists(context.Background(), sideloadBogusIndex, sideloadBogusTerm, []byte("bogus")); err != nil {
+		panic(err)
+	}
+}
+
+func (r *Replica) HasBogusSideloadedData() bool {
+	r.raftMu.Lock()
+	defer r.raftMu.Unlock()
+	if _, err := r.raftMu.sideloaded.Get(context.Background(), sideloadBogusIndex, sideloadBogusTerm); err == errSideloadedFileNotFound {
+		return false
+	} else if err != nil {
+		panic(err)
+	}
 	return true
 }
 
-// GetStoreList is the same function as GetStoreList exposed for tests only.
-func (sp *StorePool) GetStoreList(rangeID roachpb.RangeID) (StoreList, int, int) {
-	return sp.getStoreList(rangeID)
+func MakeSSTable(key, value string, ts hlc.Timestamp) ([]byte, engine.MVCCKeyValue) {
+	sst, err := engine.MakeRocksDBSstFileWriter()
+	if err != nil {
+		panic(err)
+	}
+	defer sst.Close()
+
+	v := roachpb.MakeValueFromBytes([]byte(value))
+	v.InitChecksum([]byte(key))
+
+	kv := engine.MVCCKeyValue{
+		Key: engine.MVCCKey{
+			Key:       []byte(key),
+			Timestamp: ts,
+		},
+		Value: v.RawBytes,
+	}
+
+	if err := sst.Add(kv); err != nil {
+		panic(errors.Wrap(err, "while finishing SSTable"))
+	}
+	b, err := sst.Finish()
+	if err != nil {
+		panic(errors.Wrap(err, "while finishing SSTable"))
+	}
+	return b, kv
+}
+
+func ProposeAddSSTable(ctx context.Context, key, val string, ts hlc.Timestamp, store *Store) error {
+	var ba roachpb.BatchRequest
+	ba.RangeID = store.LookupReplica(roachpb.RKey(key), nil).RangeID
+
+	var addReq roachpb.AddSSTableRequest
+	addReq.Data, _ = MakeSSTable(key, val, ts)
+	addReq.Key = roachpb.Key(key)
+	addReq.EndKey = addReq.Key.Next()
+	ba.Add(&addReq)
+
+	_, pErr := store.Send(ctx, ba)
+	if pErr != nil {
+		return pErr.GoError()
+	}
+	return nil
+}
+
+func SetMockAddSSTable() (undo func()) {
+	prev := commands[roachpb.AddSSTable]
+
+	// TODO(tschottdorf): this already does nontrivial work. Worth open-sourcing the relevant
+	// subparts of the real evalAddSSTable to make this test less likely to rot.
+	evalAddSSTable := func(
+		ctx context.Context, batch engine.ReadWriter, cArgs CommandArgs, _ roachpb.Response,
+	) (EvalResult, error) {
+		log.Event(ctx, "evaluated testing-only AddSSTable mock")
+		args := cArgs.Args.(*roachpb.AddSSTableRequest)
+
+		return EvalResult{
+			Replicated: storagebase.ReplicatedEvalResult{
+				AddSSTable: &storagebase.ReplicatedEvalResult_AddSSTable{
+					Data:  args.Data,
+					CRC32: util.CRC32(args.Data),
+				},
+			},
+		}, nil
+	}
+
+	SetAddSSTableCmd(Command{
+		DeclareKeys: DefaultDeclareKeys,
+		Eval:        evalAddSSTable,
+	})
+	return func() {
+		SetAddSSTableCmd(prev)
+	}
 }
 
 // IsQuiescent returns whether the replica is quiescent or not.
@@ -249,16 +477,32 @@ func (r *Replica) IsQuiescent() bool {
 	return r.mu.quiescent
 }
 
+func (r *Replica) IsPushTxnQueueEnabled() bool {
+	return r.pushTxnQueue.isEnabled()
+}
+
 // GetQueueLastProcessed returns the last processed timestamp for the
 // specified queue, or the zero timestamp if not available.
 func (r *Replica) GetQueueLastProcessed(ctx context.Context, queue string) (hlc.Timestamp, error) {
 	return r.getQueueLastProcessed(ctx, queue)
 }
 
+func (r *Replica) RaftTransferLeader(ctx context.Context, target roachpb.ReplicaID) {
+	r.maybeTransferRaftLeadership(ctx, target)
+}
+
 func GetGCQueueTxnCleanupThreshold() time.Duration {
 	return txnCleanupThreshold
 }
 
-func ProposerEvaluatedKVEnabled() bool {
-	return propEvalKV
+func (nl *NodeLiveness) SetDrainingInternal(
+	ctx context.Context, liveness *Liveness, drain bool,
+) error {
+	return nl.setDrainingInternal(ctx, liveness, drain)
+}
+
+func (nl *NodeLiveness) SetDecommissioningInternal(
+	ctx context.Context, nodeID roachpb.NodeID, liveness *Liveness, decommission bool,
+) error {
+	return nl.setDecommissioningInternal(ctx, nodeID, liveness, decommission)
 }

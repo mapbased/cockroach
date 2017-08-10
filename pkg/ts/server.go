@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Matt Tracy (matt@cockroachlabs.com)
 
 package ts
 
@@ -55,7 +53,9 @@ type Server struct {
 
 // MakeServer instantiates a new Server which services requests with data from
 // the supplied DB.
-func MakeServer(ambient log.AmbientContext, db *DB, cfg ServerConfig, stopper *stop.Stopper) Server {
+func MakeServer(
+	ambient log.AmbientContext, db *DB, cfg ServerConfig, stopper *stop.Stopper,
+) Server {
 	ambient.AddLogTag("ts-srv", nil)
 	queryWorkerMax := queryWorkerMax
 	if cfg.QueryWorkerMax != 0 {
@@ -117,12 +117,13 @@ func (s *Server) Query(
 	// a deadlock would occur because queries cannot complete until
 	// they have written their result to the "output" channel, which is
 	// processed later in the main function.
-	if err := s.stopper.RunAsyncTask(ctx, func(ctx context.Context) {
+	if err := s.stopper.RunAsyncTask(ctx, "ts.Server: queries", func(ctx context.Context) {
 		for queryIdx, query := range request.Queries {
 			queryIdx := queryIdx
 			query := query
 			if err := s.stopper.RunLimitedAsyncTask(
 				ctx,
+				"ts.Server: query",
 				s.workerSem,
 				true, /* wait */
 				func(ctx context.Context) {

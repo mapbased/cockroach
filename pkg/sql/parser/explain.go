@@ -11,16 +11,22 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Peter Mattis (peter@cockroachlabs.com)
 
 package parser
 
-import "bytes"
+import (
+	"bytes"
+	"strings"
+)
 
 // Explain represents an EXPLAIN statement.
 type Explain struct {
-	Options   []string
+	// Options defines how EXPLAIN should operate (VERBOSE, METADATA,
+	// etc.) Which options are valid depends on the explain mode. See
+	// sql/explain.go for details.
+	Options []string
+
+	// Statement is the statement being EXPLAINed.
 	Statement Statement
 }
 
@@ -33,7 +39,7 @@ func (node *Explain) Format(buf *bytes.Buffer, f FmtFlags) {
 			if i > 0 {
 				buf.WriteString(", ")
 			}
-			buf.WriteString(opt)
+			buf.WriteString(strings.ToUpper(opt))
 		}
 		buf.WriteString(") ")
 	}

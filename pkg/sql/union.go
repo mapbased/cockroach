@@ -11,22 +11,22 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Dan Harrison (daniel.harrison@gmail.com)
 
 package sql
 
 import (
 	"fmt"
 
+	"github.com/pkg/errors"
+	"golang.org/x/net/context"
+
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
-	"github.com/pkg/errors"
 )
 
 // UnionClause constructs a planNode from a UNION/INTERSECT/EXCEPT expression.
 func (p *planner) UnionClause(
-	n *parser.UnionClause, desiredTypes []parser.Type, autoCommit bool,
+	ctx context.Context, n *parser.UnionClause, desiredTypes []parser.Type,
 ) (planNode, error) {
 	var emitAll = false
 	var emit unionNodeEmit
@@ -53,19 +53,20 @@ func (p *planner) UnionClause(
 		return nil, errors.Errorf("%v is not supported", n.Type)
 	}
 
-	left, err := p.newPlan(n.Left, desiredTypes, autoCommit)
+	left, err := p.newPlan(ctx, n.Left, desiredTypes)
 	if err != nil {
 		return nil, err
 	}
-	right, err := p.newPlan(n.Right, desiredTypes, autoCommit)
+	right, err := p.newPlan(ctx, n.Right, desiredTypes)
 	if err != nil {
 		return nil, err
 	}
 
-	leftColumns := left.Columns()
-	rightColumns := right.Columns()
+	leftColumns := planColumns(left)
+	rightColumns := planColumns(right)
 	if len(leftColumns) != len(rightColumns) {
-		return nil, fmt.Errorf("each %v query must have the same number of columns: %d vs %d", n.Type, len(left.Columns()), len(right.Columns()))
+		return nil, fmt.Errorf("each %v query must have the same number of columns: %d vs %d",
+			n.Type, len(leftColumns), len(rightColumns))
 	}
 	for i := 0; i < len(leftColumns); i++ {
 		l := leftColumns[i]
@@ -73,22 +74,20 @@ func (p *planner) UnionClause(
 		// TODO(dan): This currently checks whether the types are exactly the same,
 		// but Postgres is more lenient:
 		// http://www.postgresql.org/docs/9.5/static/typeconv-union-case.html.
-		if !l.Typ.Equal(r.Typ) {
+		if !(l.Typ.Equivalent(r.Typ) || l.Typ == parser.TypeNull || r.Typ == parser.TypeNull) {
 			return nil, fmt.Errorf("%v types %s and %s cannot be matched", n.Type, l.Typ, r.Typ)
 		}
-		if l.hidden != r.hidden {
+		if l.Hidden != r.Hidden {
 			return nil, fmt.Errorf("%v types cannot be matched", n.Type)
 		}
 	}
 
 	node := &unionNode{
-		right:     right,
-		left:      left,
-		rightDone: false,
-		leftDone:  false,
-		emitAll:   emitAll,
-		emit:      emit,
-		scratch:   make([]byte, 0),
+		right:   right,
+		left:    left,
+		emitAll: emitAll,
+		emit:    emit,
+		scratch: make([]byte, 0),
 	}
 	return node, nil
 }
@@ -129,70 +128,29 @@ func (p *planner) UnionClause(
 //    already emitted as many as were on the right, don't emit.
 type unionNode struct {
 	right, left planNode
-	rightDone   bool
-	leftDone    bool
 	emitAll     bool // emitAll is a performance optimization for UNION ALL.
 	emit        unionNodeEmit
 	scratch     []byte
-	explain     explainMode
-	debugVals   debugValues
 }
 
-func (n *unionNode) Columns() ResultColumns { return n.left.Columns() }
-func (n *unionNode) Ordering() orderingInfo { return orderingInfo{} }
-
-func (n *unionNode) Values() parser.DTuple {
-	switch {
-	case !n.rightDone:
+func (n *unionNode) Values() parser.Datums {
+	if n.right != nil {
 		return n.right.Values()
-	case !n.leftDone:
+	}
+	if n.left != nil {
 		return n.left.Values()
-	default:
-		return nil
 	}
-}
-func (n *unionNode) SetLimitHint(numRows int64, soft bool) {
-	n.right.SetLimitHint(numRows, true)
-	n.left.SetLimitHint(numRows, true)
+	return nil
 }
 
-func (n *unionNode) setNeededColumns(_ []bool) {}
-
-func (n *unionNode) ExplainPlan(_ bool) (name, description string, children []planNode) {
-	return "union", "-", []planNode{n.left, n.right}
-}
-
-func (n *unionNode) ExplainTypes(_ func(string, string)) {}
-
-func (n *unionNode) MarkDebug(mode explainMode) {
-	if mode != explainDebug {
-		panic(fmt.Sprintf("unknown debug mode %d", mode))
-	}
-	n.explain = mode
-	n.left.MarkDebug(mode)
-	n.right.MarkDebug(mode)
-}
-
-func (n *unionNode) DebugValues() debugValues {
-	return n.debugVals
-}
-
-func (n *unionNode) readRight() (bool, error) {
-	next, err := n.right.Next()
-	for ; next; next, err = n.right.Next() {
-		if n.explain == explainDebug {
-			n.debugVals = n.right.DebugValues()
-			if n.debugVals.output != debugValueRow {
-				// Pass through any non-row debug info.
-				return true, nil
-			}
-		}
-
+func (n *unionNode) readRight(params runParams) (bool, error) {
+	next, err := n.right.Next(params)
+	for ; next; next, err = n.right.Next(params) {
 		if n.emitAll {
 			return true, nil
 		}
 		n.scratch = n.scratch[:0]
-		if n.scratch, err = sqlbase.EncodeDTuple(n.scratch, n.right.Values()); err != nil {
+		if n.scratch, err = sqlbase.EncodeDatums(n.scratch, n.right.Values()); err != nil {
 			return false, err
 		}
 		// TODO(dan): Sending the entire encodeDTuple to be stored in the map would
@@ -201,87 +159,66 @@ func (n *unionNode) readRight() (bool, error) {
 		if n.emit.emitRight(n.scratch) {
 			return true, nil
 		}
-		if n.explain == explainDebug {
-			// Mark the row as filtered out.
-			n.debugVals.output = debugValueFiltered
-			return true, nil
-		}
 	}
 	if err != nil {
 		return false, err
 	}
 
-	n.rightDone = true
-	n.right.Close()
-	return n.readLeft()
+	n.right.Close(params.ctx)
+	n.right = nil
+	return n.readLeft(params)
 }
 
-func (n *unionNode) readLeft() (bool, error) {
-	next, err := n.left.Next()
-	for ; next; next, err = n.left.Next() {
-		if n.explain == explainDebug {
-			n.debugVals = n.left.DebugValues()
-			if n.debugVals.output != debugValueRow {
-				// Pass through any non-row debug info.
-				return true, nil
-			}
-		}
-
+func (n *unionNode) readLeft(params runParams) (bool, error) {
+	next, err := n.left.Next(params)
+	for ; next; next, err = n.left.Next(params) {
 		if n.emitAll {
 			return true, nil
 		}
 		n.scratch = n.scratch[:0]
-		if n.scratch, err = sqlbase.EncodeDTuple(n.scratch, n.left.Values()); err != nil {
+		if n.scratch, err = sqlbase.EncodeDatums(n.scratch, n.left.Values()); err != nil {
 			return false, err
 		}
 		if n.emit.emitLeft(n.scratch) {
 			return true, nil
 		}
-		if n.explain == explainDebug {
-			// Mark the row as filtered out.
-			n.debugVals.output = debugValueFiltered
-			return true, nil
-		}
 	}
 	if err != nil {
 		return false, err
 	}
-	n.leftDone = true
-	n.left.Close()
+	n.left.Close(params.ctx)
+	n.left = nil
 	return false, nil
 }
 
-func (n *unionNode) expandPlan() error {
-	if err := n.right.expandPlan(); err != nil {
+func (n *unionNode) Start(params runParams) error {
+	if err := n.right.Start(params); err != nil {
 		return err
 	}
-	return n.left.expandPlan()
+	return n.left.Start(params)
 }
 
-func (n *unionNode) Start() error {
-	if err := n.right.Start(); err != nil {
-		return err
+func (n *unionNode) Next(params runParams) (bool, error) {
+	if err := params.p.cancelChecker.Check(); err != nil {
+		return false, err
 	}
-	return n.left.Start()
-}
-
-func (n *unionNode) Next() (bool, error) {
-	switch {
-	case !n.rightDone:
-		return n.readRight()
-	case !n.leftDone:
-		return n.readLeft()
-	default:
-		return false, nil
+	if n.right != nil {
+		return n.readRight(params)
 	}
+	if n.left != nil {
+		return n.readLeft(params)
+	}
+	return false, nil
 }
 
-func (n *unionNode) Close() {
-	switch {
-	case !n.rightDone:
-		n.right.Close()
-	case !n.leftDone:
-		n.left.Close()
+func (n *unionNode) Close(ctx context.Context) {
+	if n.right != nil {
+		n.right.Close(ctx)
+		n.right = nil
+	}
+	if n.left != nil {
+		n.left.Close(ctx)
+		n.left = nil
 	}
 }
 

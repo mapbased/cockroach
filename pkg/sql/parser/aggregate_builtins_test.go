@@ -15,10 +15,13 @@
 package parser
 
 import (
+	"fmt"
 	"reflect"
 	"testing"
 
-	"github.com/cockroachdb/cockroach/pkg/util/decimal"
+	"golang.org/x/net/context"
+
+	"github.com/cockroachdb/cockroach/pkg/util/duration"
 	"github.com/cockroachdb/cockroach/pkg/util/randutil"
 )
 
@@ -28,13 +31,22 @@ import (
 // printing all values to strings once the accumulation has finished. If the string
 // slices are not equal, it means that the result Datums were modified during later
 // accumulation, which violates the "deep copy of any internal state" condition.
-func testAggregateResultDeepCopy(t *testing.T, aggFunc func() AggregateFunc, vals []Datum) {
-	aggImpl := aggFunc()
+func testAggregateResultDeepCopy(
+	t *testing.T, aggFunc func([]Type, *EvalContext) AggregateFunc, vals []Datum,
+) {
+	evalCtx := NewTestingEvalContext()
+	defer evalCtx.Stop(context.Background())
+	aggImpl := aggFunc([]Type{vals[0].ResolvedType()}, evalCtx)
 	runningDatums := make([]Datum, len(vals))
 	runningStrings := make([]string, len(vals))
 	for i := range vals {
-		aggImpl.Add(vals[i])
-		res := aggImpl.Result()
+		if err := aggImpl.Add(context.Background(), vals[i]); err != nil {
+			t.Fatal(err)
+		}
+		res, err := aggImpl.Result()
+		if err != nil {
+			t.Fatal(err)
+		}
 		runningDatums[i] = res
 		runningStrings[i] = res.String()
 	}
@@ -104,6 +116,10 @@ func TestMinBoolResultDeepCopy(t *testing.T) {
 	testAggregateResultDeepCopy(t, newMinAggregate, makeBoolTestDatum(10))
 }
 
+func TestSumSmallIntResultDeepCopy(t *testing.T) {
+	testAggregateResultDeepCopy(t, newSmallIntSumAggregate, makeIntTestDatum(10))
+}
+
 func TestSumIntResultDeepCopy(t *testing.T) {
 	testAggregateResultDeepCopy(t, newIntSumAggregate, makeIntTestDatum(10))
 }
@@ -114,6 +130,10 @@ func TestSumFloatResultDeepCopy(t *testing.T) {
 
 func TestSumDecimalResultDeepCopy(t *testing.T) {
 	testAggregateResultDeepCopy(t, newDecimalSumAggregate, makeDecimalTestDatum(10))
+}
+
+func TestSumIntervalResultDeepCopy(t *testing.T) {
+	testAggregateResultDeepCopy(t, newIntervalSumAggregate, makeIntervalTestDatum(10))
 }
 
 func TestVarianceIntResultDeepCopy(t *testing.T) {
@@ -185,7 +205,9 @@ func makeDecimalTestDatum(count int) []Datum {
 	vals := make([]Datum, count)
 	for i := range vals {
 		dd := &DDecimal{}
-		decimal.SetFromFloat(&dd.Dec, rng.Float64())
+		if _, err := dd.SetFloat64(rng.Float64()); err != nil {
+			panic(err)
+		}
 		vals[i] = dd
 	}
 	return vals
@@ -201,99 +223,212 @@ func makeBoolTestDatum(count int) []Datum {
 	return vals
 }
 
-func runBenchmarkAggregate(b *testing.B, aggFunc func() AggregateFunc, vals []Datum) {
+func makeIntervalTestDatum(count int) []Datum {
+	rng, _ := randutil.NewPseudoRand()
+
+	vals := make([]Datum, count)
+	for i := range vals {
+		vals[i] = &DInterval{Duration: duration.Duration{Months: rng.Int63n(1000),
+			Days:  rng.Int63n(1000),
+			Nanos: rng.Int63n(1000000),
+		}}
+	}
+	return vals
+}
+
+func runBenchmarkAggregate(
+	b *testing.B, aggFunc func([]Type, *EvalContext) AggregateFunc, vals []Datum,
+) {
+	evalCtx := NewTestingEvalContext()
+	defer evalCtx.Stop(context.Background())
+	params := []Type{vals[0].ResolvedType()}
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		aggImpl := aggFunc()
+		aggImpl := aggFunc(params, evalCtx)
 		for i := range vals {
-			aggImpl.Add(vals[i])
+			if err := aggImpl.Add(context.Background(), vals[i]); err != nil {
+				b.Fatal(err)
+			}
 		}
-		if aggImpl.Result() == nil {
+		res, err := aggImpl.Result()
+		if err != nil || res == nil {
 			b.Errorf("taking result of aggregate implementation %T failed", aggImpl)
 		}
 	}
 }
 
-func BenchmarkAvgAggregateInt1K(b *testing.B) {
-	runBenchmarkAggregate(b, newIntAvgAggregate, makeIntTestDatum(1000))
+func BenchmarkAvgAggregateInt(b *testing.B) {
+	for _, count := range []int{1000} {
+		b.Run(fmt.Sprintf("count=%d", count), func(b *testing.B) {
+			runBenchmarkAggregate(b, newIntAvgAggregate, makeIntTestDatum(count))
+		})
+	}
 }
 
-func BenchmarkAvgAggregateSmallInt1K(b *testing.B) {
-	runBenchmarkAggregate(b, newIntAvgAggregate, makeSmallIntTestDatum(1000))
+func BenchmarkAvgAggregateSmallInt(b *testing.B) {
+	for _, count := range []int{1000} {
+		b.Run(fmt.Sprintf("count=%d", count), func(b *testing.B) {
+			runBenchmarkAggregate(b, newIntAvgAggregate, makeSmallIntTestDatum(count))
+		})
+	}
 }
 
-func BenchmarkAvgAggregateFloat1K(b *testing.B) {
-	runBenchmarkAggregate(b, newFloatAvgAggregate, makeFloatTestDatum(1000))
+func BenchmarkAvgAggregateFloat(b *testing.B) {
+	for _, count := range []int{1000} {
+		b.Run(fmt.Sprintf("count=%d", count), func(b *testing.B) {
+			runBenchmarkAggregate(b, newFloatAvgAggregate, makeFloatTestDatum(count))
+		})
+	}
 }
 
-func BenchmarkAvgAggregateDecimal1K(b *testing.B) {
-	runBenchmarkAggregate(b, newDecimalAvgAggregate, makeDecimalTestDatum(1000))
+func BenchmarkAvgAggregateDecimal(b *testing.B) {
+	for _, count := range []int{1000} {
+		b.Run(fmt.Sprintf("count=%d", count), func(b *testing.B) {
+			runBenchmarkAggregate(b, newDecimalAvgAggregate, makeDecimalTestDatum(count))
+		})
+	}
 }
 
-func BenchmarkCountAggregate1K(b *testing.B) {
-	runBenchmarkAggregate(b, newCountAggregate, makeIntTestDatum(1000))
+func BenchmarkCountAggregate(b *testing.B) {
+	for _, count := range []int{1000} {
+		b.Run(fmt.Sprintf("count=%d", count), func(b *testing.B) {
+			runBenchmarkAggregate(b, newCountAggregate, makeIntTestDatum(count))
+		})
+	}
 }
 
-func BenchmarkSumAggregateInt1K(b *testing.B) {
-	runBenchmarkAggregate(b, newIntSumAggregate, makeIntTestDatum(1000))
+func BenchmarkSumIntAggregateInt(b *testing.B) {
+	for _, count := range []int{1000} {
+		b.Run(fmt.Sprintf("count=%d", count), func(b *testing.B) {
+			runBenchmarkAggregate(b, newSmallIntSumAggregate, makeSmallIntTestDatum(count))
+		})
+	}
 }
 
-func BenchmarkSumAggregateSmallInt1K(b *testing.B) {
-	runBenchmarkAggregate(b, newIntSumAggregate, makeSmallIntTestDatum(1000))
+func BenchmarkSumAggregateInt(b *testing.B) {
+	for _, count := range []int{1000} {
+		b.Run(fmt.Sprintf("count=%d", count), func(b *testing.B) {
+			runBenchmarkAggregate(b, newIntSumAggregate, makeIntTestDatum(count))
+		})
+	}
 }
 
-func BenchmarkSumAggregateFloat1K(b *testing.B) {
-	runBenchmarkAggregate(b, newFloatSumAggregate, makeFloatTestDatum(1000))
+func BenchmarkSumAggregateSmallInt(b *testing.B) {
+	for _, count := range []int{1000} {
+		b.Run(fmt.Sprintf("count=%d", count), func(b *testing.B) {
+			runBenchmarkAggregate(b, newIntSumAggregate, makeSmallIntTestDatum(count))
+		})
+	}
 }
 
-func BenchmarkSumAggregateDecimal1K(b *testing.B) {
-	runBenchmarkAggregate(b, newDecimalSumAggregate, makeDecimalTestDatum(1000))
+func BenchmarkSumAggregateFloat(b *testing.B) {
+	for _, count := range []int{1000} {
+		b.Run(fmt.Sprintf("count=%d", count), func(b *testing.B) {
+			runBenchmarkAggregate(b, newFloatSumAggregate, makeFloatTestDatum(count))
+		})
+	}
 }
 
-func BenchmarkMaxAggregateInt1K(b *testing.B) {
-	runBenchmarkAggregate(b, newMaxAggregate, makeIntTestDatum(1000))
+func BenchmarkSumAggregateDecimal(b *testing.B) {
+	for _, count := range []int{1000} {
+		b.Run(fmt.Sprintf("count=%d", count), func(b *testing.B) {
+			runBenchmarkAggregate(b, newDecimalSumAggregate, makeDecimalTestDatum(count))
+		})
+	}
 }
 
-func BenchmarkMaxAggregateFloat1K(b *testing.B) {
-	runBenchmarkAggregate(b, newMaxAggregate, makeFloatTestDatum(1000))
+func BenchmarkMaxAggregateInt(b *testing.B) {
+	for _, count := range []int{1000} {
+		b.Run(fmt.Sprintf("count=%d", count), func(b *testing.B) {
+			runBenchmarkAggregate(b, newMaxAggregate, makeIntTestDatum(count))
+		})
+	}
 }
 
-func BenchmarkMaxAggregateDecimal1K(b *testing.B) {
-	runBenchmarkAggregate(b, newMaxAggregate, makeDecimalTestDatum(1000))
+func BenchmarkMaxAggregateFloat(b *testing.B) {
+	for _, count := range []int{1000} {
+		b.Run(fmt.Sprintf("count=%d", count), func(b *testing.B) {
+			runBenchmarkAggregate(b, newMaxAggregate, makeFloatTestDatum(count))
+		})
+	}
 }
 
-func BenchmarkMinAggregateInt1K(b *testing.B) {
-	runBenchmarkAggregate(b, newMinAggregate, makeIntTestDatum(1000))
+func BenchmarkMaxAggregateDecimal(b *testing.B) {
+	for _, count := range []int{1000} {
+		b.Run(fmt.Sprintf("count=%d", count), func(b *testing.B) {
+			runBenchmarkAggregate(b, newMaxAggregate, makeDecimalTestDatum(count))
+		})
+	}
 }
 
-func BenchmarkMinAggregateFloat1K(b *testing.B) {
-	runBenchmarkAggregate(b, newMinAggregate, makeFloatTestDatum(1000))
+func BenchmarkMinAggregateInt(b *testing.B) {
+	for _, count := range []int{1000} {
+		b.Run(fmt.Sprintf("count=%d", count), func(b *testing.B) {
+			runBenchmarkAggregate(b, newMinAggregate, makeIntTestDatum(count))
+		})
+	}
 }
 
-func BenchmarkMinAggregateDecimal1K(b *testing.B) {
-	runBenchmarkAggregate(b, newMinAggregate, makeDecimalTestDatum(1000))
+func BenchmarkMinAggregateFloat(b *testing.B) {
+	for _, count := range []int{1000} {
+		b.Run(fmt.Sprintf("count=%d", count), func(b *testing.B) {
+			runBenchmarkAggregate(b, newMinAggregate, makeFloatTestDatum(count))
+		})
+	}
 }
 
-func BenchmarkVarianceAggregateInt1K(b *testing.B) {
-	runBenchmarkAggregate(b, newIntVarianceAggregate, makeIntTestDatum(1000))
+func BenchmarkMinAggregateDecimal(b *testing.B) {
+	for _, count := range []int{1000} {
+		b.Run(fmt.Sprintf("count=%d", count), func(b *testing.B) {
+			runBenchmarkAggregate(b, newMinAggregate, makeDecimalTestDatum(count))
+		})
+	}
 }
 
-func BenchmarkVarianceAggregateFloat1K(b *testing.B) {
-	runBenchmarkAggregate(b, newFloatVarianceAggregate, makeFloatTestDatum(1000))
+func BenchmarkVarianceAggregateInt(b *testing.B) {
+	for _, count := range []int{1000} {
+		b.Run(fmt.Sprintf("count=%d", count), func(b *testing.B) {
+			runBenchmarkAggregate(b, newIntVarianceAggregate, makeIntTestDatum(count))
+		})
+	}
 }
 
-func BenchmarkVarianceAggregateDecimal1K(b *testing.B) {
-	runBenchmarkAggregate(b, newDecimalVarianceAggregate, makeDecimalTestDatum(1000))
+func BenchmarkVarianceAggregateFloat(b *testing.B) {
+	for _, count := range []int{1000} {
+		b.Run(fmt.Sprintf("count=%d", count), func(b *testing.B) {
+			runBenchmarkAggregate(b, newFloatVarianceAggregate, makeFloatTestDatum(count))
+		})
+	}
 }
 
-func BenchmarkStdDevAggregateInt1K(b *testing.B) {
-	runBenchmarkAggregate(b, newIntStdDevAggregate, makeIntTestDatum(1000))
+func BenchmarkVarianceAggregateDecimal(b *testing.B) {
+	for _, count := range []int{1000} {
+		b.Run(fmt.Sprintf("count=%d", count), func(b *testing.B) {
+			runBenchmarkAggregate(b, newDecimalVarianceAggregate, makeDecimalTestDatum(count))
+		})
+	}
 }
 
-func BenchmarkStdDevAggregateFloat1K(b *testing.B) {
-	runBenchmarkAggregate(b, newFloatStdDevAggregate, makeFloatTestDatum(1000))
+func BenchmarkStdDevAggregateInt(b *testing.B) {
+	for _, count := range []int{1000} {
+		b.Run(fmt.Sprintf("count=%d", count), func(b *testing.B) {
+			runBenchmarkAggregate(b, newIntStdDevAggregate, makeIntTestDatum(count))
+		})
+	}
 }
 
-func BenchmarkStdDevAggregateDecimal1K(b *testing.B) {
-	runBenchmarkAggregate(b, newDecimalStdDevAggregate, makeDecimalTestDatum(1000))
+func BenchmarkStdDevAggregateFloat(b *testing.B) {
+	for _, count := range []int{1000} {
+		b.Run(fmt.Sprintf("count=%d", count), func(b *testing.B) {
+			runBenchmarkAggregate(b, newFloatStdDevAggregate, makeFloatTestDatum(count))
+		})
+	}
+}
+
+func BenchmarkStdDevAggregateDecimal(b *testing.B) {
+	for _, count := range []int{1000} {
+		b.Run(fmt.Sprintf("count=%d", count), func(b *testing.B) {
+			runBenchmarkAggregate(b, newDecimalStdDevAggregate, makeDecimalTestDatum(count))
+		})
+	}
 }

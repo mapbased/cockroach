@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Matt Tracy (matt@cockroachlabs.com)
 
 package sqlbase
 
@@ -175,4 +173,19 @@ func (ms MetadataSchema) GetInitialValues() []roachpb.KeyValue {
 	// objects would be sorted if read from the engine.
 	sort.Sort(roachpb.KeyValueByKey(ret))
 	return ret
+}
+
+// InitialRangeCount returns the number of ranges that would be installed if
+// this metadata schema were installed on a fresh cluster and nothing else. Most
+// clusters will have additional ranges installed by migrations, so this
+// function should be used when only a lower bound, and not an exact count, is
+// needed. See server.ExpectedInitialRangeCount() for a count that includes
+// migrations.
+func (ms MetadataSchema) InitialRangeCount() int {
+	// The number of fixed ranges is determined by the pre-defined split points
+	// in SystemConfig.ComputeSplitKey. The early keyspace is split up in order
+	// to support separate zone configs for different parts of the system ranges.
+	// There are 4 pre-defined split points, so 5 fixed ranges.
+	const fixedRanges = 5
+	return len(ms.descs) - ms.configs + fixedRanges
 }

@@ -11,13 +11,13 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Radu Berinde (radu@cockroachlabs.com)
 
 package sqlbase
 
 import (
 	"testing"
+
+	"golang.org/x/net/context"
 
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
@@ -29,6 +29,8 @@ func TestEncDatum(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
 	a := &DatumAlloc{}
+	evalCtx := parser.NewTestingEvalContext()
+	defer evalCtx.Stop(context.Background())
 	v := EncDatum{}
 	if !v.IsUnset() {
 		t.Errorf("empty EncDatum should be unset")
@@ -38,7 +40,7 @@ func TestEncDatum(t *testing.T) {
 		t.Errorf("empty EncDatum has an encoding")
 	}
 
-	x := DatumToEncDatum(ColumnType_INT, parser.NewDInt(5))
+	x := DatumToEncDatum(ColumnType{SemanticType: ColumnType_INT}, parser.NewDInt(5))
 	if x.IsUnset() {
 		t.Errorf("unset after DatumToEncDatum()")
 	}
@@ -51,7 +53,7 @@ func TestEncDatum(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	y := EncDatumFromEncoded(ColumnType_INT, DatumEncoding_ASCENDING_KEY, encoded)
+	y := EncDatumFromEncoded(ColumnType{SemanticType: ColumnType_INT}, DatumEncoding_ASCENDING_KEY, encoded)
 
 	if y.IsUnset() {
 		t.Errorf("unset after EncDatumFromEncoded")
@@ -68,7 +70,7 @@ func TestEncDatum(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cmp := y.Datum.Compare(x.Datum); cmp != 0 {
+	if cmp := y.Datum.Compare(evalCtx, x.Datum); cmp != 0 {
 		t.Errorf("Datums should be equal, cmp = %d", cmp)
 	}
 
@@ -82,7 +84,7 @@ func TestEncDatum(t *testing.T) {
 	} else if enc != DatumEncoding_ASCENDING_KEY {
 		t.Errorf("invalid encoding %d", enc)
 	}
-	z := EncDatumFromEncoded(ColumnType_INT, DatumEncoding_DESCENDING_KEY, enc2)
+	z := EncDatumFromEncoded(ColumnType{SemanticType: ColumnType_INT}, DatumEncoding_DESCENDING_KEY, enc2)
 	if enc, ok := z.Encoding(); !ok {
 		t.Error("no encoding")
 	} else if enc != DatumEncoding_DESCENDING_KEY {
@@ -95,7 +97,7 @@ func TestEncDatum(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cmp := y.Datum.Compare(z.Datum); cmp != 0 {
+	if cmp := y.Datum.Compare(evalCtx, z.Datum); cmp != 0 {
 		t.Errorf("Datums should be equal, cmp = %d", cmp)
 	}
 	y.UnsetDatum()
@@ -108,7 +110,7 @@ func TestEncDatumNull(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
 	// Verify DNull is null.
-	n := DatumToEncDatum(ColumnType_INT, parser.DNull)
+	n := DatumToEncDatum(ColumnType{SemanticType: ColumnType_INT}, parser.DNull)
 	if !n.IsNull() {
 		t.Error("DNull not null")
 	}
@@ -126,9 +128,10 @@ func TestEncDatumNull(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			b := EncDatumFromEncoded(ColumnType_INT, DatumEncoding(enc), encoded)
+			b := EncDatumFromEncoded(ColumnType{SemanticType: ColumnType_INT}, DatumEncoding(enc), encoded)
 			if a.IsNull() != b.IsNull() {
-				t.Errorf("before: %s (null=%t)  after: %s (null=%t)", a, a.IsNull(), b, b.IsNull())
+				t.Errorf("before: %s (null=%t) after: %s (null=%t)",
+					a.String(), a.IsNull(), b.String(), b.IsNull())
 			}
 		}
 	}
@@ -158,7 +161,9 @@ func checkEncDatumCmp(
 
 	dec2 := EncDatumFromEncoded(v2.Type, enc2, buf2)
 
-	if val, err := dec1.Compare(a, &dec2); err != nil {
+	evalCtx := parser.NewTestingEvalContext()
+	defer evalCtx.Stop(context.Background())
+	if val, err := dec1.Compare(a, evalCtx, &dec2); err != nil {
 		t.Fatal(err)
 	} else if val != expectedCmp {
 		t.Errorf("comparing %s (%s), %s (%s) resulted in %d, expected %d",
@@ -180,27 +185,33 @@ func TestEncDatumCompare(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
 	a := &DatumAlloc{}
+	evalCtx := parser.NewTestingEvalContext()
+	defer evalCtx.Stop(context.Background())
 	rng, _ := randutil.NewPseudoRand()
 
-	for typ := range ColumnType_Kind_name {
-		typ := ColumnType_Kind(typ)
-		// TODO(cuongdo): we don't support persistence for arrays yet
-		if typ == ColumnType_INT_ARRAY {
+	for kind := range ColumnType_SemanticType_name {
+		kind := ColumnType_SemanticType(kind)
+		if kind == ColumnType_NULL || kind == ColumnType_ARRAY || kind == ColumnType_INT2VECTOR {
 			continue
 		}
+		typ := ColumnType{SemanticType: kind}
+		if kind == ColumnType_COLLATEDSTRING {
+			typ.Locale = RandCollationLocale(rng)
+		}
+
 		// Generate two datums d1 < d2
 		var d1, d2 parser.Datum
 		for {
 			d1 = RandDatum(rng, typ, false)
 			d2 = RandDatum(rng, typ, false)
-			if cmp := d1.Compare(d2); cmp < 0 {
+			if cmp := d1.Compare(evalCtx, d2); cmp < 0 {
 				break
 			}
 		}
 		v1 := DatumToEncDatum(typ, d1)
 		v2 := DatumToEncDatum(typ, d2)
 
-		if val, err := v1.Compare(a, &v2); err != nil {
+		if val, err := v1.Compare(a, evalCtx, &v2); err != nil {
 			t.Fatal(err)
 		} else if val != -1 {
 			t.Errorf("compare(1, 2) = %d", val)
@@ -220,10 +231,14 @@ func TestEncDatumCompare(t *testing.T) {
 		checkEncDatumCmp(t, a, &v1, &v1, desc, desc, 0, false)
 		checkEncDatumCmp(t, a, &v2, &v2, desc, desc, 0, false)
 
-		checkEncDatumCmp(t, a, &v1, &v2, noncmp, noncmp, -1, true)
-		checkEncDatumCmp(t, a, &v2, &v1, desc, noncmp, +1, true)
-		checkEncDatumCmp(t, a, &v1, &v1, asc, desc, 0, true)
-		checkEncDatumCmp(t, a, &v2, &v2, desc, asc, 0, true)
+		// These cases require decoding. Data with a composite key encoding cannot
+		// be decoded from their key part alone.
+		if !HasCompositeKeyEncoding(kind) {
+			checkEncDatumCmp(t, a, &v1, &v2, noncmp, noncmp, -1, true)
+			checkEncDatumCmp(t, a, &v2, &v1, desc, noncmp, +1, true)
+			checkEncDatumCmp(t, a, &v1, &v1, asc, desc, 0, true)
+			checkEncDatumCmp(t, a, &v2, &v2, desc, asc, 0, true)
+		}
 	}
 }
 
@@ -231,6 +246,8 @@ func TestEncDatumFromBuffer(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
 	var alloc DatumAlloc
+	evalCtx := parser.NewTestingEvalContext()
+	defer evalCtx.Stop(context.Background())
 	rng, _ := randutil.NewPseudoRand()
 	for test := 0; test < 20; test++ {
 		var err error
@@ -243,7 +260,13 @@ func TestEncDatumFromBuffer(t *testing.T) {
 		var buf []byte
 		enc := make([]DatumEncoding, len(ed))
 		for i := range ed {
-			enc[i] = RandDatumEncoding(rng)
+			if HasCompositeKeyEncoding(ed[i].Type.SemanticType) {
+				// There's no way to reconstruct data from the key part of a composite
+				// encoding.
+				enc[i] = DatumEncoding_VALUE
+			} else {
+				enc[i] = RandDatumEncoding(rng)
+			}
 			buf, err = ed[i].Encode(&alloc, enc[i], buf)
 			if err != nil {
 				t.Fatal(err)
@@ -264,7 +287,7 @@ func TestEncDatumFromBuffer(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if decoded.Datum.Compare(ed[i].Datum) != 0 {
+			if decoded.Datum.Compare(evalCtx, ed[i].Datum) != 0 {
 				t.Errorf("decoded datum %s doesn't equal original %s", decoded.Datum, ed[i].Datum)
 			}
 		}
@@ -279,7 +302,7 @@ func TestEncDatumRowCompare(t *testing.T) {
 
 	v := [5]EncDatum{}
 	for i := range v {
-		v[i] = DatumToEncDatum(ColumnType_INT, parser.NewDInt(parser.DInt(i)))
+		v[i] = DatumToEncDatum(ColumnType{SemanticType: ColumnType_INT}, parser.NewDInt(parser.DInt(i)))
 	}
 
 	asc := encoding.Ascending
@@ -371,8 +394,10 @@ func TestEncDatumRowCompare(t *testing.T) {
 	}
 
 	a := &DatumAlloc{}
+	evalCtx := parser.NewTestingEvalContext()
+	defer evalCtx.Stop(context.Background())
 	for _, c := range testCases {
-		cmp, err := c.row1.Compare(a, c.ord, c.row2)
+		cmp, err := c.row1.Compare(a, c.ord, evalCtx, c.row2)
 		if err != nil {
 			t.Error(err)
 		} else if cmp != c.cmp {
@@ -385,6 +410,8 @@ func TestEncDatumRowCompare(t *testing.T) {
 func TestEncDatumRowAlloc(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
+	evalCtx := parser.NewTestingEvalContext()
+	defer evalCtx.Stop(context.Background())
 	rng, _ := randutil.NewPseudoRand()
 	for _, cols := range []int{1, 2, 4, 10, 40, 100} {
 		for _, rows := range []int{1, 2, 3, 5, 10, 20} {
@@ -413,7 +440,7 @@ func TestEncDatumRowAlloc(t *testing.T) {
 			}
 			for i := 0; i < rows; i++ {
 				for j := 0; j < cols; j++ {
-					if a, b := in[i][j].Datum, out[i][j].Datum; a.Compare(b) != 0 {
+					if a, b := in[i][j].Datum, out[i][j].Datum; a.Compare(evalCtx, b) != 0 {
 						t.Errorf("copied datum %s doesn't equal original %s", b, a)
 					}
 				}

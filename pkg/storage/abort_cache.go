@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Tobias Schottdorf (tobias@cockroachlabs.com)
 
 package storage
 
@@ -34,8 +32,17 @@ import (
 // protection against an aborted but active transaction not reading
 // values it wrote (due to its intents having been removed).
 //
-// The AbortCache stores responses in the underlying engine, using
-// keys derived from Range ID and txn ID.
+// The cache is range-specific. It is updated when an intent for an aborted txn
+// is cleared from a range, and is consulted before read commands are processed
+// on a range.
+//
+// The AbortCache stores responses in the underlying engine, using keys derived
+// from Range ID and txn ID.
+// Note that the epoch number is not used to query the cache: once aborted, even
+// higher epochs are prohibited from reading data. That's because, for better or
+// worse, the intent resolution process clears intents even from epochs higher
+// than the txn meta used for clearing (see engine.MVCCResolveWriteIntent), and
+// this clearing can race with the new epoch laying intents.
 //
 // A AbortCache is not thread safe. Access to it is serialized
 // through Raft.
@@ -66,23 +73,34 @@ func fillUUID(b byte) uuid.UUID {
 var txnIDMin = fillUUID('\x00')
 var txnIDMax = fillUUID('\xff')
 
+func abortCacheMinKey(rangeID roachpb.RangeID) roachpb.Key {
+	return keys.AbortCacheKey(rangeID, txnIDMin)
+}
+
 func (sc *AbortCache) min() roachpb.Key {
-	return keys.AbortCacheKey(sc.rangeID, txnIDMin)
+	return abortCacheMinKey(sc.rangeID)
+}
+
+func abortCacheMaxKey(rangeID roachpb.RangeID) roachpb.Key {
+	return keys.AbortCacheKey(rangeID, txnIDMax)
 }
 
 func (sc *AbortCache) max() roachpb.Key {
-	return keys.AbortCacheKey(sc.rangeID, txnIDMax)
+	return abortCacheMaxKey(sc.rangeID)
 }
 
 // ClearData removes all persisted items stored in the cache.
 func (sc *AbortCache) ClearData(e engine.Engine) error {
-	b := e.NewBatch()
+	iter := e.NewIterator(false)
+	defer iter.Close()
+	b := e.NewWriteOnlyBatch()
 	defer b.Close()
-	_, err := engine.ClearRange(b, engine.MakeMVCCMetadataKey(sc.min()), engine.MakeMVCCMetadataKey(sc.max()))
+	err := b.ClearIterRange(iter, engine.MakeMVCCMetadataKey(sc.min()),
+		engine.MakeMVCCMetadataKey(sc.max()))
 	if err != nil {
 		return err
 	}
-	return b.Commit()
+	return b.Commit(false /* !sync */)
 }
 
 // Get looks up an abort cache entry recorded for this transaction ID.
@@ -93,7 +111,7 @@ func (sc *AbortCache) Get(
 
 	// Pull response from disk and read into reply if available.
 	key := keys.AbortCacheKey(sc.rangeID, txnID)
-	ok, err := engine.MVCCGetProto(ctx, e, key, hlc.ZeroTimestamp, true /* consistent */, nil /* txn */, entry)
+	ok, err := engine.MVCCGetProto(ctx, e, key, hlc.Timestamp{}, true /* consistent */, nil /* txn */, entry)
 	return ok, err
 }
 
@@ -104,7 +122,7 @@ func (sc *AbortCache) Get(
 func (sc *AbortCache) Iterate(
 	ctx context.Context, e engine.Reader, f func([]byte, roachpb.AbortCacheEntry),
 ) {
-	_, _ = engine.MVCCIterate(ctx, e, sc.min(), sc.max(), hlc.ZeroTimestamp,
+	_, _ = engine.MVCCIterate(ctx, e, sc.min(), sc.max(), hlc.Timestamp{},
 		true /* consistent */, nil /* txn */, false, /* !reverse */
 		func(kv roachpb.KeyValue) (bool, error) {
 			var entry roachpb.AbortCacheEntry
@@ -193,7 +211,7 @@ func (sc *AbortCache) Del(
 	ctx context.Context, e engine.ReadWriter, ms *enginepb.MVCCStats, txnID uuid.UUID,
 ) error {
 	key := keys.AbortCacheKey(sc.rangeID, txnID)
-	return engine.MVCCDelete(ctx, e, ms, key, hlc.ZeroTimestamp, nil /* txn */)
+	return engine.MVCCDelete(ctx, e, ms, key, hlc.Timestamp{}, nil /* txn */)
 }
 
 // Put writes an entry for the specified transaction ID.
@@ -205,7 +223,7 @@ func (sc *AbortCache) Put(
 	entry *roachpb.AbortCacheEntry,
 ) error {
 	key := keys.AbortCacheKey(sc.rangeID, txnID)
-	return engine.MVCCPutProto(ctx, e, ms, key, hlc.ZeroTimestamp, nil /* txn */, entry)
+	return engine.MVCCPutProto(ctx, e, ms, key, hlc.Timestamp{}, nil /* txn */, entry)
 }
 
 func decodeAbortCacheMVCCKey(encKey engine.MVCCKey, dest []byte) (uuid.UUID, error) {

@@ -11,14 +11,14 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Peter Mattis (peter@cockroachlabs.com)
 
 package sql
 
 import (
 	"fmt"
 	"testing"
+
+	"golang.org/x/net/context"
 
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
@@ -31,17 +31,22 @@ func testTableDesc() *sqlbase.TableDescriptor {
 		ID:       1001,
 		ParentID: 1000,
 		Columns: []sqlbase.ColumnDescriptor{
-			{Name: "a", Type: sqlbase.ColumnType{Kind: sqlbase.ColumnType_INT}},
-			{Name: "b", Type: sqlbase.ColumnType{Kind: sqlbase.ColumnType_INT}},
-			{Name: "c", Type: sqlbase.ColumnType{Kind: sqlbase.ColumnType_BOOL}},
-			{Name: "d", Type: sqlbase.ColumnType{Kind: sqlbase.ColumnType_BOOL}},
-			{Name: "e", Type: sqlbase.ColumnType{Kind: sqlbase.ColumnType_BOOL}},
-			{Name: "f", Type: sqlbase.ColumnType{Kind: sqlbase.ColumnType_BOOL}},
-			{Name: "g", Type: sqlbase.ColumnType{Kind: sqlbase.ColumnType_BOOL}},
-			{Name: "h", Type: sqlbase.ColumnType{Kind: sqlbase.ColumnType_FLOAT}},
-			{Name: "i", Type: sqlbase.ColumnType{Kind: sqlbase.ColumnType_STRING}},
-			{Name: "j", Type: sqlbase.ColumnType{Kind: sqlbase.ColumnType_INT}},
-			{Name: "k", Type: sqlbase.ColumnType{Kind: sqlbase.ColumnType_BYTES}},
+			{Name: "a", Type: sqlbase.ColumnType{SemanticType: sqlbase.ColumnType_INT}},
+			{Name: "b", Type: sqlbase.ColumnType{SemanticType: sqlbase.ColumnType_INT}},
+			{Name: "c", Type: sqlbase.ColumnType{SemanticType: sqlbase.ColumnType_BOOL}},
+			{Name: "d", Type: sqlbase.ColumnType{SemanticType: sqlbase.ColumnType_BOOL}},
+			{Name: "e", Type: sqlbase.ColumnType{SemanticType: sqlbase.ColumnType_BOOL}},
+			{Name: "f", Type: sqlbase.ColumnType{SemanticType: sqlbase.ColumnType_BOOL}},
+			{Name: "g", Type: sqlbase.ColumnType{SemanticType: sqlbase.ColumnType_BOOL}},
+			{Name: "h", Type: sqlbase.ColumnType{SemanticType: sqlbase.ColumnType_FLOAT}},
+			{Name: "i", Type: sqlbase.ColumnType{SemanticType: sqlbase.ColumnType_STRING}},
+			{Name: "j", Type: sqlbase.ColumnType{SemanticType: sqlbase.ColumnType_INT}},
+			{Name: "k", Type: sqlbase.ColumnType{SemanticType: sqlbase.ColumnType_BYTES}},
+			{Name: "l", Type: sqlbase.ColumnType{SemanticType: sqlbase.ColumnType_DECIMAL}},
+			{Name: "m", Type: sqlbase.ColumnType{SemanticType: sqlbase.ColumnType_DECIMAL}},
+			{Name: "n", Type: sqlbase.ColumnType{SemanticType: sqlbase.ColumnType_DATE}},
+			{Name: "o", Type: sqlbase.ColumnType{SemanticType: sqlbase.ColumnType_TIMESTAMP}},
+			{Name: "p", Type: sqlbase.ColumnType{SemanticType: sqlbase.ColumnType_TIMESTAMPTZ}},
 		},
 		PrimaryIndex: sqlbase.IndexDescriptor{
 			Name: "primary", Unique: true, ColumnNames: []string{"a"},
@@ -52,7 +57,7 @@ func testTableDesc() *sqlbase.TableDescriptor {
 	}
 }
 
-func makeSelectNode(t *testing.T) *selectNode {
+func makeSelectNode(t *testing.T) *renderNode {
 	desc := testTableDesc()
 	sel := testInitDummySelectNode(desc)
 	if err := desc.AllocateIDs(); err != nil {
@@ -60,12 +65,14 @@ func makeSelectNode(t *testing.T) *selectNode {
 	}
 	numColumns := len(sel.sourceInfo[0].sourceColumns)
 	sel.ivarHelper = parser.MakeIndexedVarHelper(sel, numColumns)
-	sel.curSourceRow = make(parser.DTuple, numColumns)
+	sel.curSourceRow = make(parser.Datums, numColumns)
 	return sel
 }
 
-func parseAndNormalizeExpr(t *testing.T, sql string, sel *selectNode) parser.TypedExpr {
-	expr, err := parser.ParseExprTraditional(sql)
+func parseAndNormalizeExpr(
+	t *testing.T, evalCtx *parser.EvalContext, sql string, sel *renderNode,
+) parser.TypedExpr {
+	expr, err := parser.ParseExpr(sql)
 	if err != nil {
 		t.Fatalf("%s: %v", sql, err)
 	}
@@ -79,14 +86,13 @@ func parseAndNormalizeExpr(t *testing.T, sql string, sel *selectNode) parser.Typ
 	if err != nil {
 		t.Fatalf("%s: %v", sql, err)
 	}
-	ctx := &parser.EvalContext{}
-	if typedExpr, err = ctx.NormalizeExpr(typedExpr); err != nil {
+	if typedExpr, err = evalCtx.NormalizeExpr(typedExpr); err != nil {
 		t.Fatalf("%s: %v", sql, err)
 	}
 	return typedExpr
 }
 
-func checkEquivExpr(a, b parser.TypedExpr, sel *selectNode) error {
+func checkEquivExpr(evalCtx *parser.EvalContext, a, b parser.TypedExpr, sel *renderNode) error {
 	// The expressions above only use the values 1 and 2. Verify that the
 	// simplified expressions evaluate to the same value as the original
 	// expression for interesting values.
@@ -100,12 +106,11 @@ func checkEquivExpr(a, b parser.TypedExpr, sel *selectNode) error {
 		for i := range sel.curSourceRow {
 			sel.curSourceRow[i] = v
 		}
-		ctx := &parser.EvalContext{}
-		da, err := a.Eval(ctx)
+		da, err := a.Eval(evalCtx)
 		if err != nil {
 			return fmt.Errorf("%s: %v", a, err)
 		}
-		db, err := b.Eval(ctx)
+		db, err := b.Eval(evalCtx)
 		if err != nil {
 			return fmt.Errorf("%s: %v", b, err)
 		}
@@ -133,9 +138,11 @@ func TestSplitOrExpr(t *testing.T) {
 	}
 	for _, d := range testData {
 		t.Run(d.expr+"~"+d.expected, func(t *testing.T) {
+			evalCtx := parser.NewTestingEvalContext()
+			defer evalCtx.Stop(context.Background())
 			sel := makeSelectNode(t)
-			expr := parseAndNormalizeExpr(t, d.expr, sel)
-			exprs := splitOrExpr(expr, nil)
+			expr := parseAndNormalizeExpr(t, evalCtx, d.expr, sel)
+			exprs := splitOrExpr(evalCtx, expr, nil)
 			if s := exprs.String(); d.expected != s {
 				t.Errorf("%s: expected %s, but found %s", d.expr, d.expected, s)
 			}
@@ -157,9 +164,11 @@ func TestSplitAndExpr(t *testing.T) {
 	}
 	for _, d := range testData {
 		t.Run(d.expr+"~"+d.expected, func(t *testing.T) {
+			evalCtx := parser.NewTestingEvalContext()
+			defer evalCtx.Stop(context.Background())
 			sel := makeSelectNode(t)
-			expr := parseAndNormalizeExpr(t, d.expr, sel)
-			exprs := splitAndExpr(expr, nil)
+			expr := parseAndNormalizeExpr(t, evalCtx, d.expr, sel)
+			exprs := splitAndExpr(evalCtx, expr, nil)
 			if s := exprs.String(); d.expected != s {
 				t.Errorf("%s: expected %s, but found %s", d.expr, d.expected, s)
 			}
@@ -199,7 +208,7 @@ func TestSimplifyExpr(t *testing.T) {
 		{`a >= NULL`, `NULL`, true},
 		{`a < NULL`, `NULL`, true},
 		{`a <= NULL`, `NULL`, true},
-		{`a IN (NULL)`, `false`, true},
+		{`a IN (NULL)`, `NULL`, true},
 
 		{`f < false`, `false`, true},
 		{`f < true`, `f < true`, true},
@@ -220,8 +229,8 @@ func TestSimplifyExpr(t *testing.T) {
 
 		{`a IN (1, 1)`, `a IN (1)`, true},
 		{`a IN (2, 3, 1)`, `a IN (1, 2, 3)`, true},
-		{`a IN (1, NULL, 2, NULL)`, `a IN (1, 2)`, true},
-		{`a IN (1, NULL) OR a IN (2, NULL)`, `a IN (1, 2)`, true},
+		{`a IN (1, NULL, 2, NULL)`, `a IN (NULL, 1, 2)`, true},
+		{`a IN (1, NULL) OR a IN (2, NULL)`, `a IN (NULL, 1, 2)`, true},
 
 		{`(a, b) IN ((1, 2))`, `(a, b) IN ((1, 2))`, true},
 		{`(a, b) IN ((1, 2), (1, 2))`, `(a, b) IN ((1, 2))`, true},
@@ -266,12 +275,25 @@ func TestSimplifyExpr(t *testing.T) {
 			`(a < 0) AND (b > 0)`, true},
 		{`((a < 0) OR (a < 0 OR b > 0)) AND (a > 0 OR a < 1)`,
 			`((a < 0) OR (b > 0)) AND (a IS NOT NULL)`, true},
+
+		// Contains mixed date-type comparisons.
+		{`n >= DATE '1997-01-01' AND n < (DATE '1997-01-01' + INTERVAL '1' year)`,
+			`(n >= '1997-01-01') AND (n < '1998-01-01 00:00:00+00:00')`, true},
+		{`o >= DATE '1997-01-01' AND o < (DATE '1997-01-01' + INTERVAL '1' year)`,
+			`(o >= '1997-01-01') AND (o < '1998-01-01 00:00:00+00:00')`, true},
+		{`p >= DATE '1997-01-01' AND p < (DATE '1997-01-01' + INTERVAL '1' year)`,
+			`(p >= '1997-01-01') AND (p < '1998-01-01 00:00:00+00:00')`, true},
 	}
 	for _, d := range testData {
 		t.Run(d.expr+"~"+d.expected, func(t *testing.T) {
+			evalCtx := parser.NewTestingEvalContext()
+			defer evalCtx.Stop(context.Background())
 			sel := makeSelectNode(t)
-			expr := parseAndNormalizeExpr(t, d.expr, sel)
-			expr, equiv := simplifyExpr(expr)
+			// We need to manually close this memory account because we're doing the
+			// evals ourselves here.
+			defer evalCtx.ActiveMemAcc.Close(context.Background())
+			expr := parseAndNormalizeExpr(t, evalCtx, d.expr, sel)
+			expr, equiv := simplifyExpr(evalCtx, expr)
 			if s := expr.String(); d.expected != s {
 				t.Errorf("%s: structure: expected %s, but found %s", d.expr, d.expected, s)
 			}
@@ -308,9 +330,11 @@ func TestSimplifyNotExpr(t *testing.T) {
 	}
 	for _, d := range testData {
 		t.Run(d.expr+"~"+d.expected, func(t *testing.T) {
+			evalCtx := parser.NewTestingEvalContext()
+			defer evalCtx.Stop(context.Background())
 			sel := makeSelectNode(t)
-			expr1 := parseAndNormalizeExpr(t, d.expr, sel)
-			expr2, equiv := simplifyExpr(expr1)
+			expr1 := parseAndNormalizeExpr(t, evalCtx, d.expr, sel)
+			expr2, equiv := simplifyExpr(evalCtx, expr1)
 			if s := expr2.String(); d.expected != s {
 				t.Errorf("%s: expected %s, but found %s", d.expr, d.expected, s)
 			}
@@ -318,7 +342,7 @@ func TestSimplifyNotExpr(t *testing.T) {
 				t.Errorf("%s: expected %v, but found %v", d.expr, d.isEquiv, equiv)
 			}
 			if d.checkEquiv {
-				if err := checkEquivExpr(expr1, expr2, sel); err != nil {
+				if err := checkEquivExpr(evalCtx, expr1, expr2, sel); err != nil {
 					t.Error(err)
 				}
 			}
@@ -343,9 +367,11 @@ func TestSimplifyAndExpr(t *testing.T) {
 	}
 	for _, d := range testData {
 		t.Run(d.expr+"~"+d.expected, func(t *testing.T) {
+			evalCtx := parser.NewTestingEvalContext()
+			defer evalCtx.Stop(context.Background())
 			sel := makeSelectNode(t)
-			expr1 := parseAndNormalizeExpr(t, d.expr, sel)
-			expr2, equiv := simplifyExpr(expr1)
+			expr1 := parseAndNormalizeExpr(t, evalCtx, d.expr, sel)
+			expr2, equiv := simplifyExpr(evalCtx, expr1)
 			if s := expr2.String(); d.expected != s {
 				t.Errorf("%s: expected %s, but found %s", d.expr, d.expected, s)
 			}
@@ -546,16 +572,18 @@ func TestSimplifyAndExprCheck(t *testing.T) {
 	}
 	for _, d := range testData {
 		t.Run(d.expr+"~"+d.expected, func(t *testing.T) {
+			evalCtx := parser.NewTestingEvalContext()
+			defer evalCtx.Stop(context.Background())
 			sel := makeSelectNode(t)
-			expr1 := parseAndNormalizeExpr(t, d.expr, sel)
-			expr2, equiv := simplifyExpr(expr1)
+			expr1 := parseAndNormalizeExpr(t, evalCtx, d.expr, sel)
+			expr2, equiv := simplifyExpr(evalCtx, expr1)
 			if s := expr2.String(); d.expected != s {
 				t.Errorf("%s: expected %s, but found %s", d.expr, d.expected, s)
 			}
 			if d.checkEquiv != equiv {
 				t.Errorf("%s: expected %v, but found %v", d.expr, d.checkEquiv, equiv)
 			}
-			err := checkEquivExpr(expr1, expr2, sel)
+			err := checkEquivExpr(evalCtx, expr1, expr2, sel)
 			if d.checkEquiv && err != nil {
 				t.Error(err)
 				return
@@ -567,10 +595,10 @@ func TestSimplifyAndExprCheck(t *testing.T) {
 			if _, ok := expr2.(*parser.AndExpr); !ok {
 				// The result was not an AND expression. Re-parse to re-resolve names
 				// and verify that the analysis is commutative.
-				expr1 = parseAndNormalizeExpr(t, d.expr, sel)
+				expr1 = parseAndNormalizeExpr(t, evalCtx, d.expr, sel)
 				andExpr := expr1.(*parser.AndExpr)
 				andExpr.Left, andExpr.Right = andExpr.Right, andExpr.Left
-				expr3, equiv := simplifyExpr(andExpr)
+				expr3, equiv := simplifyExpr(evalCtx, andExpr)
 				if s := expr3.String(); d.expected != s {
 					t.Errorf("%s: expected %s, but found %s", expr1, d.expected, s)
 				}
@@ -596,9 +624,11 @@ func TestSimplifyOrExpr(t *testing.T) {
 	}
 	for _, d := range testData {
 		t.Run(d.expr+"~"+d.expected, func(t *testing.T) {
+			evalCtx := parser.NewTestingEvalContext()
+			defer evalCtx.Stop(context.Background())
 			sel := makeSelectNode(t)
-			expr1 := parseAndNormalizeExpr(t, d.expr, sel)
-			expr2, _ := simplifyExpr(expr1)
+			expr1 := parseAndNormalizeExpr(t, evalCtx, d.expr, sel)
+			expr2, _ := simplifyExpr(evalCtx, expr1)
 			if s := expr2.String(); d.expected != s {
 				t.Errorf("%s: expected %s, but found %s", d.expr, d.expected, s)
 			}
@@ -769,9 +799,11 @@ func TestSimplifyOrExprCheck(t *testing.T) {
 	}
 	for _, d := range testData {
 		t.Run(d.expr+"~"+d.expected, func(t *testing.T) {
+			evalCtx := parser.NewTestingEvalContext()
+			defer evalCtx.Stop(context.Background())
 			sel := makeSelectNode(t)
-			expr1 := parseAndNormalizeExpr(t, d.expr, sel)
-			expr2, equiv := simplifyExpr(expr1)
+			expr1 := parseAndNormalizeExpr(t, evalCtx, d.expr, sel)
+			expr2, equiv := simplifyExpr(evalCtx, expr1)
 			if s := expr2.String(); d.expected != s {
 				t.Errorf("%s: expected %s, but found %s", d.expr, d.expected, s)
 			}
@@ -779,7 +811,7 @@ func TestSimplifyOrExprCheck(t *testing.T) {
 				t.Errorf("%s: expected equivalent, but found %v", d.expr, equiv)
 			}
 
-			if err := checkEquivExpr(expr1, expr2, sel); err != nil {
+			if err := checkEquivExpr(evalCtx, expr1, expr2, sel); err != nil {
 				t.Error(err)
 				return
 			}
@@ -787,10 +819,10 @@ func TestSimplifyOrExprCheck(t *testing.T) {
 			if _, ok := expr2.(*parser.OrExpr); !ok {
 				// The result was not an OR expression. Re-parse to re-resolve names
 				// and verify that the analysis is commutative.
-				expr1 = parseAndNormalizeExpr(t, d.expr, sel)
+				expr1 = parseAndNormalizeExpr(t, evalCtx, d.expr, sel)
 				orExpr := expr1.(*parser.OrExpr)
 				orExpr.Left, orExpr.Right = orExpr.Right, orExpr.Left
-				expr3, equiv := simplifyExpr(orExpr)
+				expr3, equiv := simplifyExpr(evalCtx, orExpr)
 				if s := expr3.String(); d.expected != s {
 					t.Errorf("%s: expected %s, but found %s", expr1, d.expected, s)
 				}

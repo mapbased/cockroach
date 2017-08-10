@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Cuong Do (cdo@cockroachlabs.com)
 
 package cli
 
@@ -41,6 +39,10 @@ many Unix-like systems, use "--path=/usr/local/share/man/man1".
 }
 
 func runGenManCmd(cmd *cobra.Command, args []string) error {
+	if len(args) > 0 {
+		return usageAndError(cmd)
+	}
+
 	info := build.GetInfo()
 	header := &doc.GenManHeader{
 		Section: "1",
@@ -92,6 +94,9 @@ package (or an equivalent) and follow the post-install instructions.
 }
 
 func runGenAutocompleteCmd(cmd *cobra.Command, args []string) error {
+	if len(args) > 0 {
+		return usageAndError(cmd)
+	}
 	if err := cmd.Root().GenBashCompletionFile(autoCompletePath); err != nil {
 		return err
 	}
@@ -112,6 +117,7 @@ var genCmds = []*cobra.Command{
 	genManCmd,
 	genAutocompleteCmd,
 	genExamplesCmd,
+	genHAProxyCmd,
 }
 
 func init() {
@@ -119,6 +125,8 @@ func init() {
 		"path where man pages will be outputted")
 	genAutocompleteCmd.PersistentFlags().StringVar(&autoCompletePath, "out", "cockroach.bash",
 		"path to generated autocomplete file")
+	genHAProxyCmd.PersistentFlags().StringVar(&haProxyPath, "out", "haproxy.cfg",
+		"path to generated haproxy configuration file")
 
 	genCmd.AddCommand(genCmds...)
 }

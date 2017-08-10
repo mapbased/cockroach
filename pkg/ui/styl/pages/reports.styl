@@ -1,0 +1,146 @@
+$reports-table
+  margin 0 0 40px
+  display table
+  border-collapse collapse
+  border-spacing 0
+
+  &__row
+    display table-row
+    background-color $table-border-color
+
+    &--header
+      font-weight 900
+      color white
+      border 0
+      border-style none
+
+  &__cell
+    padding 6px 12px
+    display table-cell
+    height 20px
+    overflow hidden
+    text-overflow ellipsis
+    white-space nowrap
+    max-width 200px
+    border-width 1px 1px 0 0
+    border-color rgba(0, 0, 0, .1)
+    border-style solid
+
+    &--header
+      font-weight 900
+      color white
+      border 0
+      border-style none
+
+    &--short
+      max-width 1px
+
+.failure-table
+  @extend $reports-table
+
+  &__row
+    alternating-background white $table-border-color
+
+    &&--header
+      background-color $alert-color
+
+  &__cell
+    white-space normal
+    max-width none
+
+.problems-table
+  @extend $reports-table
+  width 100%
+
+  &__row
+    background-color white
+
+  &__cell
+    white-space normal
+
+.node-filter-list
+  list-style-position inside
+  margin 5px
+
+.network-table
+  @extend $reports-table
+
+  &__cell
+    background-color white
+    text-align center
+    width 6em
+
+    &&--header
+      background-color $link-color
+
+    &&--header:nth-child(1)
+      width 3em
+
+    &&--header-warning
+      color $alert-color
+
+    &&--spacer
+      border 0
+      background-color $background-color
+      width 3em
+
+    &&--self
+      background-color $table-border-color
+
+    &&--stddev-plus-2
+      background-color lighten($alert-color, 10%)
+
+    &&--stddev-plus-1
+      background-color lighten($alert-color, 50%)
+
+    &&--stddev-even
+      background-color white
+
+    &&--stddev-minus-1
+      background-color lighten($healthy-color, 50%)
+
+    &&--stddev-minus-2
+      background-color lighten($healthy-color, 10%)
+
+    &&--no-connection
+        color $alert-color
+
+.nodes-table
+  @extend $reports-table
+  font-size 12px
+
+  &__cell
+    background-color white
+    padding 6px 12px
+
+    &--header
+      background-color $link-color
+      text-align right
+
+    &--header-warning
+      color $alert-color
+
+.nodes-entries-list
+  list-style-type none
+  margin 0
+  padding 0
+
+.certs-table
+  @extend $reports-table
+
+  &__cell
+    background-color white
+    padding 6px 12px
+    max-width none
+
+    &--header
+      background-color $link-color
+      text-align right
+
+    &--header-warning
+      color $alert-color
+
+.certs-entries-list
+  list-style-type none
+  margin 0
+  padding 0

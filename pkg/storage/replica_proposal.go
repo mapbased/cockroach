@@ -11,25 +11,31 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Tobias Schottdorf (tobias.schottdorf@gmail.com)
 
 package storage
 
 import (
+	"fmt"
+	"io/ioutil"
+	"os"
+	"path/filepath"
 	"time"
 
-	"golang.org/x/net/context"
-
-	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	"github.com/cockroachdb/cockroach/pkg/storage/engine/enginepb"
-	"github.com/cockroachdb/cockroach/pkg/storage/storagebase"
-	"github.com/cockroachdb/cockroach/pkg/util/hlc"
-	"github.com/cockroachdb/cockroach/pkg/util/log"
-	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/coreos/etcd/raft"
 	"github.com/kr/pretty"
 	"github.com/pkg/errors"
+	"golang.org/x/net/context"
+
+	"github.com/cockroachdb/cockroach/pkg/keys"
+	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
+	"github.com/cockroachdb/cockroach/pkg/storage/engine"
+	"github.com/cockroachdb/cockroach/pkg/storage/engine/enginepb"
+	"github.com/cockroachdb/cockroach/pkg/storage/storagebase"
+	"github.com/cockroachdb/cockroach/pkg/util"
+	"github.com/cockroachdb/cockroach/pkg/util/hlc"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 )
 
 // leaseMetricsType is used to distinguish between various lease
@@ -70,13 +76,15 @@ type ProposalData struct {
 	endCmds *endCmds
 
 	// doneCh is used to signal the waiting RPC handler (the contents of
-	// proposalResult come from LocalEvalResult)
+	// proposalResult come from LocalEvalResult).
+	//
+	// Attention: this channel is not to be signaled directly downstream of Raft.
+	// Always use ProposalData.finishRaftApplication().
 	doneCh chan proposalResult
 
-	// Local contains the results of evaluating the request in
-	// propEvalKV, tying the upstream evaluation of the request to the
-	// downstream application of the command. If propEvalKV is false,
-	// Local is nil.
+	// Local contains the results of evaluating the request
+	// tying the upstream evaluation of the request to the
+	// downstream application of the command.
 	Local *LocalEvalResult
 
 	// Request is the client's original BatchRequest.
@@ -90,12 +98,23 @@ type ProposalData struct {
 	Request *roachpb.BatchRequest
 }
 
-// finish first invokes the endCmds function and then sends the
-// specified proposalResult on the proposal's done channel. endCmds is
-// invoked here in order to allow the original client to be cancelled
-// and possibly no longer listening to this done channel, and so can't
-// be counted on to invoke endCmds itself.
-func (proposal *ProposalData) finish(pr proposalResult) {
+// finishRaftApplication is called downstream of Raft when a command application
+// has finished. proposal.doneCh is signaled with pr so that the proposer is
+// unblocked.
+//
+// It first invokes the endCmds function and then sends the specified
+// proposalResult on the proposal's done channel. endCmds is invoked here in
+// order to allow the original client to be cancelled and possibly no longer
+// listening to this done channel, and so can't be counted on to invoke endCmds
+// itself.
+//
+// Note: this should not be called upstream of Raft because, in case pr.Err is
+// set, it clears the intents from pr before sending it on the channel. This
+// clearing should not be done upstream of Raft because, in cases of errors
+// encountered upstream of Raft, we might still want to resolve intents:
+// upstream of Raft, pr.intents represent intents encountered by a request, not
+// the current txn's intents.
+func (proposal *ProposalData) finishRaftApplication(pr proposalResult) {
 	if proposal.endCmds != nil {
 		proposal.endCmds.done(pr.Reply, pr.Err, pr.ProposalRetry)
 		proposal.endCmds = nil
@@ -108,11 +127,6 @@ func (proposal *ProposalData) finish(pr proposalResult) {
 // only used on the node on which the command was proposed. Note that
 // the proposing node may die before the local results are processed,
 // so any side effects here are only best-effort.
-//
-// TODO(tschottdorf): once the WriteBatch is available in the replicated
-// proposal data (i.e. once we really do proposer-evaluted KV), experiment with
-// holding on to the proposer's constructed engine.Batch in this struct, which
-// could give a performance gain.
 type LocalEvalResult struct {
 	// The error resulting from the proposal. Most failing proposals will
 	// fail-fast, i.e. will return an error to the client above Raft. However,
@@ -123,14 +137,19 @@ type LocalEvalResult struct {
 	Err   *roachpb.Error
 	Reply *roachpb.BatchResponse
 
-	// intents stores any intents encountered but not conflicted with. They
-	// should be handed off to asynchronous intent processing on the proposer,
-	// so that an attempt to resolve them is made.
-	// In particular, this is the pathway used by EndTransaction to communicate
-	// its non-local intents up the stack.
+	// intentsAlways stores any intents encountered but not conflicted with.
+	// They should be handed off to asynchronous intent processing on the
+	// proposer, so that an attempt to resolve them is made. In particular, this
+	// is the pathway used by EndTransaction to communicate its non-local
+	// intents up the stack.
 	//
 	// This is a pointer to allow the zero (and as an unwelcome side effect,
 	// all) values to be compared.
+	intentsAlways *[]intentsWithArg
+	// Like intentsAlways, but specifies intents that must be left alone if the
+	// corresponding command/proposal didn't succeed. For example, resolving
+	// intents of a committing txn should not happen if the commit fails, or
+	// we may accidentally make uncommitted values live.
 	intents *[]intentsWithArg
 	// Whether we successfully or non-successfully requested a lease.
 	//
@@ -150,15 +169,34 @@ type LocalEvalResult struct {
 	maybeAddToSplitQueue bool
 	// Call maybeGossipNodeLiveness with the specified Span, if set.
 	maybeGossipNodeLiveness *roachpb.Span
+
+	// Set when a transaction record is updated, after a call to
+	// EndTransaction or PushTxn.
+	updatedTxn *roachpb.Transaction
 }
 
-func (lResult *LocalEvalResult) detachIntents() []intentsWithArg {
-	if lResult == nil || lResult.intents == nil {
+// detachIntents returns (and removes) those intents from the LocalEvalResult
+// which are supposed to be handled. When hasError is false, returns all
+// intents. When it is true, returns only a subset of intents for which it is
+// known that it is safe to handle them even if the command that discovered them
+// has failed (e.g. omitting intents associated to a committing EndTransaction).
+func (lResult *LocalEvalResult) detachIntents(hasError bool) []intentsWithArg {
+	if lResult == nil {
 		return nil
 	}
-	intents := *lResult.intents
-	lResult.intents = nil
-	return intents
+	var r []intentsWithArg
+	if !hasError && lResult.intents != nil {
+		r = *lResult.intents
+	}
+	if lResult.intentsAlways != nil {
+		if r == nil {
+			r = *lResult.intentsAlways
+		} else {
+			r = append(r, *lResult.intentsAlways...)
+		}
+	}
+	lResult.intents, lResult.intentsAlways = nil, nil
+	return r
 }
 
 // EvalResult is the result of evaluating a KV request. That is, the
@@ -174,6 +212,20 @@ type EvalResult struct {
 	Local      LocalEvalResult
 	Replicated storagebase.ReplicatedEvalResult
 	WriteBatch *storagebase.WriteBatch
+}
+
+// IsZero reports whether p is the zero value.
+func (p *EvalResult) IsZero() bool {
+	if p.Local != (LocalEvalResult{}) {
+		return false
+	}
+	if !p.Replicated.Equal(storagebase.ReplicatedEvalResult{}) {
+		return false
+	}
+	if p.WriteBatch != nil {
+		return false
+	}
+	return true
 }
 
 // coalesceBool ORs rhs into lhs and then zeroes rhs.
@@ -216,20 +268,13 @@ func (p *EvalResult) MergeAndDestroy(q EvalResult) error {
 	q.Replicated.State.TruncatedState = nil
 
 	p.Replicated.State.GCThreshold.Forward(q.Replicated.State.GCThreshold)
-	q.Replicated.State.GCThreshold = hlc.ZeroTimestamp
+	q.Replicated.State.GCThreshold = hlc.Timestamp{}
 	p.Replicated.State.TxnSpanGCThreshold.Forward(q.Replicated.State.TxnSpanGCThreshold)
-	q.Replicated.State.TxnSpanGCThreshold = hlc.ZeroTimestamp
+	q.Replicated.State.TxnSpanGCThreshold = hlc.Timestamp{}
 
 	if (q.Replicated.State.Stats != enginepb.MVCCStats{}) {
 		return errors.New("must not specify Stats")
 	}
-
-	if p.Replicated.State.Frozen == storagebase.ReplicaState_FROZEN_UNSPECIFIED {
-		p.Replicated.State.Frozen = q.Replicated.State.Frozen
-	} else if q.Replicated.State.Frozen != storagebase.ReplicaState_FROZEN_UNSPECIFIED {
-		return errors.New("conflicting FrozenStatus")
-	}
-	q.Replicated.State.Frozen = storagebase.ReplicaState_FROZEN_UNSPECIFIED
 
 	p.Replicated.BlockReads = p.Replicated.BlockReads || q.Replicated.BlockReads
 	q.Replicated.BlockReads = false
@@ -269,6 +314,22 @@ func (p *EvalResult) MergeAndDestroy(q EvalResult) error {
 	}
 	q.Replicated.RaftLogDelta = nil
 
+	if p.Replicated.AddSSTable == nil {
+		p.Replicated.AddSSTable = q.Replicated.AddSSTable
+	} else if q.Replicated.AddSSTable != nil {
+		return errors.New("conflicting AddSSTable")
+	}
+	q.Replicated.AddSSTable = nil
+
+	if q.Local.intentsAlways != nil {
+		if p.Local.intentsAlways == nil {
+			p.Local.intentsAlways = q.Local.intentsAlways
+		} else {
+			*p.Local.intentsAlways = append(*p.Local.intentsAlways, *q.Local.intentsAlways...)
+		}
+	}
+	q.Local.intentsAlways = nil
+
 	if q.Local.intents != nil {
 		if p.Local.intents == nil {
 			p.Local.intents = q.Local.intents
@@ -296,7 +357,14 @@ func (p *EvalResult) MergeAndDestroy(q EvalResult) error {
 	coalesceBool(&p.Local.maybeGossipSystemConfig, &q.Local.maybeGossipSystemConfig)
 	coalesceBool(&p.Local.maybeAddToSplitQueue, &q.Local.maybeAddToSplitQueue)
 
-	if (q != EvalResult{}) {
+	if p.Local.updatedTxn == nil {
+		p.Local.updatedTxn = q.Local.updatedTxn
+	} else if q.Local.updatedTxn != nil {
+		return errors.New("conflicting updatedTxn")
+	}
+	q.Local.updatedTxn = nil
+
+	if !q.IsZero() {
 		log.Fatalf(context.TODO(), "unhandled EvalResult: %s", pretty.Diff(q, EvalResult{}))
 	}
 
@@ -342,10 +410,12 @@ func (r *Replica) computeChecksumPostApply(
 	r.mu.checksums[id] = replicaChecksum{started: true, notify: notify}
 	desc := *r.mu.state.Desc
 	r.mu.Unlock()
-	snap := r.store.NewSnapshot()
+	// Caller is holding raftMu, so an engine snapshot is automatically
+	// Raft-consistent (i.e. not in the middle of an AddSSTable).
+	snap := r.store.engine.NewSnapshot()
 
 	// Compute SHA asynchronously and store it in a map by UUID.
-	if err := stopper.RunAsyncTask(ctx, func(ctx context.Context) {
+	if err := stopper.RunAsyncTask(ctx, "storage.Replica: computing checksum", func(ctx context.Context) {
 		defer snap.Close()
 		var snapshot *roachpb.RaftSnapshotData
 		if args.Snapshot {
@@ -365,20 +435,30 @@ func (r *Replica) computeChecksumPostApply(
 	}
 }
 
-func (r *Replica) leasePostApply(
-	ctx context.Context,
-	newLease *roachpb.Lease,
-	replicaID roachpb.ReplicaID,
-	prevLease *roachpb.Lease,
-) {
+// leasePostApply is called when a RequestLease or TransferLease
+// request is executed for a range.
+func (r *Replica) leasePostApply(ctx context.Context, newLease roachpb.Lease) {
+	r.mu.Lock()
+	replicaID := r.mu.replicaID
+	prevLease := *r.mu.state.Lease
+	r.mu.Unlock()
+
 	iAmTheLeaseHolder := newLease.Replica.ReplicaID == replicaID
 	leaseChangingHands := prevLease.Replica.StoreID != newLease.Replica.StoreID
+
+	if iAmTheLeaseHolder {
+		// Always log lease acquisition for epoch-based leases which are
+		// infrequent.
+		if newLease.Type() == roachpb.LeaseEpoch || (log.V(1) && leaseChangingHands) {
+			log.Infof(ctx, "new range lease %s following %s", newLease, prevLease)
+		}
+	}
 
 	if leaseChangingHands && iAmTheLeaseHolder {
 		// If this replica is a new holder of the lease, update the low water
 		// mark of the timestamp cache. Note that clock offset scenarios are
 		// handled via a stasis period inherent in the lease which is documented
-		// in on the Lease struct.
+		// in the Lease struct.
 		//
 		// The introduction of lease transfers implies that the previous lease
 		// may have been shortened and we are now applying a formally overlapping
@@ -386,27 +466,43 @@ func (r *Replica) leasePostApply(
 		// requests, this is kosher). This means that we don't use the old
 		// lease's expiration but instead use the new lease's start to initialize
 		// the timestamp cache low water.
-		log.Infof(ctx, "new range lease %s following %s [physicalTime=%s]",
-			newLease, prevLease, r.store.Clock().PhysicalTime())
-		r.mu.Lock()
-		r.mu.tsCache.SetLowWater(newLease.Start)
-		r.mu.Unlock()
+		desc := r.Desc()
+		r.store.tsCacheMu.Lock()
+		for _, keyRange := range makeReplicatedKeyRanges(desc) {
+			for _, readOnly := range []bool{true, false} {
+				r.store.tsCacheMu.cache.add(
+					keyRange.start.Key, keyRange.end.Key,
+					newLease.Start, lowWaterTxnIDMarker, readOnly)
+			}
+		}
+		r.store.tsCacheMu.Unlock()
 
-		// Gossip the first range whenever its lease is acquired. We check to
-		// make sure the lease is active so that a trailing replica won't process
-		// an old lease request and attempt to gossip the first range.
-		if r.IsFirstRange() && r.IsLeaseValid(newLease, r.store.Clock().Now()) {
-			r.gossipFirstRange(ctx)
+		// Reset the request counts used to make lease placement decisions whenever
+		// starting a new lease.
+		if r.leaseholderStats != nil {
+			r.leaseholderStats.resetRequestCounts()
 		}
 	}
+
+	// We're setting the new lease after we've updated the timestamp cache in
+	// order to avoid race conditions where a replica starts serving requests
+	// for a lease without first having taken into account requests served
+	// by the previous lease holder.
+	r.mu.Lock()
+	r.mu.state.Lease = &newLease
+	r.mu.Unlock()
+
+	// Gossip the first range whenever its lease is acquired. We check to
+	// make sure the lease is active so that a trailing replica won't process
+	// an old lease request and attempt to gossip the first range.
+	if leaseChangingHands && iAmTheLeaseHolder && r.IsFirstRange() && r.IsLeaseValid(newLease, r.store.Clock().Now()) {
+		r.gossipFirstRange(ctx)
+	}
+
 	if leaseChangingHands && !iAmTheLeaseHolder {
-		// We're not the lease holder, reset our timestamp cache, releasing
-		// anything currently cached. The timestamp cache is only used by the
-		// lease holder. Note that we'll call SetLowWater when we next acquire
-		// the lease.
-		r.mu.Lock()
-		r.mu.tsCache.Clear(r.store.Clock().Now())
-		r.mu.Unlock()
+		// Also clear and disable the push transaction queue. Any waiters
+		// must be redirected to the new lease holder.
+		r.pushTxnQueue.Clear(true /* disable */)
 	}
 
 	if !iAmTheLeaseHolder && r.IsLeaseValid(newLease, r.store.Clock().Now()) {
@@ -415,13 +511,9 @@ func (r *Replica) leasePostApply(
 		// when leases and raft leadership are collocated because that facilitates
 		// quick command application (requests generally need to make it to both the
 		// lease holder and the raft leader before being applied by other replicas).
-		//
-		// TODO(andrei): We want to do this attempt when a lease changes hands, and
-		// then periodically check that the collocation is fine. So we keep checking
-		// it here on lease extensions, which happen periodically, but that's pretty
-		// arbitrary. There might be a more natural place elsewhere where this
-		// periodic check should happen.
-		r.maybeTransferRaftLeadership(ctx, replicaID, newLease.Replica.ReplicaID)
+		// Note that this condition is also checked periodically when computing
+		// replica metrics.
+		r.maybeTransferRaftLeadership(ctx, newLease.Replica.ReplicaID)
 	}
 
 	// Notify the store that a lease change occurred and it may need to
@@ -429,22 +521,113 @@ func (r *Replica) leasePostApply(
 	if leaseChangingHands && (prevLease.OwnedBy(r.store.StoreID()) ||
 		newLease.OwnedBy(r.store.StoreID())) {
 		r.store.maybeGossipOnCapacityChange(ctx, leaseChangeEvent)
+		if r.leaseholderStats != nil {
+			r.leaseholderStats.resetRequestCounts()
+		}
+	}
+
+	// Potentially re-gossip if the range contains system data (e.g. system
+	// config or node liveness). We need to perform this gossip at startup as
+	// soon as possible. Trying to minimize how often we gossip is a fool's
+	// errand. The node liveness info will be gossiped frequently (every few
+	// seconds) in any case due to the liveness heartbeats. And the system config
+	// will be gossiped rarely because it falls on a range with an epoch-based
+	// range lease that is only reacquired extremely infrequently.
+	if iAmTheLeaseHolder {
+		if err := r.maybeGossipSystemConfig(ctx); err != nil {
+			log.Error(ctx, err)
+		}
+		if err := r.maybeGossipNodeLiveness(ctx, keys.NodeLivenessSpan); err != nil {
+			log.Error(ctx, err)
+		}
+		// Make sure the push transaction queue is enabled.
+		r.pushTxnQueue.Enable()
+	}
+
+	// Mark the new lease in the replica's lease history.
+	if r.leaseHistory != nil {
+		r.leaseHistory.add(newLease)
 	}
 }
 
-// maybeTransferRaftLeadership attempts to transfer the leadership away from
-// this node to target, if this node is the current raft leader.
-// The transfer might silently fail, particularly (only?) if the transferee is
-// behind on applying the log.
-func (r *Replica) maybeTransferRaftLeadership(
-	ctx context.Context, replicaID roachpb.ReplicaID, target roachpb.ReplicaID,
+func addSSTablePreApply(
+	ctx context.Context,
+	st *cluster.Settings,
+	eng engine.Engine,
+	sideloaded sideloadStorage,
+	term, index uint64,
+	startKey, endKey roachpb.RKey,
+	sst storagebase.ReplicatedEvalResult_AddSSTable,
 ) {
+	checksum := util.CRC32(sst.Data)
+
+	if checksum != sst.CRC32 {
+		log.Fatalf(
+			ctx,
+			"checksum for AddSSTable at index term %d, index %d does not match; at proposal time %x (%d), now %x (%d)",
+			term, index, sst.CRC32, sst.CRC32, checksum, checksum,
+		)
+	}
+
+	// TODO(danhhz,tschottdorf): we can hardlink directly to the sideloaded
+	// SSTable and ingest that if we also put a "sanitizer" in the
+	// implementation of sideloadedStorage that undoes the serial number that
+	// RocksDB may add to the SSTable. This avoids copying the file entirely.
+	path, err := sideloaded.Filename(ctx, index, term)
+	if err != nil {
+		log.Fatalf(ctx, "sideloaded SSTable at term %d, index %d is missing", term, index)
+	}
+	path += ".ingested"
+
+	limitBulkIOWrite(ctx, st, len(sst.Data))
+
+	if inmem, ok := eng.(engine.InMem); ok {
+		path = fmt.Sprintf("%x", checksum)
+		if err := inmem.WriteFile(path, sst.Data); err != nil {
+			panic(err)
+		}
+	} else {
+		// TODO(tschottdorf): remove this once sideloaded storage guarantees its
+		// existence.
+		if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+			panic(err)
+		}
+		if _, err := os.Stat(path); err == nil {
+			// The file we want to ingest exists. This can happen since the
+			// ingestion may apply twice (we ingest before we mark the Raft
+			// command as committed). Just unlink the file (RocksDB created a
+			// hard link); after that we're free to write it again.
+			if err := os.Remove(path); err != nil {
+				log.Fatalf(ctx, "while removing existing file during ingestion of %s: %s", path, err)
+			}
+		}
+
+		if err := ioutil.WriteFile(path, sst.Data, 0600); err != nil {
+			log.Fatalf(ctx, "while ingesting %s: %s", path, err)
+		}
+	}
+
+	const move = true
+	if err := eng.IngestExternalFile(ctx, path, move); err != nil {
+		panic(err)
+	}
+	log.Eventf(ctx, "ingested SSTable at index %d, term %d: %s", index, term, path)
+}
+
+// maybeTransferRaftLeadership attempts to transfer the leadership
+// away from this node to target, if this node is the current raft
+// leader. We don't attempt to transfer leadership if the transferee
+// is behind on applying the log.
+func (r *Replica) maybeTransferRaftLeadership(ctx context.Context, target roachpb.ReplicaID) {
 	err := r.withRaftGroup(func(raftGroup *raft.RawNode) (bool, error) {
-		if raftGroup.Status().RaftState == raft.StateLeader {
-			// Only the raft leader can attempt a leadership transfer.
-			log.Infof(ctx, "range %s: transferring raft leadership to replica ID %v",
-				r, target)
-			raftGroup.TransferLeader(uint64(target))
+		// Only the raft leader can attempt a leadership transfer.
+		if status := raftGroup.Status(); status.RaftState == raft.StateLeader {
+			// Only attempt this if the target has all the log entries.
+			if pr, ok := status.Progress[uint64(target)]; ok && pr.Match == r.mu.lastIndex {
+				log.VEventf(ctx, 1, "transferring raft leadership to replica ID %v", target)
+				r.store.metrics.RangeRaftLeaderTransfers.Inc(1)
+				raftGroup.TransferLeader(uint64(target))
+			}
 		}
 		return true, nil
 	})
@@ -468,9 +651,9 @@ func (r *Replica) handleReplicatedEvalResult(
 	// that all fields were handled).
 	{
 		rResult.IsLeaseRequest = false
-		rResult.IsConsistencyRelated = false
-		rResult.IsFreeze = false
-		rResult.Timestamp = hlc.ZeroTimestamp
+		rResult.Timestamp = hlc.Timestamp{}
+		rResult.StartKey = nil
+		rResult.EndKey = nil
 	}
 
 	if rResult.BlockReads {
@@ -488,16 +671,12 @@ func (r *Replica) handleReplicatedEvalResult(
 	if rResult.State.LeaseAppliedIndex != 0 {
 		r.mu.state.LeaseAppliedIndex = rResult.State.LeaseAppliedIndex
 	}
-	needsSplitBySize := r.needsSplitBySizeLocked()
+	needsSplitBySize := r.needsSplitBySizeRLocked()
 	r.mu.Unlock()
 
 	r.store.metrics.addMVCCStats(rResult.Delta)
 	rResult.Delta = enginepb.MVCCStats{}
 
-	const raftLogCheckFrequency = 1 + RaftLogQueueStaleThreshold/4
-	if rResult.State.RaftAppliedIndex%raftLogCheckFrequency == 1 {
-		r.store.raftLogQueue.MaybeAdd(r, r.store.Clock().Now())
-	}
 	if needsSplitBySize {
 		r.store.splitQueue.MaybeAdd(r, r.store.Clock().Now())
 	}
@@ -508,7 +687,7 @@ func (r *Replica) handleReplicatedEvalResult(
 
 	// The above are always present, so we assert only if there are
 	// "nontrivial" actions below.
-	shouldAssert = (rResult != storagebase.ReplicatedEvalResult{})
+	shouldAssert = !rResult.Equal(storagebase.ReplicatedEvalResult{})
 
 	// Process Split or Merge. This needs to happen after stats update because
 	// of the ContainsEstimates hack.
@@ -526,7 +705,7 @@ func (r *Replica) handleReplicatedEvalResult(
 			r.mu.state.Stats.ContainsEstimates = false
 			stats := r.mu.state.Stats
 			r.mu.Unlock()
-			if err := setMVCCStats(ctx, r.store.Engine(), r.RangeID, stats); err != nil {
+			if err := r.raftMu.stateLoader.setMVCCStats(ctx, r.store.Engine(), &stats); err != nil {
 				log.Fatal(ctx, errors.Wrap(err, "unable to write MVCC stats"))
 			}
 		}
@@ -551,13 +730,6 @@ func (r *Replica) handleReplicatedEvalResult(
 	}
 
 	// Update the remaining ReplicaState.
-
-	if rResult.State.Frozen != storagebase.ReplicaState_FROZEN_UNSPECIFIED {
-		r.mu.Lock()
-		r.mu.state.Frozen = rResult.State.Frozen
-		r.mu.Unlock()
-	}
-	rResult.State.Frozen = storagebase.ReplicaState_FROZEN_UNSPECIFIED
 
 	if newDesc := rResult.State.Desc; newDesc != nil {
 		if err := r.setDesc(newDesc); err != nil {
@@ -590,37 +762,74 @@ func (r *Replica) handleReplicatedEvalResult(
 	if newLease := rResult.State.Lease; newLease != nil {
 		rResult.State.Lease = nil // for assertion
 
-		r.mu.Lock()
-		replicaID := r.mu.replicaID
-		prevLease := r.mu.state.Lease
-		r.mu.state.Lease = newLease
-		r.mu.Unlock()
-
-		r.leasePostApply(ctx, newLease, replicaID, prevLease)
+		r.leasePostApply(ctx, *newLease)
 	}
 
 	if newTruncState := rResult.State.TruncatedState; newTruncState != nil {
 		rResult.State.TruncatedState = nil // for assertion
+
 		r.mu.Lock()
 		r.mu.state.TruncatedState = newTruncState
 		r.mu.Unlock()
+
+		// TODO(tschottdorf): everything below doesn't need to be on this
+		// goroutine. Worth moving out -- truncations are frequent and missing
+		// one of the side effects below doesn't matter. Need to be careful
+		// about the interaction with `evalTruncateLog` though, which computes
+		// some stats based on the log entries it sees. Also, sideloaded storage
+		// needs to hold the raft mu. Perhaps it should just get its own mutex
+		// (which is usually held together with raftMu, except when accessing
+		// the storage for a truncation). Or, even better, make use of the fact
+		// that all we need to synchronize is disk i/o, and there is no overlap
+		// between files *removed* during truncation and those active in Raft.
+
+		if r.store.cfg.IsActive(cluster.VersionRaftLogTruncationBelowRaft) {
+			// Truncate the Raft log.
+			start := engine.MakeMVCCMetadataKey(keys.RaftLogKey(r.RangeID, 0))
+			end := engine.MakeMVCCMetadataKey(
+				keys.RaftLogKey(r.RangeID, newTruncState.Index).PrefixEnd(),
+			)
+			iter := r.store.engine.NewIterator(false /* !prefix */)
+			// Clear the log entries. Intentionally don't use range deletion
+			// tombstones (ClearRange()) due to performance concerns connected
+			// to having many range deletion tombstones. There is a chance that
+			// ClearRange will perform well here because the tombstones could be
+			// "collapsed", but it is hardly worth the risk at this point.
+			err := r.store.engine.ClearIterRange(iter, start, end)
+			iter.Close()
+
+			if err != nil {
+				log.Errorf(ctx, "unable to clear truncated Raft entries for %+v: %s", newTruncState, err)
+			}
+		}
+
 		// Clear any entries in the Raft log entry cache for this range up
 		// to and including the most recently truncated index.
 		r.store.raftEntryCache.clearTo(r.RangeID, newTruncState.Index+1)
+
+		// Truncate the sideloaded storage.
+		{
+			log.Eventf(ctx, "truncating sideloaded storage up to (and including) index %d", newTruncState.Index)
+			if err := r.raftMu.sideloaded.TruncateTo(ctx, newTruncState.Index+1); err != nil {
+				// We don't *have* to remove these entries for correctness. Log a
+				// loud error, but keep humming along.
+				log.Errorf(ctx, "while removing sideloaded files during log truncation: %s", err)
+			}
+		}
 	}
 
-	if newThresh := rResult.State.GCThreshold; newThresh != hlc.ZeroTimestamp {
+	if newThresh := rResult.State.GCThreshold; newThresh != (hlc.Timestamp{}) {
 		r.mu.Lock()
 		r.mu.state.GCThreshold = newThresh
 		r.mu.Unlock()
-		rResult.State.GCThreshold = hlc.ZeroTimestamp
+		rResult.State.GCThreshold = hlc.Timestamp{}
 	}
 
-	if newThresh := rResult.State.TxnSpanGCThreshold; newThresh != hlc.ZeroTimestamp {
+	if newThresh := rResult.State.TxnSpanGCThreshold; newThresh != (hlc.Timestamp{}) {
 		r.mu.Lock()
 		r.mu.state.TxnSpanGCThreshold = newThresh
 		r.mu.Unlock()
-		rResult.State.TxnSpanGCThreshold = hlc.ZeroTimestamp
+		rResult.State.TxnSpanGCThreshold = hlc.Timestamp{}
 	}
 
 	if rResult.ComputeChecksum != nil {
@@ -631,24 +840,50 @@ func (r *Replica) handleReplicatedEvalResult(
 	if rResult.RaftLogDelta != nil {
 		r.mu.Lock()
 		r.mu.raftLogSize += *rResult.RaftLogDelta
+		r.mu.raftLogLastCheckSize += *rResult.RaftLogDelta
+		// Ensure raftLog{,LastCheck}Size is not negative since it isn't persisted
+		// between server restarts.
 		if r.mu.raftLogSize < 0 {
-			// Ensure raftLogSize is not negative since it isn't persisted between
-			// server restarts.
 			r.mu.raftLogSize = 0
+		}
+		if r.mu.raftLogLastCheckSize < 0 {
+			r.mu.raftLogLastCheckSize = 0
 		}
 		r.mu.Unlock()
 		rResult.RaftLogDelta = nil
+	} else {
+		// Check for whether to queue the range for Raft log truncation if this is
+		// not a Raft log truncation command itself. We don't want to check the
+		// Raft log for truncation on every write operation or even every operation
+		// which occurs after the Raft log exceeds RaftLogQueueStaleSize. The logic
+		// below queues the replica for possible Raft log truncation whenever an
+		// additional RaftLogQueueStaleSize bytes have been written to the Raft
+		// log.
+		r.mu.Lock()
+		checkRaftLog := r.mu.raftLogSize-r.mu.raftLogLastCheckSize >= RaftLogQueueStaleSize
+		if checkRaftLog {
+			r.mu.raftLogLastCheckSize = r.mu.raftLogSize
+		}
+		r.mu.Unlock()
+		if checkRaftLog {
+			r.store.raftLogQueue.MaybeAdd(r, r.store.Clock().Now())
+		}
 	}
 
-	if (rResult != storagebase.ReplicatedEvalResult{}) {
+	if !rResult.Equal(storagebase.ReplicatedEvalResult{}) {
 		log.Fatalf(ctx, "unhandled field in ReplicatedEvalResult: %s", pretty.Diff(rResult, storagebase.ReplicatedEvalResult{}))
 	}
 	return shouldAssert
 }
 
-func (r *Replica) handleLocalEvalResult(
-	ctx context.Context, originReplica roachpb.ReplicaDescriptor, lResult LocalEvalResult,
-) (shouldAssert bool) {
+func (r *Replica) handleLocalEvalResult(ctx context.Context, lResult LocalEvalResult) {
+	// Enqueue failed push transactions on the pushTxnQueue.
+	if !r.store.cfg.DontRetryPushTxnFailures {
+		if tpErr, ok := lResult.Err.GetDetail().(*roachpb.TransactionPushError); ok {
+			r.pushTxnQueue.Enqueue(&tpErr.PusheeTxn)
+		}
+	}
+
 	// Fields for which no action is taken in this method are zeroed so that
 	// they don't trigger an assertion at the end of the method (which checks
 	// that all fields were handled).
@@ -662,13 +897,12 @@ func (r *Replica) handleLocalEvalResult(
 	// ======================
 
 	// The caller is required to detach and handle intents.
+	if lResult.intentsAlways != nil {
+		log.Fatalf(ctx, "LocalEvalResult.intentsAlways should be nil: %+v", lResult.intentsAlways)
+	}
 	if lResult.intents != nil {
 		log.Fatalf(ctx, "LocalEvalResult.intents should be nil: %+v", lResult.intents)
 	}
-
-	// The above are present too often, so we assert only if there are
-	// "nontrivial" actions below.
-	shouldAssert = (lResult != LocalEvalResult{})
 
 	if lResult.gossipFirstRange {
 		// We need to run the gossip in an async task because gossiping requires
@@ -677,16 +911,18 @@ func (r *Replica) handleLocalEvalResult(
 		// blocks waiting for the lease acquisition to finish but it can't finish
 		// because we're not processing raft messages due to holding
 		// processRaftMu (and running on the processRaft goroutine).
-		if err := r.store.Stopper().RunAsyncTask(ctx, func(ctx context.Context) {
-			hasLease, pErr := r.getLeaseForGossip(ctx)
+		if err := r.store.Stopper().RunAsyncTask(
+			ctx, "storage.Replica: gossipping first range",
+			func(ctx context.Context) {
+				hasLease, pErr := r.getLeaseForGossip(ctx)
 
-			if pErr != nil {
-				log.Infof(ctx, "unable to gossip first range; hasLease=%t, err=%s", hasLease, pErr)
-			} else if !hasLease {
-				return
-			}
-			r.gossipFirstRange(ctx)
-		}); err != nil {
+				if pErr != nil {
+					log.Infof(ctx, "unable to gossip first range; hasLease=%t, err=%s", hasLease, pErr)
+				} else if !hasLease {
+					return
+				}
+				r.gossipFirstRange(ctx)
+			}); err != nil {
 			log.Infof(ctx, "unable to gossip first range: %s", err)
 		}
 		lResult.gossipFirstRange = false
@@ -698,52 +934,50 @@ func (r *Replica) handleLocalEvalResult(
 	}
 
 	if lResult.maybeGossipSystemConfig {
-		r.maybeGossipSystemConfig()
+		if err := r.maybeGossipSystemConfig(ctx); err != nil {
+			log.Error(ctx, err)
+		}
 		lResult.maybeGossipSystemConfig = false
 	}
-
-	if originReplica.StoreID == r.store.StoreID() {
-		if lResult.leaseMetricsResult != nil {
-			switch metric := *lResult.leaseMetricsResult; metric {
-			case leaseRequestSuccess, leaseRequestError:
-				r.store.metrics.leaseRequestComplete(metric == leaseRequestSuccess)
-			case leaseTransferSuccess, leaseTransferError:
-				r.store.metrics.leaseTransferComplete(metric == leaseTransferSuccess)
-			}
+	if lResult.maybeGossipNodeLiveness != nil {
+		if err := r.maybeGossipNodeLiveness(ctx, *lResult.maybeGossipNodeLiveness); err != nil {
+			log.Error(ctx, err)
 		}
-		if lResult.maybeGossipNodeLiveness != nil {
-			r.maybeGossipNodeLiveness(*lResult.maybeGossipNodeLiveness)
-		}
+		lResult.maybeGossipNodeLiveness = nil
 	}
-	// Satisfy the assertions for all of the items processed only on the
-	// proposer (the block just above).
-	lResult.leaseMetricsResult = nil
-	lResult.maybeGossipNodeLiveness = nil
+
+	if lResult.leaseMetricsResult != nil {
+		switch metric := *lResult.leaseMetricsResult; metric {
+		case leaseRequestSuccess, leaseRequestError:
+			r.store.metrics.leaseRequestComplete(metric == leaseRequestSuccess)
+		case leaseTransferSuccess, leaseTransferError:
+			r.store.metrics.leaseTransferComplete(metric == leaseTransferSuccess)
+		}
+		lResult.leaseMetricsResult = nil
+	}
+
+	if lResult.updatedTxn != nil {
+		r.pushTxnQueue.UpdateTxn(ctx, lResult.updatedTxn)
+		lResult.updatedTxn = nil
+	}
 
 	if (lResult != LocalEvalResult{}) {
 		log.Fatalf(ctx, "unhandled field in LocalEvalResult: %s", pretty.Diff(lResult, LocalEvalResult{}))
 	}
-
-	return shouldAssert
 }
 
-func (r *Replica) handleEvalResult(
-	ctx context.Context,
-	originReplica roachpb.ReplicaDescriptor,
-	lResult *LocalEvalResult,
-	rResult *storagebase.ReplicatedEvalResult,
+func (r *Replica) handleEvalResultRaftMuLocked(
+	ctx context.Context, lResult *LocalEvalResult, rResult storagebase.ReplicatedEvalResult,
 ) {
-	// Careful: `shouldAssert = f() || g()` will not run both if `f()` is true.
-	shouldAssert := false
-	if rResult != nil {
-		shouldAssert = r.handleReplicatedEvalResult(ctx, *rResult) || shouldAssert
-	}
+	shouldAssert := r.handleReplicatedEvalResult(ctx, rResult)
 	if lResult != nil {
-		shouldAssert = r.handleLocalEvalResult(ctx, originReplica, *lResult) || shouldAssert
+		r.handleLocalEvalResult(ctx, *lResult)
 	}
 	if shouldAssert {
 		// Assert that the on-disk state doesn't diverge from the in-memory
 		// state as a result of the side effects.
-		r.assertState(r.store.Engine())
+		r.mu.Lock()
+		r.assertStateLocked(ctx, r.store.Engine())
+		r.mu.Unlock()
 	}
 }

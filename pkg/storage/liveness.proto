@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Spencer Kimball (spencer@cockroachlabs.com)
 
 syntax = "proto3";
 package cockroach.storage;
@@ -31,4 +29,6 @@ message Liveness {
   int64 epoch = 2;
   // The timestamp at which this liveness record expires.
   util.hlc.Timestamp expiration = 3 [(gogoproto.nullable) = false];
+  bool draining = 4;
+  bool decommissioning = 5;
 }

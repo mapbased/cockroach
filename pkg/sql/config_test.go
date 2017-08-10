@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Marc Berhault (marc@cockroachlabs.com)
 
 package sql_test
 
@@ -54,9 +52,11 @@ func forceNewConfig(t *testing.T, s *server.TestServer) config.SystemConfig {
 	}
 
 	// This needs to be done in a transaction with the system trigger set.
-	if err := s.DB().Txn(context.TODO(), func(txn *client.Txn) error {
-		txn.SetSystemConfigTrigger()
-		return txn.Put(configDescKey, configDesc)
+	if err := s.DB().Txn(context.TODO(), func(ctx context.Context, txn *client.Txn) error {
+		if err := txn.SetSystemConfigTrigger(); err != nil {
+			return err
+		}
+		return txn.Put(ctx, configDescKey, configDesc)
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -89,7 +89,7 @@ func TestGetZoneConfig(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	params, _ := createTestServerParams()
 	srv, sqlDB, _ := serverutils.StartServer(t, params)
-	defer srv.Stopper().Stop()
+	defer srv.Stopper().Stop(context.TODO())
 	s := srv.(*server.TestServer)
 
 	expectedCounter := uint32(keys.MaxReservedDescID)
@@ -145,8 +145,13 @@ func TestGetZoneConfig(t *testing.T) {
 	}
 
 	expectedCounter++
-	tb22 := expectedCounter
 	if _, err := sqlDB.Exec(`CREATE TABLE db2.tb2 (k INT PRIMARY KEY, v INT)`); err != nil {
+		t.Fatal(err)
+	}
+
+	expectedCounter++
+	tb22 := expectedCounter
+	if _, err := sqlDB.Exec(`TRUNCATE TABLE db2.tb2`); err != nil {
 		t.Fatal(err)
 	}
 

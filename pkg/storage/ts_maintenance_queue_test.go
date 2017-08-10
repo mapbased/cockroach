@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Matt Tracy (matt@cockroachlabs.com)
 
 package storage_test
 
@@ -104,7 +102,7 @@ func TestTimeSeriesMaintenanceQueue(t *testing.T) {
 	cfg.TestingKnobs.DisableSplitQueue = true
 
 	stopper := stop.NewStopper()
-	defer stopper.Stop()
+	defer stopper.Stop(context.TODO())
 	store := createTestStoreWithConfig(t, stopper, cfg)
 
 	// Generate several splits.
@@ -226,7 +224,7 @@ func TestTimeSeriesMaintenanceQueueServer(t *testing.T) {
 			},
 		},
 	})
-	defer s.Stopper().Stop()
+	defer s.Stopper().Stop(context.TODO())
 	tsrv := s.(*server.TestServer)
 	tsdb := tsrv.TsDB()
 
@@ -271,7 +269,7 @@ func TestTimeSeriesMaintenanceQueueServer(t *testing.T) {
 
 	// Force a range split in between near past and far past. This guarantees
 	// that the pruning operation will issue a DeleteRange which spans ranges.
-	if err := db.AdminSplit(context.TODO(), splitKey); err != nil {
+	if err := db.AdminSplit(context.TODO(), splitKey, splitKey); err != nil {
 		t.Fatal(err)
 	}
 

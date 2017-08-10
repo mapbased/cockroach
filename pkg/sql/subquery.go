@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Peter Mattis (peter@cockroachlabs.com)
 
 package sql
 
@@ -20,7 +18,13 @@ import (
 	"bytes"
 	"fmt"
 
+	"github.com/pkg/errors"
+	"golang.org/x/net/context"
+
+	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/util/encoding"
 )
 
 // subquery represents a subquery expression in an expression tree
@@ -28,6 +32,7 @@ import (
 // in the expression tree from the point type checking occurs to
 // the point the query starts execution / evaluation.
 type subquery struct {
+	planner  *planner
 	typ      parser.Type
 	subquery *parser.Subquery
 	execMode subqueryExecMode
@@ -35,7 +40,6 @@ type subquery struct {
 	started  bool
 	plan     planNode
 	result   parser.Datum
-	err      error
 }
 
 type subqueryExecMode int
@@ -67,13 +71,11 @@ func (s *subquery) Format(buf *bytes.Buffer, f parser.FmtFlags) {
 	if s.execMode == execModeExists {
 		buf.WriteString("EXISTS ")
 	}
-	if f == parser.FmtShowTypes {
-		// TODO(knz/nvanbenschoten) It is not possible to extract types
-		// from the subquery using Format, because type checking does not
-		// replace the sub-expressions of a SelectClause node in-place.
-		f = parser.FmtSimple
-	}
-	s.subquery.Format(buf, f)
+	// Note: we remove the flag to print types, because subqueries can
+	// be printed in a context where type resolution has not occurred
+	// yet. We do not use FmtSimple directly however, in case the
+	// caller wants to use other flags (e.g. to anonymize identifiers).
+	parser.FormatNode(buf, parser.StripTypeFormatting(f), s.subquery)
 }
 
 func (s *subquery) String() string { return parser.AsString(s) }
@@ -90,7 +92,7 @@ func (s *subquery) TypeCheck(_ *parser.SemaContext, desired parser.Type) (parser
 	// sub-query. For now, the type is simply derived during the subquery node
 	// creation by looking at the result column types.
 
-	// TODO(nvanbenschoten) Type checking for the comparison operator(s)
+	// TODO(nvanbenschoten): Type checking for the comparison operator(s)
 	// should take this new node into account. In particular it should
 	// check that the tuple types match pairwise.
 	return s, nil
@@ -99,24 +101,26 @@ func (s *subquery) TypeCheck(_ *parser.SemaContext, desired parser.Type) (parser
 func (s *subquery) ResolvedType() parser.Type { return s.typ }
 
 func (s *subquery) Eval(_ *parser.EvalContext) (parser.Datum, error) {
-	if s.err != nil {
-		return nil, s.err
-	}
 	if s.result == nil {
 		panic("subquery was not pre-evaluated properly")
 	}
-	return s.result, s.err
+	return s.result, nil
 }
 
-func (s *subquery) doEval() (parser.Datum, error) {
-	var result parser.Datum
+func (s *subquery) doEval(ctx context.Context) (result parser.Datum, err error) {
+	// After evaluation, there is no plan remaining.
+	defer func() { s.plan.Close(ctx); s.plan = nil }()
+
+	params := runParams{
+		ctx: ctx,
+		p:   s.planner,
+	}
 	switch s.execMode {
 	case execModeExists:
 		// For EXISTS expressions, all we want to know is if there is at least one
 		// result.
-		next, err := s.plan.Next()
-		s.plan.Close()
-		if s.err = err; err != nil {
+		next, err := s.plan.Next(params)
+		if err != nil {
 			return result, err
 		}
 		if next {
@@ -126,12 +130,10 @@ func (s *subquery) doEval() (parser.Datum, error) {
 			result = parser.MakeDBool(false)
 		}
 
-	case execModeAllRows:
-		fallthrough
-	case execModeAllRowsNormalized:
+	case execModeAllRows, execModeAllRowsNormalized:
 		var rows parser.DTuple
-		next, err := s.plan.Next()
-		for ; next; next, err = s.plan.Next() {
+		next, err := s.plan.Next(params)
+		for ; next; next, err = s.plan.Next(params) {
 			values := s.plan.Values()
 			switch len(values) {
 			case 1:
@@ -139,51 +141,52 @@ func (s *subquery) doEval() (parser.Datum, error) {
 				// to a tuple of tuples instead of a tuple of values and an expression
 				// like "k IN (SELECT foo FROM bar)" will fail because we're comparing
 				// a single value against a tuple.
-				rows = append(rows, values[0])
+				rows.D = append(rows.D, values[0])
 			default:
 				// The result from plan.Values() is only valid until the next call to
 				// plan.Next(), so make a copy.
-				valuesCopy := make(parser.DTuple, len(values))
-				copy(valuesCopy, values)
-				rows = append(rows, &valuesCopy)
+				valuesCopy := parser.NewDTupleWithLen(len(values))
+				copy(valuesCopy.D, values)
+				rows.D = append(rows.D, valuesCopy)
 			}
 		}
-		s.plan.Close()
-		if s.err = err; err != nil {
+		if err != nil {
 			return result, err
 		}
+
+		if ok, dir := s.subqueryTupleOrdering(); ok {
+			if dir == encoding.Descending {
+				rows.D.Reverse()
+			}
+			rows.SetSorted()
+		}
 		if s.execMode == execModeAllRowsNormalized {
-			rows.Normalize()
+			rows.Normalize(&s.planner.evalCtx)
 		}
 		result = &rows
 
 	case execModeOneRow:
 		result = parser.DNull
-		hasRow, err := s.plan.Next()
-		if s.err = err; err != nil {
-			s.plan.Close()
+		hasRow, err := s.plan.Next(params)
+		if err != nil {
 			return result, err
 		}
-		if !hasRow {
-			s.plan.Close()
-		} else {
+		if hasRow {
 			values := s.plan.Values()
 			switch len(values) {
 			case 1:
 				result = values[0]
 			default:
-				valuesCopy := make(parser.DTuple, len(values))
-				copy(valuesCopy, values)
-				result = &valuesCopy
+				valuesCopy := parser.NewDTupleWithLen(len(values))
+				copy(valuesCopy.D, values)
+				result = valuesCopy
 			}
-			another, err := s.plan.Next()
-			s.plan.Close()
-			if s.err = err; err != nil {
+			another, err := s.plan.Next(params)
+			if err != nil {
 				return result, err
 			}
 			if another {
-				s.err = fmt.Errorf("more than one row returned by a subquery used as an expression")
-				return result, s.err
+				return result, fmt.Errorf("more than one row returned by a subquery used as an expression")
 			}
 		}
 	}
@@ -191,103 +194,115 @@ func (s *subquery) doEval() (parser.Datum, error) {
 	return result, nil
 }
 
+// subqueryTupleOrdering returns whether the rows of the subquery are ordered
+// such that the resulting subquery tuple can be considered fully sorted.
+// For this to happen, the columns in the subquery must be sorted in the same
+// direction and with the same order of precedence that the tuple will have. The
+// method will return a boolean specifying whether the result is in sorted order,
+// and if so, will specify which direction it is sorted in.
+//
+// TODO(knz): This will not work for subquery renders that are not row dependent
+// like
+//   SELECT 1 IN (SELECT 1 ORDER BY 1)
+// because even if they are included in an ORDER BY clause, they will not be part
+// of the plan.Ordering().
+func (s *subquery) subqueryTupleOrdering() (bool, encoding.Direction) {
+	// Columns must be sorted in the order that they appear in the render
+	// and which they will later appear in the resulting tuple.
+	desired := make(sqlbase.ColumnOrdering, len(planColumns(s.plan)))
+	for i := range desired {
+		desired[i] = sqlbase.ColumnOrderInfo{
+			ColIdx:    i,
+			Direction: encoding.Ascending,
+		}
+	}
+
+	// Check Ascending direction.
+	order := planOrdering(s.plan)
+	match := order.computeMatch(desired)
+	if match == len(desired) {
+		return true, encoding.Ascending
+	}
+	// Check Descending direction.
+	match = order.reverse().computeMatch(desired)
+	if match == len(desired) {
+		return true, encoding.Descending
+	}
+	return false, 0
+}
+
 // subqueryPlanVisitor is responsible for acting on the query plan
 // that implements the sub-query, after it has been populated by
-// subqueryVisitor.  This visitor supports both expanding, starting
+// subqueryVisitor. This visitor supports both starting
 // and evaluating the sub-plans in one recursion.
 type subqueryPlanVisitor struct {
-	doExpand bool
-	doStart  bool
-	doEval   bool
-	err      error
+	p *planner
 }
 
-var _ parser.Visitor = &subqueryPlanVisitor{}
-
-func (v *subqueryPlanVisitor) VisitPre(expr parser.Expr) (recurse bool, newExpr parser.Expr) {
-	if v.err != nil {
-		return false, expr
+func (v *subqueryPlanVisitor) subqueryNode(ctx context.Context, sq *subquery) error {
+	if !sq.expanded {
+		panic("subquery was not expanded properly")
 	}
-	if sq, ok := expr.(*subquery); ok {
-		if v.doExpand && !sq.expanded {
-			v.err = sq.plan.expandPlan()
-			sq.expanded = true
+	if !sq.started {
+		if err := v.p.startPlan(ctx, sq.plan); err != nil {
+			return err
 		}
-		if v.err == nil && v.doStart && !sq.started {
-			if !sq.expanded {
-				panic("subquery was not expanded properly")
-			}
-			v.err = sq.plan.Start()
-			sq.started = true
+		sq.started = true
+		res, err := sq.doEval(ctx)
+		if err != nil {
+			return err
 		}
-		if v.err == nil && v.doEval && sq.result == nil {
-			if !sq.expanded || !sq.started {
-				panic("subquery was not expanded or prepared properly")
-			}
-			sq.result, sq.err = sq.doEval()
-			if sq.err != nil {
-				v.err = sq.err
-			}
-		}
-		return false, expr
+		sq.result = res
 	}
-	return true, expr
+	return nil
 }
 
-func (v *subqueryPlanVisitor) VisitPost(expr parser.Expr) parser.Expr { return expr }
-
-func (p *planner) expandSubqueryPlans(expr parser.Expr) error {
-	if expr == nil {
-		return nil
+func (v *subqueryPlanVisitor) enterNode(_ context.Context, _ string, n planNode) bool {
+	if _, ok := n.(*explainPlanNode); ok {
+		// EXPLAIN doesn't start/substitute sub-queries.
+		return false
 	}
-	p.subqueryPlanVisitor = subqueryPlanVisitor{doExpand: true}
-	_, _ = parser.WalkExpr(&p.subqueryPlanVisitor, expr)
-	return p.subqueryPlanVisitor.err
+	return true
 }
 
-func (p *planner) startSubqueryPlans(expr parser.Expr) error {
-	if expr == nil {
-		return nil
-	}
+func (p *planner) startSubqueryPlans(ctx context.Context, plan planNode) error {
 	// We also run and pre-evaluate the subqueries during start,
 	// so as to avoid re-running the sub-query for every row
 	// in the results of the surrounding planNode.
-	p.subqueryPlanVisitor = subqueryPlanVisitor{doStart: true, doEval: true}
-	_, _ = parser.WalkExpr(&p.subqueryPlanVisitor, expr)
-	return p.subqueryPlanVisitor.err
+	p.subqueryPlanVisitor = subqueryPlanVisitor{p: p}
+	return walkPlan(ctx, plan, planObserver{
+		subqueryNode: p.subqueryPlanVisitor.subqueryNode,
+		enterNode:    p.subqueryPlanVisitor.enterNode,
+	})
 }
 
-// collectSubqueryPlansVisitor gathers all the planNodes implementing
-// sub-queries in a given expression. This is used by EXPLAIN to show
-// the sub-plans.
-type collectSubqueryPlansVisitor struct {
-	plans []planNode
+// subquerySpanCollector is responsible for collecting all read spans that
+// subqueries in a query plan may touch. Subqueries should never be performing
+// any write operations, so only the read spans are collected.
+// FOR REVIEW: this assumption is correct, right?
+type subquerySpanCollector struct {
+	reads roachpb.Spans
 }
 
-var _ parser.Visitor = &collectSubqueryPlansVisitor{}
-
-func (v *collectSubqueryPlansVisitor) VisitPre(
-	expr parser.Expr,
-) (recurse bool, newExpr parser.Expr) {
-	if sq, ok := expr.(*subquery); ok {
-		if sq.plan == nil {
-			panic("cannot collect the sub-plans before they were expanded")
-		}
-		v.plans = append(v.plans, sq.plan)
-		return false, expr
+func (v *subquerySpanCollector) subqueryNode(ctx context.Context, sq *subquery) error {
+	reads, writes, err := collectSpans(ctx, sq.plan)
+	if err != nil {
+		return err
 	}
-	return true, expr
+	if len(writes) > 0 {
+		return errors.Errorf("unexpected span writes in subquery: %v", writes)
+	}
+	v.reads = append(v.reads, reads...)
+	return nil
 }
 
-func (v *collectSubqueryPlansVisitor) VisitPost(expr parser.Expr) parser.Expr { return expr }
-
-func (p *planner) collectSubqueryPlans(expr parser.Expr, result []planNode) []planNode {
-	if expr == nil {
-		return result
+func collectSubquerySpans(ctx context.Context, plan planNode) (roachpb.Spans, error) {
+	var v subquerySpanCollector
+	po := planObserver{subqueryNode: v.subqueryNode}
+	if err := walkPlan(ctx, plan, po); err != nil {
+		return nil, err
 	}
-	p.collectSubqueryPlansVisitor = collectSubqueryPlansVisitor{plans: result}
-	_, _ = parser.WalkExpr(&p.collectSubqueryPlansVisitor, expr)
-	return p.collectSubqueryPlansVisitor.plans
+	return v.reads, nil
 }
 
 // subqueryVisitor replaces parser.Subquery syntax nodes by a
@@ -299,6 +314,9 @@ type subqueryVisitor struct {
 	path    []parser.Expr // parent expressions
 	pathBuf [4]parser.Expr
 	err     error
+
+	// TODO(andrei): plumb the context through the parser.Visitor.
+	ctx context.Context
 }
 
 var _ parser.Visitor = &subqueryVisitor{}
@@ -331,14 +349,14 @@ func (v *subqueryVisitor) VisitPre(expr parser.Expr) (recurse bool, newExpr pars
 	// Calling newPlan() might recursively invoke expandSubqueries, so we need to preserve
 	// the state of the visitor across the call to newPlan().
 	visitorCopy := v.planner.subqueryVisitor
-	plan, err := v.planner.newPlan(sq.Select, nil, false)
+	plan, err := v.planner.newPlan(v.ctx, sq.Select, nil)
 	v.planner.subqueryVisitor = visitorCopy
 	if err != nil {
 		v.err = err
 		return false, expr
 	}
 
-	result := &subquery{subquery: sq, plan: plan}
+	result := &subquery{planner: v.planner, subquery: sq, plan: plan}
 
 	if exists != nil {
 		result.execMode = execModeExists
@@ -348,7 +366,7 @@ func (v *subqueryVisitor) VisitPre(expr parser.Expr) (recurse bool, newExpr pars
 		result.execMode = execMode
 
 		// First check that the number of columns match.
-		cols := plan.Columns()
+		cols := planColumns(plan)
 		if numColumns := len(cols); wantedNumColumns != numColumns {
 			switch wantedNumColumns {
 			case 1:
@@ -386,8 +404,10 @@ func (v *subqueryVisitor) VisitPost(expr parser.Expr) parser.Expr {
 	return expr
 }
 
-func (p *planner) replaceSubqueries(expr parser.Expr, columns int) (parser.Expr, error) {
-	p.subqueryVisitor = subqueryVisitor{planner: p, columns: columns}
+func (p *planner) replaceSubqueries(
+	ctx context.Context, expr parser.Expr, columns int,
+) (parser.Expr, error) {
+	p.subqueryVisitor = subqueryVisitor{planner: p, columns: columns, ctx: ctx}
 	p.subqueryVisitor.path = p.subqueryVisitor.pathBuf[:0]
 	expr, _ = parser.WalkExpr(&p.subqueryVisitor, expr)
 	return expr, p.subqueryVisitor.err
@@ -423,7 +443,7 @@ func (v *subqueryVisitor) getSubqueryContext() (columns int, execMode subqueryEx
 			case *parser.Tuple:
 				columns = len(t.Exprs)
 			case *parser.DTuple:
-				columns = len(*t)
+				columns = len(t.D)
 			}
 
 			execMode = execModeOneRow

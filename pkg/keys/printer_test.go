@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Veteran Lu (23907238@qq.com)
 
 package keys
 
@@ -23,8 +21,7 @@ import (
 	"testing"
 	"time"
 
-	"gopkg.in/inf.v0"
-
+	"github.com/cockroachdb/apd"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/util/duration"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
@@ -90,6 +87,7 @@ func TestPrettyPrint(t *testing.T) {
 		{RangeMetaKey(roachpb.RKey(makeKey(Meta2Prefix, roachpb.Key("foo")))), `/Meta1/"foo"`},
 
 		// table
+		{SystemConfigSpan.Key, "/Table/SystemConfigSpan/Start"},
 		{UserTableDataMin, "/Table/50"},
 		{MakeTablePrefix(111), "/Table/111"},
 		{makeKey(MakeTablePrefix(42), roachpb.RKey("foo")), `/Table/42/"foo"`},
@@ -135,23 +133,23 @@ func TestPrettyPrint(t *testing.T) {
 			roachpb.RKey(encoding.EncodeTimeDescending(nil, tm))),
 			"/Table/42/1923-10-04T10:19:23.946274991Z"},
 		{makeKey(MakeTablePrefix(42),
-			roachpb.RKey(encoding.EncodeDecimalAscending(nil, inf.NewDec(1234, 2)))),
+			roachpb.RKey(encoding.EncodeDecimalAscending(nil, apd.New(1234, -2)))),
 			"/Table/42/12.34"},
 		{makeKey(MakeTablePrefix(42),
-			roachpb.RKey(encoding.EncodeDecimalDescending(nil, inf.NewDec(1234, 2)))),
+			roachpb.RKey(encoding.EncodeDecimalDescending(nil, apd.New(1234, -2)))),
 			"/Table/42/-12.34"},
 		{makeKey(MakeTablePrefix(42),
 			roachpb.RKey(durationAsc)),
-			"/Table/42/1m1d1s"},
+			"/Table/42/1mon1d1s"},
 		{makeKey(MakeTablePrefix(42),
 			roachpb.RKey(durationDesc)),
-			"/Table/42/-2m-2d743h59m58.999999999s"},
+			"/Table/42/-2mon-2d743h59m58s999ms999µs999ns"},
 
 		// others
 		{makeKey([]byte("")), "/Min"},
 		{Meta1KeyMax, "/Meta1/Max"},
 		{Meta2KeyMax, "/Meta2/Max"},
-		{makeKey(MakeTablePrefix(42), roachpb.RKey([]byte{0x12, 'a', 0x00, 0x02})), "/Table/42/<unknown escape sequence: 0x0 0x2>"},
+		{makeKey(MakeTablePrefix(42), roachpb.RKey([]byte{0x12, 'a', 0x00, 0x02})), "/Table/42/???"},
 	}
 	for i, test := range testCases {
 		keyInfo := MassagePrettyPrintedSpanForTest(PrettyPrint(test.key), nil)
@@ -181,6 +179,8 @@ func TestPrettyPrint(t *testing.T) {
 }
 
 func TestPrettyPrintRange(t *testing.T) {
+	key := makeKey([]byte("a"))
+	key2 := makeKey([]byte("z"))
 	tableKey := makeKey(MakeTablePrefix(61), encoding.EncodeVarintAscending(nil, 4))
 	tableKey2 := makeKey(MakeTablePrefix(61), encoding.EncodeVarintAscending(nil, 500))
 
@@ -189,6 +189,7 @@ func TestPrettyPrintRange(t *testing.T) {
 		maxChars   int
 		expected   string
 	}{
+		{key, key2, 20, "{a-z}"},
 		{MinKey, tableKey, 8, "/{M…-T…}"},
 		{MinKey, tableKey, 15, "/{Min-Tabl…}"},
 		{MinKey, tableKey, 20, "/{Min-Table/6…}"},
@@ -202,9 +203,8 @@ func TestPrettyPrintRange(t *testing.T) {
 	}
 
 	for i, tc := range testCases {
-		var buf bytes.Buffer
-		PrettyPrintRange(&buf, tc.start, tc.end, tc.maxChars)
-		if str := buf.String(); str != tc.expected {
+		str := PrettyPrintRange(tc.start, tc.end, tc.maxChars)
+		if str != tc.expected {
 			t.Errorf("%d: expected \"%s\", got \"%s\"", i, tc.expected, str)
 		}
 	}

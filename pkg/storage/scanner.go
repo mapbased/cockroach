@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Spencer Kimball (spencer.kimball@gmail.com)
 
 package storage
 
@@ -162,6 +160,9 @@ func (rs *replicaScanner) GetDisabled() bool {
 func (rs *replicaScanner) avgScan() time.Duration {
 	rs.mu.Lock()
 	defer rs.mu.Unlock()
+	if rs.mu.scanCount == 0 {
+		return 0
+	}
 	return time.Duration(rs.mu.total.Nanoseconds() / rs.mu.scanCount)
 }
 
@@ -248,8 +249,8 @@ func (rs *replicaScanner) removeReplica(repl *Replica) {
 // the replica set, or until the scanner is stopped. The iteration
 // is paced to complete a full scan in approximately the scan interval.
 func (rs *replicaScanner) scanLoop(clock *hlc.Clock, stopper *stop.Stopper) {
-	stopper.RunWorker(func() {
-		ctx := rs.AnnotateCtx(context.Background())
+	ctx := rs.AnnotateCtx(context.Background())
+	stopper.RunWorker(ctx, func(ctx context.Context) {
 		start := timeutil.Now()
 
 		// waitTimer is reset in each call to waitAndProcess.
@@ -274,19 +275,21 @@ func (rs *replicaScanner) scanLoop(clock *hlc.Clock, stopper *stop.Stopper) {
 				shouldStop = rs.waitAndProcess(ctx, start, clock, stopper, nil)
 			}
 
-			shouldStop = shouldStop || nil != stopper.RunTask(func() {
-				// Increment iteration count.
-				rs.mu.Lock()
-				defer rs.mu.Unlock()
-				rs.mu.scanCount++
-				rs.mu.total += timeutil.Since(start)
-				if log.V(6) {
-					log.Infof(ctx, "reset replica scan iteration")
-				}
+			shouldStop = shouldStop || nil != stopper.RunTask(
+				ctx, "storage.replicaScanner: scan loop",
+				func(ctx context.Context) {
+					// Increment iteration count.
+					rs.mu.Lock()
+					defer rs.mu.Unlock()
+					rs.mu.scanCount++
+					rs.mu.total += timeutil.Since(start)
+					if log.V(6) {
+						log.Infof(ctx, "reset replica scan iteration")
+					}
 
-				// Reset iteration and start time.
-				start = timeutil.Now()
-			})
+					// Reset iteration and start time.
+					start = timeutil.Now()
+				})
 			if shouldStop {
 				return
 			}

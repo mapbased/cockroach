@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Peter Mattis (peter@cockroachlabs.com)
 
 package cli
 
@@ -21,11 +19,25 @@ import (
 
 	"golang.org/x/net/context"
 
+	"github.com/cockroachdb/cockroach/pkg/internal/client"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/security"
+	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/pkg/errors"
 	"github.com/spf13/cobra"
 )
+
+// MakeDBClient creates a kv client for use in cli tools.
+func MakeDBClient() (*client.DB, *stop.Stopper, error) {
+	// The KV endpoints require the node user.
+	baseCfg.User = security.NodeUser
+	conn, clock, stopper, err := getClientGRPCConn()
+	if err != nil {
+		return nil, nil, err
+	}
+	return client.NewDB(client.NewSender(conn), clock), stopper, nil
+}
 
 // A lsRangesCmd command lists the ranges in a cluster.
 var lsRangesCmd = &cobra.Command{
@@ -34,8 +46,7 @@ var lsRangesCmd = &cobra.Command{
 	Long: `
 Lists the ranges in a cluster.
 `,
-	SilenceUsage: true,
-	RunE:         MaybeDecorateGRPCError(runLsRanges),
+	RunE: MaybeDecorateGRPCError(runLsRanges),
 }
 
 func runLsRanges(cmd *cobra.Command, args []string) error {
@@ -61,7 +72,7 @@ func runLsRanges(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return err
 	}
-	defer stopper.Stop()
+	defer stopper.Stop(stopperContext(stopper))
 
 	rows, err := kvDB.Scan(context.Background(), startKey, endKey, maxResults)
 	if err != nil {
@@ -90,8 +101,7 @@ var splitRangeCmd = &cobra.Command{
 	Long: `
 Splits the range containing <key> at <key>.
 `,
-	SilenceUsage: true,
-	RunE:         MaybeDecorateGRPCError(runSplitRange),
+	RunE: MaybeDecorateGRPCError(runSplitRange),
 }
 
 func runSplitRange(cmd *cobra.Command, args []string) error {
@@ -105,8 +115,8 @@ func runSplitRange(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return err
 	}
-	defer stopper.Stop()
-	return errors.Wrap(kvDB.AdminSplit(context.Background(), key), "split failed")
+	defer stopper.Stop(stopperContext(stopper))
+	return errors.Wrap(kvDB.AdminSplit(context.Background(), key, key), "split failed")
 }
 
 var rangeCmds = []*cobra.Command{

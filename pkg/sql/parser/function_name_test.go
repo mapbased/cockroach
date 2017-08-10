@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Raphael 'kena' Poss (knz@cockroachlabs.com)
 
 package parser
 
@@ -28,8 +26,7 @@ func TestResolveFunction(t *testing.T) {
 		err     string
 	}{
 		{`count`, `count`, ``},
-		{`pg_catalog.pg_typeof`, `pg_catalog.pg_typeof`, ``},
-		{`pg_typeof`, `pg_catalog.pg_typeof`, ``},
+		{`pg_catalog.pg_typeof`, `pg_typeof`, ``},
 
 		{`foo`, ``, `unknown function: foo`},
 		{`""`, ``, `invalid function name: ""`},
@@ -39,7 +36,7 @@ func TestResolveFunction(t *testing.T) {
 
 	searchPath := []string{"pg_catalog"}
 	for _, tc := range testCases {
-		stmt, err := ParseOneTraditional("SELECT " + tc.in + "(1)")
+		stmt, err := ParseOne("SELECT " + tc.in + "(1)")
 		if err != nil {
 			t.Fatalf("%s: %v", tc.in, err)
 		}

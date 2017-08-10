@@ -1,0 +1,672 @@
+# LogicTest: default parallel-stmts distsql
+
+statement ok
+CREATE TABLE t (
+  a INT,
+  b CHAR,
+  c INT,
+  d CHAR,
+  PRIMARY KEY (a, b),
+  INDEX bc (b, c),
+  INDEX dc (d, c),
+  INDEX a_desc (a DESC),
+  FAMILY (a, b),
+  FAMILY (c),
+  FAMILY (d)
+)
+
+statement ok
+INSERT INTO t VALUES
+  (1, 'one', 11, 'foo'),
+  (2, 'two', 22, 'bar'),
+  (3, 'three', 33, 'blah')
+
+query T
+SELECT message FROM [SHOW KV TRACE FOR SELECT * FROM t WHERE a = 2]
+ WHERE message LIKE 'fetched:%' OR message LIKE 'output row%'
+----
+fetched: /t/primary/2/'two' -> NULL
+fetched: /t/primary/2/'two'/c -> 22
+fetched: /t/primary/2/'two'/d -> 'bar'
+output row: [2 'two' 22 'bar']
+
+query T
+SELECT message FROM [SHOW KV TRACE FOR SELECT * FROM t WHERE a IN (1, 3)]
+ WHERE message LIKE 'fetched:%' OR message LIKE 'output row%'
+----
+fetched: /t/primary/1/'one' -> NULL
+fetched: /t/primary/1/'one'/c -> 11
+fetched: /t/primary/1/'one'/d -> 'foo'
+output row: [1 'one' 11 'foo']
+fetched: /t/primary/3/'three' -> NULL
+fetched: /t/primary/3/'three'/c -> 33
+fetched: /t/primary/3/'three'/d -> 'blah'
+output row: [3 'three' 33 'blah']
+
+query T
+SELECT message FROM [SHOW KV TRACE FOR SELECT * FROM t WHERE d = 'foo' OR d = 'bar']
+ WHERE message LIKE 'fetched:%' OR message LIKE 'output row%'
+----
+fetched: /t/dc/'bar'/22/2/'two' -> NULL
+output row: [2 'two' 22 'bar']
+fetched: /t/dc/'foo'/11/1/'one' -> NULL
+output row: [1 'one' 11 'foo']
+
+query T
+SELECT message FROM [SHOW KV TRACE FOR SELECT * FROM t WHERE (d, c) IN (('foo', 11), ('bar', 22))]
+ WHERE message LIKE 'fetched:%' OR message LIKE 'output row%'
+----
+fetched: /t/dc/'bar'/22/2/'two' -> NULL
+output row: [2 'two' 22 'bar']
+fetched: /t/dc/'foo'/11/1/'one' -> NULL
+output row: [1 'one' 11 'foo']
+
+query T
+SELECT message FROM [SHOW KV TRACE FOR SELECT * FROM t WHERE (d, c) = ('foo', 11)]
+ WHERE message LIKE 'fetched:%' OR message LIKE 'output row%'
+----
+fetched: /t/dc/'foo'/11/1/'one' -> NULL
+output row: [1 'one' 11 'foo']
+
+query T
+SELECT message FROM [SHOW KV TRACE FOR SELECT * FROM t WHERE a < 2]
+ WHERE message LIKE 'fetched:%' OR message LIKE 'output row%'
+----
+fetched: /t/primary/1/'one' -> NULL
+fetched: /t/primary/1/'one'/c -> 11
+fetched: /t/primary/1/'one'/d -> 'foo'
+output row: [1 'one' 11 'foo']
+
+query T
+SELECT message FROM [SHOW KV TRACE FOR SELECT * FROM t WHERE a <= (1 + 1)]
+ WHERE message LIKE 'fetched:%' OR message LIKE 'output row%'
+----
+fetched: /t/primary/1/'one' -> NULL
+fetched: /t/primary/1/'one'/c -> 11
+fetched: /t/primary/1/'one'/d -> 'foo'
+output row: [1 'one' 11 'foo']
+fetched: /t/primary/2/'two' -> NULL
+fetched: /t/primary/2/'two'/c -> 22
+fetched: /t/primary/2/'two'/d -> 'bar'
+output row: [2 'two' 22 'bar']
+
+query T
+SELECT message FROM [SHOW KV TRACE FOR SELECT a, b FROM t WHERE b > 't']
+ WHERE message LIKE 'fetched:%' OR message LIKE 'output row%'
+----
+fetched: /t/bc/'three'/33/3 -> NULL
+output row: [3 'three']
+fetched: /t/bc/'two'/22/2 -> NULL
+output row: [2 'two']
+
+query T
+SELECT message FROM [SHOW KV TRACE FOR SELECT * FROM t WHERE d < ('b' || 'l')]
+ WHERE message LIKE 'fetched:%' OR message LIKE 'output row%'
+----
+fetched: /t/dc/'bar'/22/2/'two' -> NULL
+output row: [2 'two' 22 'bar']
+
+# The where-clause does not contain columns matching a prefix of any
+# index. Note that the index "dc" was chosen because it contains fewer
+# keys per row than the primary key index while still containing all
+# of the needed columns.
+query T
+SELECT message FROM [SHOW KV TRACE FOR SELECT * FROM t WHERE c = 22]
+ WHERE message LIKE 'fetched:%' OR message LIKE 'output row%'
+----
+fetched: /t/dc/'bar'/22/2/'two' -> NULL
+output row: [2 'two' 22 'bar']
+fetched: /t/dc/'blah'/33/3/'three' -> NULL
+fetched: /t/dc/'foo'/11/1/'one' -> NULL
+
+# Use the descending index
+query T
+SELECT message FROM [SHOW KV TRACE FOR SELECT a FROM t ORDER BY a DESC]
+ WHERE message LIKE 'fetched:%' OR message LIKE 'output row%'
+----
+fetched: /t/a_desc/3/'three' -> NULL
+output row: [3]
+fetched: /t/a_desc/2/'two' -> NULL
+output row: [2]
+fetched: /t/a_desc/1/'one' -> NULL
+output row: [1]
+
+# Use the descending index with multiple spans.
+query T
+SELECT message FROM [SHOW KV TRACE FOR SELECT a FROM t WHERE a in (2, 3) ORDER BY a DESC]
+ WHERE message LIKE 'fetched:%' OR message LIKE 'output row%'
+----
+fetched: /t/a_desc/3/'three' -> NULL
+output row: [3]
+fetched: /t/a_desc/2/'two' -> NULL
+output row: [2]
+
+# Index selection occurs in direct join operands too.
+query ITTT
+EXPLAIN SELECT * FROM t x JOIN t y USING(b) WHERE x.b < '3'
+----
+0  render      ·         ·
+1  join        ·         ·
+1  ·           type      inner
+1  ·           equality  (b) = (b)
+2  index-join  ·         ·
+3  scan        ·         ·
+3  ·           table     t@bc
+3  ·           spans     /#-/"3"
+3  scan        ·         ·
+3  ·           table     t@primary
+2  scan        ·         ·
+2  ·           table     t@primary
+2  ·           spans     ALL
+
+statement ok
+TRUNCATE TABLE t
+
+statement ok
+INSERT INTO t VALUES
+  (1, 'a', NULL, NULL),
+  (1, 'b', NULL, NULL),
+  (1, 'c', NULL, NULL)
+
+query T
+SELECT message FROM [SHOW KV TRACE FOR SELECT * FROM t WHERE a = 1 AND b > 'b']
+ WHERE message LIKE 'fetched:%' OR message LIKE 'output row%'
+----
+fetched: /t/primary/1/'c' -> NULL
+output row: [1 'c' NULL NULL]
+
+query T
+SELECT message FROM [SHOW KV TRACE FOR SELECT * FROM t WHERE a > 0 AND b > 'b']
+ WHERE message LIKE 'fetched:%' OR message LIKE 'output row%'
+----
+fetched: /t/primary/1/'c' -> NULL
+output row: [1 'c' NULL NULL]
+
+query T
+SELECT message FROM [SHOW KV TRACE FOR SELECT * FROM t WHERE a > 1 AND b > 'b']
+ WHERE message LIKE 'fetched:%' OR message LIKE 'output row%'
+----
+
+query ITTT
+EXPLAIN SELECT * FROM t WHERE a > 1 AND a < 2
+----
+0  render  ·  ·
+1  empty   ·  ·
+
+query T
+SELECT message FROM [SHOW KV TRACE FOR SELECT * FROM t WHERE a = 1 AND 'a' < b AND 'c' > b]
+ WHERE message LIKE 'fetched:%' OR message LIKE 'output row%'
+----
+fetched: /t/primary/1/'b' -> NULL
+output row: [1 'b' NULL NULL]
+
+statement ok
+DROP TABLE t
+
+statement ok
+CREATE TABLE t (
+  a INT PRIMARY KEY,
+  b INT,
+  INDEX ab (a, b)
+)
+
+statement ok
+INSERT INTO t VALUES (1, 2), (3, 4), (5, 6)
+
+query T
+SELECT message FROM [SHOW KV TRACE FOR SELECT * FROM t@ab WHERE a >= 3 AND a < 5]
+ WHERE message LIKE 'fetched:%' OR message LIKE 'output row%'
+----
+fetched: /t/ab/3/4 -> NULL
+output row: [3 4]
+
+query T
+SELECT message FROM [SHOW KV TRACE FOR SELECT * FROM t@ab WHERE a BETWEEN 3 AND 4]
+ WHERE message LIKE 'fetched:%' OR message LIKE 'output row%'
+----
+fetched: /t/ab/3/4 -> NULL
+output row: [3 4]
+
+query T
+SELECT message FROM [SHOW KV TRACE FOR SELECT * FROM t@ab WHERE a BETWEEN 3 AND 5]
+ WHERE message LIKE 'fetched:%' OR message LIKE 'output row%'
+----
+fetched: /t/ab/3/4 -> NULL
+output row: [3 4]
+fetched: /t/ab/5/6 -> NULL
+output row: [5 6]
+
+query T
+SELECT message FROM [SHOW KV TRACE FOR SELECT * FROM t@ab WHERE a < 2 OR a < 4]
+ WHERE message LIKE 'fetched:%' OR message LIKE 'output row%'
+----
+fetched: /t/ab/1/2 -> NULL
+output row: [1 2]
+fetched: /t/ab/3/4 -> NULL
+output row: [3 4]
+
+query T
+SELECT message FROM [SHOW KV TRACE FOR SELECT * FROM t@ab WHERE a < 3 OR a <= 3]
+ WHERE message LIKE 'fetched:%' OR message LIKE 'output row%'
+----
+fetched: /t/ab/1/2 -> NULL
+output row: [1 2]
+fetched: /t/ab/3/4 -> NULL
+output row: [3 4]
+
+query T
+SELECT message FROM [SHOW KV TRACE FOR SELECT * FROM t@ab WHERE a <= 3 OR a < 3]
+ WHERE message LIKE 'fetched:%' OR message LIKE 'output row%'
+----
+fetched: /t/ab/1/2 -> NULL
+output row: [1 2]
+fetched: /t/ab/3/4 -> NULL
+output row: [3 4]
+
+query T
+SELECT message FROM [SHOW KV TRACE FOR SELECT * FROM t@ab WHERE a > 3 OR a >= 3]
+ WHERE message LIKE 'fetched:%' OR message LIKE 'output row%'
+----
+fetched: /t/ab/3/4 -> NULL
+output row: [3 4]
+fetched: /t/ab/5/6 -> NULL
+output row: [5 6]
+
+query T
+SELECT message FROM [SHOW KV TRACE FOR SELECT * FROM t@ab WHERE a >= 3 OR a > 3]
+ WHERE message LIKE 'fetched:%' OR message LIKE 'output row%'
+----
+fetched: /t/ab/3/4 -> NULL
+output row: [3 4]
+fetched: /t/ab/5/6 -> NULL
+output row: [5 6]
+
+query T
+SELECT message FROM [SHOW KV TRACE FOR SELECT * FROM t@ab WHERE a = 3 OR a = 5]
+ WHERE message LIKE 'fetched:%' OR message LIKE 'output row%'
+----
+fetched: /t/ab/3/4 -> NULL
+output row: [3 4]
+fetched: /t/ab/5/6 -> NULL
+output row: [5 6]
+
+query T
+SELECT message FROM [SHOW KV TRACE FOR SELECT * FROM t@ab WHERE a < 3 OR a > 3]
+ WHERE message LIKE 'fetched:%' OR message LIKE 'output row%'
+----
+fetched: /t/ab/1/2 -> NULL
+output row: [1 2]
+fetched: /t/ab/3/4 -> NULL
+fetched: /t/ab/5/6 -> NULL
+output row: [5 6]
+
+query T
+SELECT message FROM [SHOW KV TRACE FOR SELECT * FROM t@ab WHERE a + 1 = 4]
+ WHERE message LIKE 'fetched:%' OR message LIKE 'output row%'
+----
+fetched: /t/ab/3/4 -> NULL
+output row: [3 4]
+
+query ITTT
+EXPLAIN SELECT * FROM t WHERE a = 1 AND false
+----
+0  render  ·  ·
+1  empty   ·  ·
+
+# Make sure that mixed type comparison operations are not used
+# for selecting indexes.
+
+statement ok
+DROP TABLE t
+
+statement ok
+CREATE TABLE t (
+  a INT PRIMARY KEY,
+  b INT,
+  c INT,
+  INDEX b_desc (b DESC),
+  INDEX bc (b, c)
+)
+
+statement ok
+INSERT INTO t VALUES (1, 2, 3), (3, 4, 5), (5, 6, 7)
+
+query I rowsort
+SELECT a FROM t WHERE a < 4.0
+----
+1
+3
+
+query I
+SELECT b FROM t WHERE c > 4.0 AND a < 4
+----
+4
+
+query ITTT
+EXPLAIN SELECT a FROM t WHERE c > 1
+----
+0  render  ·      ·
+1  scan    ·      ·
+1  ·       table  t@bc
+1  ·       spans  ALL
+
+query ITTT
+EXPLAIN SELECT a FROM t WHERE c < 1 AND b < 5
+----
+0  render  ·      ·
+1  scan    ·      ·
+1  ·       table  t@bc
+1  ·       spans  /#-/4/1
+
+query ITTT
+EXPLAIN SELECT a FROM t WHERE c > 1.0
+----
+0  render  ·      ·
+1  scan    ·      ·
+1  ·       table  t@bc
+1  ·       spans  ALL
+
+query ITTT
+EXPLAIN SELECT a FROM t WHERE c < 1.0
+----
+0  render  ·      ·
+1  scan    ·      ·
+1  ·       table  t@bc
+1  ·       spans  ALL
+
+query ITTT
+EXPLAIN SELECT a FROM t WHERE c > 1.0 AND b < 5
+----
+0  render  ·      ·
+1  scan    ·      ·
+1  ·       table  t@bc
+1  ·       spans  /#-/5
+
+query ITTT
+EXPLAIN SELECT a FROM t WHERE b < 5.0 AND c < 1
+----
+0  render  ·      ·
+1  scan    ·      ·
+1  ·       table  t@bc
+1  ·       spans  /#-/4/1
+
+query ITTT
+EXPLAIN SELECT a FROM t WHERE (b, c) = (5, 1)
+----
+0  render  ·      ·
+1  scan    ·      ·
+1  ·       table  t@bc
+1  ·       spans  /5/1-/5/2
+
+query ITTT
+EXPLAIN SELECT a FROM t WHERE (b, c) = (5.0, 1)
+----
+0  render  ·      ·
+1  scan    ·      ·
+1  ·       table  t@bc
+1  ·       spans  /5/1-/5/2
+
+query ITTT
+EXPLAIN SELECT a FROM t WHERE (b, c) = (5.1, 1)
+----
+0  render  ·      ·
+1  scan    ·      ·
+1  ·       table  t@bc
+1  ·       spans  ALL
+
+query ITTT
+EXPLAIN SELECT a FROM t WHERE b IN (5.0, 1)
+----
+0  render  ·      ·
+1  scan    ·      ·
+1  ·       table  t@b_desc
+1  ·       spans  /-6-/-5 /-2-/-1
+
+statement ok
+CREATE TABLE abcd (
+  a INT,
+  b INT,
+  c INT,
+  d INT,
+  INDEX adb (a, d, b),
+  INDEX abcd (a, b, c, d)
+)
+
+# Verify that we prefer the index where more columns are constrained, even if it
+# has more keys per row.
+query ITTT
+EXPLAIN SELECT b FROM abcd WHERE (a, b) = (1, 4)
+----
+0  render  ·      ·
+1  scan    ·      ·
+1  ·       table  abcd@abcd
+1  ·       spans  /1/4-/1/5
+
+query ITTT
+EXPLAIN SELECT b FROM abcd WHERE (a, b) IN ((1, 4), (2, 9))
+----
+0  render  ·      ·
+1  scan    ·      ·
+1  ·       table  abcd@abcd
+1  ·       spans  /1/4-/1/5 /2/9-/2/10
+
+statement ok
+CREATE TABLE ab (
+  s STRING,
+  i INT
+); INSERT INTO ab VALUES ('a', 1), ('b', 1), ('c', 1)
+
+query IT rowsort
+SELECT i, s FROM ab WHERE (i, s) < (1, 'c')
+----
+1 a
+1 b
+
+statement ok
+CREATE INDEX baz ON ab (i, s)
+
+query IT rowsort
+SELECT i, s FROM ab@baz WHERE (i, s) < (1, 'c')
+----
+1 a
+1 b
+
+query ITTT
+EXPLAIN SELECT i, s FROM ab@baz WHERE (i, s) < (1, 'c')
+----
+0  render  ·      ·
+1  scan    ·      ·
+1  ·       table  ab@baz
+1  ·       spans  /#-/1/"c"
+
+# Check that primary key definitions can indicate index ordering,
+# and this information is subsequently used during index selection
+# and span generation. #13882
+query TTBITTBB
+CREATE TABLE abz(a INT, b INT, c INT, PRIMARY KEY (a DESC, b ASC), UNIQUE(c DESC, b ASC)); SHOW INDEX FROM abz
+----
+abz    primary      true      1  a       DESC       false    false
+abz    primary      true      2  b       ASC        false    false
+abz    abz_c_b_key  true      1  c       DESC       false    false
+abz    abz_c_b_key  true      2  b       ASC        false    false
+abz    abz_c_b_key  true      3  a       ASC        false    true
+
+query ITTT
+EXPLAIN SELECT a FROM abz ORDER BY a DESC LIMIT 1
+----
+0  limit   ·      ·
+1  render  ·      ·
+2  scan    ·      ·
+2  ·       table  abz@primary
+2  ·       spans  ALL
+2  ·       limit  1
+
+query ITTT
+EXPLAIN SELECT c FROM abz ORDER BY c DESC LIMIT 1
+----
+0  limit   ·      ·
+1  render  ·      ·
+2  scan    ·      ·
+2  ·       table  abz@abz_c_b_key
+2  ·       spans  ALL
+2  ·       limit  1
+
+# Issue #14426: verify we don't have an internal filter that contains "a IN ()"
+# (which causes an error in DistSQL due to expression serialization).
+statement ok
+CREATE TABLE tab0(
+  k INT PRIMARY KEY,
+  a INT,
+  b INT
+)
+
+query ITTTTT
+EXPLAIN (VERBOSE) SELECT k FROM tab0 WHERE (a IN (6) AND a > 6) OR b >= 4
+----
+0  render  ·         ·                                     (k)        ·
+0  ·       render 0  test.tab0.k                           ·          ·
+1  scan    ·         ·                                     (k, a, b)  ·
+1  ·       table     tab0@primary                          ·          ·
+1  ·       spans     ALL                                   ·          ·
+1  ·       filter    ((a IN (6)) AND (a > 6)) OR (b >= 4)  ·          ·
+
+query I
+SELECT k FROM tab0 WHERE (a IN (6) AND a > 6) OR b >= 4
+----
+
+# Regression tests for #12022
+
+statement ok
+CREATE TABLE t12022 (
+  c1 INT,
+  c2 BOOL,
+  UNIQUE INDEX i (c1, c2)
+);
+
+statement ok
+INSERT INTO t12022 VALUES
+  (1, NULL), (1, false), (1, true),
+  (2, NULL), (2, false), (2, true);
+
+query IB
+SELECT * FROM t12022@i WHERE (c1, c2) > (1, NULL) ORDER BY (c1, c2);
+----
+2  NULL
+2  false
+2  true
+
+query IB
+SELECT * FROM t12022@i WHERE (c1, c2) > (1, false) ORDER BY (c1, c2);
+----
+1  true
+2  NULL
+2  false
+2  true
+
+query IB
+SELECT * FROM t12022@i WHERE (c1, c2) > (1, true) ORDER BY (c1, c2);
+----
+2  NULL
+2  false
+2  true
+
+query IB
+SELECT * FROM t12022@i WHERE (c1, c2) < (2, NULL) ORDER BY (c1, c2);
+----
+1  NULL
+1  false
+1  true
+
+query IB
+SELECT * FROM t12022@i WHERE (c1, c2) < (2, false) ORDER BY (c1, c2);
+----
+1  NULL
+1  false
+1  true
+
+query IB
+SELECT * FROM t12022@i WHERE (c1, c2) < (2, true) ORDER BY (c1, c2);
+----
+1  NULL
+1  false
+1  true
+2  false
+
+# Check that no extraneous rows are fetched due to excessive batching (#15910)
+# The test is composed of three parts: populate a table, check
+# that the problematic plan is properly derived from the test query,
+# then test the results.
+
+statement ok
+CREATE TABLE test2 (id BIGSERIAL PRIMARY KEY, k TEXT UNIQUE, v INT DEFAULT 42);
+  INSERT INTO test2(k)
+       VALUES ('001'),('002'),('003'),('004'),('005'),('006'),('007'),('008'),('009'),('010'),
+              ('011'),('012'),('013'),('014'),('015'),('016'),('017'),('018'),('019'),('020'),
+              ('021'),('022'),('023'),('024'),('025'),('026'),('027'),('028'),('029'),('030')
+
+# Plan check:
+# The query is using an index-join and the limit is propagated to the scan.
+
+query ITTT
+EXPLAIN SELECT * FROM test2 WHERE k <= '100' ORDER BY k DESC LIMIT 20
+----
+0  limit       ·      ·
+1  index-join  ·      ·
+2  revscan     ·      ·
+2  ·           table  test2@test2_k_key
+2  ·           spans  /#-/"100\x00"
+2  ·           limit  20
+2  scan        ·      ·
+2  ·           table  test2@primary
+
+# Result check: The following query must not issue more than the
+# requested LIMIT K/V reads, even though an index join batches 100
+# rows at a time -- the limit should be enforced by the scan.  We are
+# reading from the end (ORDER BY k DESC) so we should see 20 values
+# from 030 to 011 (thus not 001-010).
+
+query T
+SELECT regexp_replace(message, '\d\d\d\d\d+', '...PK...')
+  FROM [SHOW KV TRACE FOR SELECT * FROM test2 WHERE k <= '100' ORDER BY k DESC LIMIT 20]
+ WHERE message LIKE 'fetched:%'
+----
+fetched: /test2/test2_k_key/'030' -> /...PK...
+fetched: /test2/test2_k_key/'029' -> /...PK...
+fetched: /test2/test2_k_key/'028' -> /...PK...
+fetched: /test2/test2_k_key/'027' -> /...PK...
+fetched: /test2/test2_k_key/'026' -> /...PK...
+fetched: /test2/test2_k_key/'025' -> /...PK...
+fetched: /test2/test2_k_key/'024' -> /...PK...
+fetched: /test2/test2_k_key/'023' -> /...PK...
+fetched: /test2/test2_k_key/'022' -> /...PK...
+fetched: /test2/test2_k_key/'021' -> /...PK...
+fetched: /test2/test2_k_key/'020' -> /...PK...
+fetched: /test2/test2_k_key/'019' -> /...PK...
+fetched: /test2/test2_k_key/'018' -> /...PK...
+fetched: /test2/test2_k_key/'017' -> /...PK...
+fetched: /test2/test2_k_key/'016' -> /...PK...
+fetched: /test2/test2_k_key/'015' -> /...PK...
+fetched: /test2/test2_k_key/'014' -> /...PK...
+fetched: /test2/test2_k_key/'013' -> /...PK...
+fetched: /test2/test2_k_key/'012' -> /...PK...
+fetched: /test2/test2_k_key/'011' -> /...PK...
+fetched: /test2/primary/...PK.../k/v -> /'030'/42
+fetched: /test2/primary/...PK.../k/v -> /'029'/42
+fetched: /test2/primary/...PK.../k/v -> /'028'/42
+fetched: /test2/primary/...PK.../k/v -> /'027'/42
+fetched: /test2/primary/...PK.../k/v -> /'026'/42
+fetched: /test2/primary/...PK.../k/v -> /'025'/42
+fetched: /test2/primary/...PK.../k/v -> /'024'/42
+fetched: /test2/primary/...PK.../k/v -> /'023'/42
+fetched: /test2/primary/...PK.../k/v -> /'022'/42
+fetched: /test2/primary/...PK.../k/v -> /'021'/42
+fetched: /test2/primary/...PK.../k/v -> /'020'/42
+fetched: /test2/primary/...PK.../k/v -> /'019'/42
+fetched: /test2/primary/...PK.../k/v -> /'018'/42
+fetched: /test2/primary/...PK.../k/v -> /'017'/42
+fetched: /test2/primary/...PK.../k/v -> /'016'/42
+fetched: /test2/primary/...PK.../k/v -> /'015'/42
+fetched: /test2/primary/...PK.../k/v -> /'014'/42
+fetched: /test2/primary/...PK.../k/v -> /'013'/42
+fetched: /test2/primary/...PK.../k/v -> /'012'/42
+fetched: /test2/primary/...PK.../k/v -> /'011'/42

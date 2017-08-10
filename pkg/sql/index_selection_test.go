@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Peter Mattis (peter@cockroachlabs.com)
 
 package sql
 
@@ -21,6 +19,8 @@ import (
 	"math"
 	"strings"
 	"testing"
+
+	"golang.org/x/net/context"
 
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
@@ -165,13 +165,14 @@ func makeTestIndexFromStr(
 
 func makeConstraints(
 	t *testing.T,
+	evalCtx *parser.EvalContext,
 	sql string,
 	desc *sqlbase.TableDescriptor,
 	index *sqlbase.IndexDescriptor,
-	sel *selectNode,
+	sel *renderNode,
 ) (orIndexConstraints, parser.TypedExpr) {
-	expr := parseAndNormalizeExpr(t, sql, sel)
-	exprs, equiv := analyzeExpr(expr)
+	expr := parseAndNormalizeExpr(t, evalCtx, sql, sel)
+	exprs, equiv := analyzeExpr(evalCtx, expr)
 
 	c := &indexInfo{
 		desc:     desc,
@@ -312,9 +313,11 @@ func TestMakeConstraints(t *testing.T) {
 	}
 	for _, d := range testData {
 		t.Run(d.expr+"~"+d.expected, func(t *testing.T) {
+			evalCtx := parser.NewTestingEvalContext()
+			defer evalCtx.Stop(context.Background())
 			sel := makeSelectNode(t)
 			desc, index := makeTestIndexFromStr(t, d.columns)
-			constraints, _ := makeConstraints(t, d.expr, desc, index, sel)
+			constraints, _ := makeConstraints(t, evalCtx, d.expr, desc, index, sel)
 			if s := constraints.String(); d.expected != s {
 				t.Errorf("%s, columns: %s: expected %s, but found %s", d.expr, d.columns, d.expected, s)
 			}
@@ -483,12 +486,13 @@ func TestMakeSpans(t *testing.T) {
 
 		// When encoding an end constraint for a maximal datum, we use
 		// bytes.PrefixEnd() to go beyond the normal encodings of that datatype.
+		// This is the reason for the "???" suffix of the pretty-printed spans.
 		{fmt.Sprintf(`a = %d`, math.MaxInt64), `a`,
-			`/9223372036854775807-/<varint 9223372036854775808 overflows int64>`,
+			`/9223372036854775807-/???`,
 			`/9223372036854775807-/9223372036854775806`},
 		{fmt.Sprintf(`a = %d`, math.MinInt64), `a`,
 			`/-9223372036854775808-/-9223372036854775807`,
-			`/-9223372036854775808-/<varint 9223372036854775808 overflows int64>`},
+			`/-9223372036854775808-/???`},
 
 		{`(a, b) >= (1, 4)`, `a,b`, `/1/4-`, `-/1/3`},
 		{`(a, b) > (1, 4)`, `a,b`, `/1/5-`, `-/1/4`},
@@ -506,6 +510,8 @@ func TestMakeSpans(t *testing.T) {
 				expected = d.expectedDesc
 			}
 			t.Run(d.expr+"~"+expected, func(t *testing.T) {
+				evalCtx := parser.NewTestingEvalContext()
+				defer evalCtx.Stop(context.Background())
 				sel := makeSelectNode(t)
 				columns := strings.Split(d.columns, ",")
 				dirs := make([]encoding.Direction, 0, len(columns))
@@ -513,8 +519,11 @@ func TestMakeSpans(t *testing.T) {
 					dirs = append(dirs, dir)
 				}
 				desc, index := makeTestIndex(t, columns, dirs)
-				constraints, _ := makeConstraints(t, d.expr, desc, index, sel)
-				spans := makeSpans(constraints, desc, index)
+				constraints, _ := makeConstraints(t, evalCtx, d.expr, desc, index, sel)
+				spans, err := makeSpans(constraints, desc, index)
+				if err != nil {
+					t.Fatal(err)
+				}
 				s := sqlbase.PrettySpans(spans, 2)
 				s = keys.MassagePrettyPrintedSpanForTest(s, indexToDirs(index))
 				if expected != s {
@@ -550,10 +559,15 @@ func TestMakeSpans(t *testing.T) {
 	}
 	for _, d := range testData2 {
 		t.Run(d.expr+"~"+d.expected, func(t *testing.T) {
+			evalCtx := parser.NewTestingEvalContext()
+			defer evalCtx.Stop(context.Background())
 			sel := makeSelectNode(t)
 			desc, index := makeTestIndexFromStr(t, d.columns)
-			constraints, _ := makeConstraints(t, d.expr, desc, index, sel)
-			spans := makeSpans(constraints, desc, index)
+			constraints, _ := makeConstraints(t, evalCtx, d.expr, desc, index, sel)
+			spans, err := makeSpans(constraints, desc, index)
+			if err != nil {
+				t.Fatal(err)
+			}
 			var got string
 			raw := false
 			if strings.HasPrefix(d.expected, "raw:") {
@@ -625,10 +639,12 @@ func TestExactPrefix(t *testing.T) {
 	}
 	for _, d := range testData {
 		t.Run(fmt.Sprintf("%s~%d", d.expr, d.expected), func(t *testing.T) {
+			evalCtx := parser.NewTestingEvalContext()
+			defer evalCtx.Stop(context.Background())
 			sel := makeSelectNode(t)
 			desc, index := makeTestIndexFromStr(t, d.columns)
-			constraints, _ := makeConstraints(t, d.expr, desc, index, sel)
-			prefix := constraints.exactPrefix()
+			constraints, _ := makeConstraints(t, evalCtx, d.expr, desc, index, sel)
+			prefix := constraints.exactPrefix(evalCtx)
 			if d.expected != prefix {
 				t.Errorf("%s: expected %d, but found %d", d.expr, d.expected, prefix)
 			}
@@ -648,8 +664,8 @@ func TestApplyConstraints(t *testing.T) {
 		{`a = 1 AND b = 1`, `a,b`, `<nil>`},
 		{`a = 1 AND b = 1`, `a`, `b = 1`},
 		{`a = 1 AND b = 1`, `b`, `a = 1`},
-		{`a = 1 AND b > 1`, `a,b`, `b > 1`},
-		{`a > 1 AND b = 1`, `a,b`, `(a > 1) AND (b = 1)`},
+		{`a = 1 AND b > 1`, `a,b`, `<nil>`},
+		{`a > 1 AND b = 1`, `a,b`, `b = 1`},
 		{`a IN (1)`, `a`, `<nil>`},
 		{`a IN (1) OR a IN (2)`, `a`, `<nil>`},
 		{`a = 1 OR a = 2`, `a`, `<nil>`},
@@ -658,26 +674,56 @@ func TestApplyConstraints(t *testing.T) {
 		{`a != 1`, `a`, `a != 1`},
 		{`a IS NOT NULL`, `a`, `<nil>`},
 		{`a = 1 AND b IS NOT NULL`, `a,b`, `<nil>`},
-		{`a >= 1 AND b = 2`, `a,b`, `(a >= 1) AND (b = 2)`},
-		{`a >= 1 AND a <= 3 AND b = 2`, `a,b`, `(a >= 1) AND ((a <= 3) AND (b = 2))`},
+		{`a >= 1 AND b = 2`, `a,b`, `b = 2`},
+		{`a >= 1 AND a <= 3 AND b = 2`, `a,b`, `b = 2`},
 		{`(a, b) = (1, 2) AND c IS NOT NULL`, `a,b,c`, `<nil>`},
 		{`a IN (1, 2) AND b = 3`, `a,b`, `b = 3`},
-		{`a <= 5 AND b >= 6 AND (a, b) IN ((1, 2))`, `a,b`, `(a <= 5) AND (b >= 6)`},
+		{`a <= 5 AND b >= 6 AND (a, b) IN ((1, 2))`, `a,b`, `false`},
 		{`a IN (1) AND a = 1`, `a`, `<nil>`},
-		{`(a, b) = (1, 2)`, `a`, `(a, b) IN ((1, 2))`},
-		// Filters that are not trimmed as of Dec 2015, although they could be.
-		// Issue #3473.
-		// {`a > 1`, `a`, `<nil>`},
-		// {`a < 1`, `a`, `<nil>`},
+		{`(a, b) = (1, 2)`, `a`, `b = 2`},
+		{`a > 1`, `a`, `<nil>`},
+		{`a < 1`, `a`, `<nil>`},
+		// The constraint (l, m) < (123, 456) must be treated as implying
+		// l <= 123. This means that l < 123 definitely cannot be
+		// simplified.
+		// Note 1: we use DECIMAL columns so that constraint extraction
+		// cannot change the < constraint on the left <= by applying
+		// Next(). Any column type without a Next() would do.
+		// Note 2: we use a COALESCE expression to make the
+		// sub-expression "l < 123" invisible to constraint analysis; any
+		// function that returns an opaque boolean based on a boolean
+		// argument would do.
+		{`(l, m) < (123, 456) AND COALESCE(l < 123, true)`, `l,m`,
+			`((l, m) < (123, 456)) AND COALESCE(l < 123, true)`},
+		// Same for the other direction.
+		{`(l, m) > (123, 456) AND COALESCE(l > 123, true)`, `l,m`,
+			`((l, m) > (123, 456)) AND COALESCE(l > 123, true)`},
+		// The constraint a <= 1 implies that a != 2 is true.
+		// Note: we use COALESCE so that the sub-expression a != 2 is not
+		// elided during constraint analysis before constraint
+		// propagation.
+		{`a <= 1 AND COALESCE(a != 2, true)`, `a`, `COALESCE(true, true)`},
+		// Regression tests: #13707
+		// The following tests must achieve a constraint on `a` and an
+		// expression to simplify that contains `a` in a previously
+		// unhandled comparison operator. We use OR so that analyzeExpr
+		// doesn't decompose further.
+		{`a < 3 AND (b < 2 OR a IN (0,1,2))`, `a`, `(b < 2) OR (a IN (0, 1, 2))`},
+		{`a < 3 AND (b < 2 OR a NOT IN (0,1,2))`, `a`, `(b < 2) OR (a NOT IN (0, 1, 2))`},
+		{`a < 3 AND (b < 2 OR a = ANY ARRAY[0,1,2])`, `a`, `(b < 2) OR (a = ANY ARRAY[0,1,2])`},
+		{`a IN (0, 2, 3) AND (b < 2 OR a <= 4)`, `a`, `(b < 2) OR (a <= 4)`},
+		{`a IN (0, 2, 3) AND (b < 2 OR a = 2)`, `a`, `(b < 2) OR (a = 2)`},
 	}
 	for _, d := range testData {
 		t.Run(d.expr+"~"+d.expected, func(t *testing.T) {
+			evalCtx := parser.NewTestingEvalContext()
+			defer evalCtx.Stop(context.Background())
 			sel := makeSelectNode(t)
 			desc, index := makeTestIndexFromStr(t, d.columns)
-			constraints, expr := makeConstraints(t, d.expr, desc, index, sel)
-			expr2 := applyIndexConstraints(expr, constraints)
+			constraints, expr := makeConstraints(t, evalCtx, d.expr, desc, index, sel)
+			expr2 := applyIndexConstraints(evalCtx, expr, constraints)
 			if s := fmt.Sprint(expr2); d.expected != s {
-				t.Errorf("%s: expected %s, but found %s", d.expr, d.expected, s)
+				t.Errorf("%s: expected %s, but found %s (constraints %s)", d.expr, d.expected, s, constraints)
 			}
 		})
 	}

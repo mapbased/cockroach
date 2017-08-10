@@ -11,9 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Marc Berhault (marc@cockroachlabs.com)
-// Author: Andrei Matei (andreimatei1@gmail.com)
 
 package sql
 
@@ -37,7 +34,7 @@ import (
 func TestRenameTable(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	s, db, kvDB := serverutils.StartServer(t, base.TestServerArgs{})
-	defer s.Stopper().Stop()
+	defer s.Stopper().Stop(context.TODO())
 
 	counter := int64(keys.MaxReservedDescID)
 
@@ -160,7 +157,7 @@ func TestTxnCanStillResolveOldName(t *testing.T) {
 			}
 		}
 	s, db, kvDB := serverutils.StartServer(t, serverParams)
-	defer s.Stopper().Stop()
+	defer s.Stopper().Stop(context.TODO())
 
 	sql := `
 CREATE DATABASE test;
@@ -224,12 +221,12 @@ CREATE TABLE test.t (a INT PRIMARY KEY);
 	// that the node doesn't have a lease on it anymore (committing the txn
 	// should have released the lease on the version of the descriptor with the
 	// old name), even thoudh the name mapping still exists.
-	lease := s.LeaseManager().(*LeaseManager).tableNames.get(tableDesc.ID, "t", s.Clock())
+	lease := s.LeaseManager().(*LeaseManager).tableNames.get(tableDesc.ID, "t", s.Clock().Now())
 	if lease != nil {
 		t.Fatalf(`still have lease on "t"`)
 	}
 	if _, err := db.Exec("SELECT * FROM test.t"); !testutils.IsError(
-		err, `table "test.t" does not exist`) {
+		err, `relation "test.t" does not exist`) {
 		t.Fatal(err)
 	}
 	close(renameUnblocked)
@@ -245,7 +242,7 @@ CREATE TABLE test.t (a INT PRIMARY KEY);
 func TestTxnCanUseNewNameAfterRename(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	s, db, _ := serverutils.StartServer(t, base.TestServerArgs{})
-	defer s.Stopper().Stop()
+	defer s.Stopper().Stop(context.TODO())
 
 	sql := `
 CREATE DATABASE test;
@@ -256,28 +253,51 @@ CREATE TABLE test.t (a INT PRIMARY KEY);
 		t.Fatal(err)
 	}
 
-	txn, err := db.Begin()
-	if err != nil {
+	// Make sure we take a lease on the version called "t".
+	if _, err := db.Exec("SELECT * FROM test.t"); err != nil {
 		t.Fatal(err)
+	}
+	{
+		txn, err := db.Begin()
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if _, err := txn.Exec("ALTER TABLE test.t RENAME TO test.t2"); err != nil {
+			t.Fatal(err)
+		}
+		// Check that we can use the new name.
+		if _, err := txn.Exec("SELECT * FROM test.t2"); err != nil {
+			t.Fatal(err)
+		}
+
+		if err := txn.Commit(); err != nil {
+			t.Fatal(err)
+		}
 	}
 
-	// Make sure we take a lease on the version called "t".
-	if _, err := txn.Exec("SELECT * FROM test.t"); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := txn.Exec("ALTER TABLE test.t RENAME TO test.t2"); err != nil {
-		t.Fatal(err)
-	}
-	// Check that we can use the new name.
-	if _, err := txn.Exec("SELECT * FROM test.t2"); err != nil {
-		t.Fatal(err)
-	}
-	// Check that we can also use the old name, since we have a lease on it.
-	if _, err := txn.Exec("SELECT * FROM test.t"); err != nil {
-		t.Fatal(err)
-	}
-	if err := txn.Commit(); err != nil {
-		t.Fatal(err)
+	{
+		txn, err := db.Begin()
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if _, err := txn.Exec("ALTER TABLE test.t2 RENAME TO test.t"); err != nil {
+			t.Fatal(err)
+		}
+		// Check that we can use the new name.
+		if _, err := txn.Exec("SELECT * FROM test.t"); err != nil {
+			t.Fatal(err)
+		}
+		// Check that we cannot use the old name.
+		if _, err := txn.Exec(`
+SELECT * FROM test.t2
+`); !testutils.IsError(err, "relation \"test.t2\" does not exist") {
+			t.Fatalf("err = %v", err)
+		}
+		if err := txn.Rollback(); err != nil {
+			t.Fatal(err)
+		}
 	}
 }
 
@@ -286,7 +306,7 @@ CREATE TABLE test.t (a INT PRIMARY KEY);
 func TestSeriesOfRenames(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	s, db, _ := serverutils.StartServer(t, base.TestServerArgs{})
-	defer s.Stopper().Stop()
+	defer s.Stopper().Stop(context.TODO())
 
 	sql := `
 CREATE DATABASE test;

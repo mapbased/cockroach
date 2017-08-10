@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Spencer Kimball (spencer.kimball@gmail.com)
 
 package kv_test
 
@@ -20,7 +18,6 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
-	"path/filepath"
 	"sync/atomic"
 	"testing"
 
@@ -50,14 +47,13 @@ func createTestClientForUser(
 	var ctx base.Config
 	ctx.InitDefaults()
 	ctx.User = user
-	ctx.SSLCA = filepath.Join(security.EmbeddedCertsDir, security.EmbeddedCACert)
-	ctx.SSLCert = filepath.Join(security.EmbeddedCertsDir, fmt.Sprintf("%s.crt", user))
-	ctx.SSLCertKey = filepath.Join(security.EmbeddedCertsDir, fmt.Sprintf("%s.key", user))
-	conn, err := rpc.NewContext(log.AmbientContext{}, &ctx, s.Clock(), s.Stopper()).GRPCDial(s.ServingAddr())
+	testutils.FillCerts(&ctx)
+
+	conn, err := rpc.NewContext(log.AmbientContext{Tracer: s.ClusterSettings().Tracer}, &ctx, s.Clock(), s.Stopper()).GRPCDial(s.ServingAddr())
 	if err != nil {
 		t.Fatal(err)
 	}
-	return client.NewDB(client.NewSender(conn))
+	return client.NewDB(client.NewSender(conn), s.Clock())
 }
 
 // TestKVDBCoverage verifies that all methods may be invoked on the
@@ -65,7 +61,7 @@ func createTestClientForUser(
 func TestKVDBCoverage(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
-	defer s.Stopper().Stop()
+	defer s.Stopper().Stop(context.TODO())
 	ctx := context.TODO()
 
 	db := createTestClient(t, s)
@@ -171,12 +167,13 @@ func TestKVDBCoverage(t *testing.T) {
 func TestKVDBInternalMethods(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
-	defer s.Stopper().Stop()
+	defer s.Stopper().Stop(context.TODO())
 
 	testCases := []roachpb.Request{
 		&roachpb.HeartbeatTxnRequest{},
 		&roachpb.GCRequest{},
 		&roachpb.PushTxnRequest{},
+		&roachpb.QueryTxnRequest{},
 		&roachpb.ResolveIntentRequest{},
 		&roachpb.ResolveIntentRangeRequest{},
 		&roachpb.MergeRequest{},
@@ -214,31 +211,31 @@ func TestKVDBInternalMethods(t *testing.T) {
 func TestKVDBTransaction(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
-	defer s.Stopper().Stop()
+	defer s.Stopper().Stop(context.TODO())
 
 	db := createTestClient(t, s)
 
 	key := roachpb.Key("db-txn-test")
 	value := []byte("value")
-	err := db.Txn(context.TODO(), func(txn *client.Txn) error {
+	err := db.Txn(context.TODO(), func(ctx context.Context, txn *client.Txn) error {
 		// Use snapshot isolation so non-transactional read can always push.
 		if err := txn.SetIsolation(enginepb.SNAPSHOT); err != nil {
 			return err
 		}
 
-		if err := txn.Put(key, value); err != nil {
+		if err := txn.Put(ctx, key, value); err != nil {
 			t.Fatal(err)
 		}
 
 		// Attempt to read outside of txn.
-		if gr, err := db.Get(context.TODO(), key); err != nil {
+		if gr, err := db.Get(ctx, key); err != nil {
 			t.Fatal(err)
 		} else if gr.Exists() {
 			t.Errorf("expected nil value; got %+v", gr.Value)
 		}
 
 		// Read within the transaction.
-		if gr, err := txn.Get(key); err != nil {
+		if gr, err := txn.Get(ctx, key); err != nil {
 			t.Fatal(err)
 		} else if !gr.Exists() || !bytes.Equal(gr.ValueBytes(), value) {
 			t.Errorf("expected value %q; got %q", value, gr.ValueBytes())
@@ -261,7 +258,7 @@ func TestKVDBTransaction(t *testing.T) {
 func TestAuthentication(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
-	defer s.Stopper().Stop()
+	defer s.Stopper().Stop(context.TODO())
 
 	b1 := &client.Batch{}
 	b1.Put("a", "b")
@@ -294,7 +291,7 @@ func TestTxnDelRangeIntentResolutionCounts(t *testing.T) {
 		Knobs: base.TestingKnobs{
 			Store: &storage.StoreTestingKnobs{
 				NumKeysEvaluatedForRangeIntentResolution: &intentResolutionCount,
-				TestingCommandFilter: func(filterArgs storagebase.FilterArgs) *roachpb.Error {
+				TestingEvalFilter: func(filterArgs storagebase.FilterArgs) *roachpb.Error {
 					req, ok := filterArgs.Req.(*roachpb.ResolveIntentRequest)
 					if ok {
 						key := req.Header().Key.String()
@@ -310,7 +307,7 @@ func TestTxnDelRangeIntentResolutionCounts(t *testing.T) {
 		},
 	}
 	s, _, db := serverutils.StartServer(t, params)
-	defer s.Stopper().Stop()
+	defer s.Stopper().Stop(context.TODO())
 
 	for _, abortTxn := range []bool{false, true} {
 		spanSize := int64(10)
@@ -326,7 +323,7 @@ func TestTxnDelRangeIntentResolutionCounts(t *testing.T) {
 
 		atomic.StoreInt64(&intentResolutionCount, 0)
 		limit := totalNumKeys / 2
-		if err := db.Txn(context.TODO(), func(txn *client.Txn) error {
+		if err := db.Txn(context.TODO(), func(ctx context.Context, txn *client.Txn) error {
 			var b client.Batch
 			// Fully deleted.
 			b.DelRange("a", "b", false)
@@ -335,7 +332,7 @@ func TestTxnDelRangeIntentResolutionCounts(t *testing.T) {
 			// Not deleted.
 			b.DelRange("c", "d", false)
 			b.Header.MaxSpanRequestKeys = limit
-			if err := txn.Run(&b); err != nil {
+			if err := txn.Run(ctx, &b); err != nil {
 				return err
 			}
 			if abortTxn {
@@ -366,5 +363,33 @@ func TestTxnDelRangeIntentResolutionCounts(t *testing.T) {
 			t.Errorf("abortTxn: %v, %d keys left behind, expected=%d",
 				abortTxn, len(kvs), expectedNumKeys)
 		}
+	}
+}
+
+// Test that, for non-transactional requests, low-level retryable errors get
+// transformed to an UnhandledRetryableError.
+func TestNonTransactionalRetryableError(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	key := []byte("key-restart")
+	value := []byte("value")
+	params := base.TestServerArgs{}
+	testingKnobs := &storage.StoreTestingKnobs{
+		TestingEvalFilter: func(args storagebase.FilterArgs) *roachpb.Error {
+			if resArgs, ok := args.Req.(*roachpb.PutRequest); ok {
+				if resArgs.Key.Equal(key) {
+					return roachpb.NewError(&roachpb.WriteTooOldError{})
+				}
+			}
+			return nil
+		},
+	}
+	params.Knobs.Store = testingKnobs
+	s, _, db := serverutils.StartServer(t, params)
+	defer s.Stopper().Stop(context.TODO())
+
+	err := db.Put(context.TODO(), key, value)
+	if _, ok := err.(*roachpb.UnhandledRetryableError); !ok {
+		t.Fatalf("expected UnhandledRetryableError, got: %T - %v", err, err)
 	}
 }

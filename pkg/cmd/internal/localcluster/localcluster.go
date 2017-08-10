@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Peter Mattis (peter@cockroachlabs.com)
 
 package localcluster
 
@@ -20,15 +18,18 @@ import (
 	"bytes"
 	gosql "database/sql"
 	"fmt"
-	"io"
 	"math/rand"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
-	"syscall"
 	"text/tabwriter"
 	"time"
+
+	"github.com/pkg/errors"
+	// Import postgres driver.
+	_ "github.com/lib/pq"
+	"golang.org/x/net/context"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/config"
@@ -44,22 +45,21 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
-
-	"github.com/pkg/errors"
-	// Import postgres driver.
-	_ "github.com/lib/pq"
-	"golang.org/x/net/context"
+	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 )
 
 const basePort = 26257
 const dataDir = "cockroach-data"
 
-var cockroachBin = func() string {
+// CockroachBin is the path to the cockroach binary.
+var CockroachBin = func() string {
 	bin := "./cockroach"
-	if _, err := os.Stat(bin); err == nil {
-		return bin
+	if _, err := os.Stat(bin); os.IsNotExist(err) {
+		bin = "cockroach"
+	} else if err != nil {
+		panic(err)
 	}
-	return "cockroach"
+	return bin
 }()
 
 // IsUnavailableError returns true iff the error corresponds to a GRPC
@@ -71,41 +71,58 @@ func IsUnavailableError(err error) bool {
 // Cluster holds the state for a local cluster, providing methods for common
 // operations, access to the underlying nodes and per-node KV and SQL clients.
 type Cluster struct {
-	rpcCtx  *rpc.Context
-	Nodes   []*Node
-	Clients []*client.DB
-	Status  []serverpb.StatusClient
-	DB      []*gosql.DB
-	stopper *stop.Stopper
-	started time.Time
+	rpcCtx        *rpc.Context
+	Nodes         []*Node
+	Clients       []*client.DB
+	Status        []serverpb.StatusClient
+	DB            []*gosql.DB
+	separateAddrs bool
+	stopper       *stop.Stopper
+	started       time.Time
 }
 
 // New creates a cluster of size nodes.
-func New(size int) *Cluster {
+// separateAddrs controls whether all the nodes use the same localhost IP
+// address (127.0.0.1) or separate addresses (e.g. 127.1.1.1, 127.1.1.2, etc).
+func New(size int, separateAddrs bool) *Cluster {
 	return &Cluster{
-		Nodes:   make([]*Node, size),
-		Clients: make([]*client.DB, size),
-		Status:  make([]serverpb.StatusClient, size),
-		DB:      make([]*gosql.DB, size),
-		stopper: stop.NewStopper(),
+		Nodes:         make([]*Node, size),
+		Clients:       make([]*client.DB, size),
+		Status:        make([]serverpb.StatusClient, size),
+		DB:            make([]*gosql.DB, size),
+		separateAddrs: separateAddrs,
+		stopper:       stop.NewStopper(),
 	}
 }
 
 // Start starts a cluster. The numWorkers parameter controls the SQL connection
-// settings to avoid unnecessary connection creation. The args parameter can be
-// used to pass extra arguments to each node.
-func (c *Cluster) Start(db string, numWorkers int, args, env []string) {
+// settings to avoid unnecessary connection creation. The allNodeArgs parameter
+// can be used to pass extra arguments to every node. The perNodeArgs parameter
+// can be used to pass extra arguments to an individual node. If not nil, its
+// size must equal the number of nodes.
+func (c *Cluster) Start(
+	db string,
+	numWorkers int,
+	binary string,
+	allNodeArgs []string,
+	perNodeArgs, perNodeEnv map[int][]string,
+) {
 	c.started = timeutil.Now()
 
 	baseCtx := &base.Config{
 		User:     security.NodeUser,
 		Insecure: true,
 	}
-	c.rpcCtx = rpc.NewContext(log.AmbientContext{}, baseCtx,
+	c.rpcCtx = rpc.NewContext(log.AmbientContext{Tracer: tracing.NewTracer()}, baseCtx,
 		hlc.NewClock(hlc.UnixNano, 0), c.stopper)
 
+	if perNodeArgs != nil && len(perNodeArgs) != len(c.Nodes) {
+		panic(fmt.Sprintf("there are %d nodes, but perNodeArgs' length is %d",
+			len(c.Nodes), len(perNodeArgs)))
+	}
+
 	for i := range c.Nodes {
-		c.Nodes[i] = c.makeNode(i, args, env)
+		c.Nodes[i] = c.makeNode(i, binary, append(append([]string(nil), allNodeArgs...), perNodeArgs[i]...), perNodeEnv[i])
 		c.Clients[i] = c.makeClient(i)
 		c.Status[i] = c.makeStatus(i)
 		c.DB[i] = c.makeDB(i, numWorkers, db)
@@ -120,25 +137,33 @@ func (c *Cluster) Close() {
 	for _, n := range c.Nodes {
 		n.Kill()
 	}
-	c.stopper.Stop()
+	c.stopper.Stop(context.Background())
 }
 
-// RPCPort returns the RPC port of the specified node.
-func (c *Cluster) RPCPort(nodeIdx int) int {
-	return basePort + nodeIdx*2
+// IPAddr returns the IP address of the specified node.
+func (c *Cluster) IPAddr(nodeIdx int) string {
+	if c.separateAddrs {
+		return fmt.Sprintf("127.1.1.%d", nodeIdx+1)
+	}
+	return "127.0.0.1"
 }
 
 // RPCAddr returns the RPC address of the specified node.
 func (c *Cluster) RPCAddr(nodeIdx int) string {
-	return fmt.Sprintf("localhost:%d", c.RPCPort(nodeIdx))
+	return fmt.Sprintf("%s:%d", c.IPAddr(nodeIdx), RPCPort(nodeIdx))
+}
+
+// RPCPort returns the RPC port of the specified node.
+func RPCPort(nodeIdx int) int {
+	return basePort + nodeIdx*2
 }
 
 // HTTPPort returns the HTTP port of the specified node.
-func (c *Cluster) HTTPPort(nodeIdx int) int {
-	return c.RPCPort(nodeIdx) + 1
+func HTTPPort(nodeIdx int) int {
+	return RPCPort(nodeIdx) + 1
 }
 
-func (c *Cluster) makeNode(nodeIdx int, extraArgs, extraEnv []string) *Node {
+func (c *Cluster) makeNode(nodeIdx int, binary string, extraArgs, extraEnv []string) *Node {
 	name := fmt.Sprintf("%d", nodeIdx+1)
 	dir := filepath.Join(dataDir, name)
 	logDir := filepath.Join(dir, "logs")
@@ -147,17 +172,18 @@ func (c *Cluster) makeNode(nodeIdx int, extraArgs, extraEnv []string) *Node {
 	}
 
 	args := []string{
-		cockroachBin,
+		binary,
 		"start",
 		"--insecure",
-		fmt.Sprintf("--port=%d", c.RPCPort(nodeIdx)),
-		fmt.Sprintf("--http-port=%d", c.HTTPPort(nodeIdx)),
+		fmt.Sprintf("--host=%s", c.IPAddr(nodeIdx)),
+		fmt.Sprintf("--port=%d", RPCPort(nodeIdx)),
+		fmt.Sprintf("--http-port=%d", HTTPPort(nodeIdx)),
 		fmt.Sprintf("--store=%s", dir),
 		fmt.Sprintf("--cache=256MiB"),
 		fmt.Sprintf("--logtostderr"),
 	}
 	if nodeIdx > 0 {
-		args = append(args, fmt.Sprintf("--join=localhost:%d", c.RPCPort(0)))
+		args = append(args, fmt.Sprintf("--join=%s", c.RPCAddr(0)))
 	}
 	args = append(args, extraArgs...)
 
@@ -175,7 +201,7 @@ func (c *Cluster) makeClient(nodeIdx int) *client.DB {
 	if err != nil {
 		log.Fatalf(context.Background(), "failed to initialize KV client: %s", err)
 	}
-	return client.NewDB(client.NewSender(conn))
+	return client.NewDB(client.NewSender(conn), c.rpcCtx.LocalClock)
 }
 
 func (c *Cluster) makeStatus(nodeIdx int) serverpb.StatusClient {
@@ -187,8 +213,8 @@ func (c *Cluster) makeStatus(nodeIdx int) serverpb.StatusClient {
 }
 
 func (c *Cluster) makeDB(nodeIdx, numWorkers int, dbName string) *gosql.DB {
-	url := fmt.Sprintf("postgresql://root@localhost:%d/%s?sslmode=disable",
-		c.RPCPort(nodeIdx), dbName)
+	url := fmt.Sprintf("postgresql://root@%s/%s?sslmode=disable",
+		c.RPCAddr(nodeIdx), dbName)
 	conn, err := gosql.Open("postgres", url)
 	if err != nil {
 		log.Fatal(context.Background(), err)
@@ -270,7 +296,7 @@ func (c *Cluster) UpdateZoneConfig(rangeMinBytes, rangeMaxBytes int64) {
 
 // Split splits the range containing the split key at the specified split key.
 func (c *Cluster) Split(nodeIdx int, splitKey roachpb.Key) error {
-	return c.Clients[nodeIdx].AdminSplit(context.Background(), splitKey)
+	return c.Clients[nodeIdx].AdminSplit(context.Background(), splitKey, splitKey)
 }
 
 // TransferLease transfers the lease for the range containing key to a random
@@ -310,34 +336,6 @@ func (c *Cluster) lookupRange(nodeIdx int, key roachpb.Key) (*roachpb.RangeDescr
 		return nil, errors.Errorf("%s: lookup range: %s", key, pErr)
 	}
 	return &resp.(*roachpb.RangeLookupResponse).Ranges[0], nil
-}
-
-// Freeze freezes (or thaws) the cluster. The freeze request is sent to the
-// specified node.
-func (c *Cluster) Freeze(nodeIdx int, freeze bool) {
-	addr := c.RPCAddr(nodeIdx)
-	conn, err := c.rpcCtx.GRPCDial(addr)
-	if err != nil {
-		log.Fatalf(context.Background(), "unable to dial: %s: %v", addr, err)
-	}
-
-	adminClient := serverpb.NewAdminClient(conn)
-	stream, err := adminClient.ClusterFreeze(
-		context.Background(), &serverpb.ClusterFreezeRequest{Freeze: freeze})
-	if err != nil {
-		log.Fatal(context.Background(), err)
-	}
-	for {
-		resp, err := stream.Recv()
-		if err != nil {
-			if err == io.EOF {
-				break
-			}
-			log.Fatal(context.Background(), err)
-		}
-		fmt.Println(resp.Message)
-	}
-	fmt.Println("ok")
 }
 
 // RandNode returns the index of a random alive node.
@@ -381,79 +379,54 @@ func (n *Node) Start() {
 	n.cmd.Env = os.Environ()
 	n.cmd.Env = append(n.cmd.Env, n.env...)
 
+	ctx := context.Background()
+
 	stdoutPath := filepath.Join(n.logDir, "stdout")
-	stdout, err := os.OpenFile(stdoutPath,
-		os.O_RDWR|os.O_CREATE|os.O_APPEND, 0666)
+	stdout, err := os.OpenFile(stdoutPath, os.O_RDWR|os.O_CREATE|os.O_APPEND, 0666)
 	if err != nil {
-		log.Fatalf(context.Background(), "unable to open file %s: %s", stdoutPath, err)
+		log.Fatalf(ctx, "unable to open file %s: %s", stdoutPath, err)
 	}
 	n.cmd.Stdout = stdout
 
 	stderrPath := filepath.Join(n.logDir, "stderr")
-	stderr, err := os.OpenFile(stderrPath,
-		os.O_RDWR|os.O_CREATE|os.O_APPEND, 0666)
+	stderr, err := os.OpenFile(stderrPath, os.O_RDWR|os.O_CREATE|os.O_APPEND, 0666)
 	if err != nil {
-		log.Fatalf(context.Background(), "unable to open file %s: %s", stderrPath, err)
+		log.Fatalf(ctx, "unable to open file %s: %s", stderrPath, err)
 	}
 	n.cmd.Stderr = stderr
 
-	err = n.cmd.Start()
-	if n.cmd.Process != nil {
-		log.Infof(context.Background(), "process %d started: %s",
-			n.cmd.Process.Pid, strings.Join(n.args, " "))
-	}
-	if err != nil {
-		log.Infof(context.Background(), "%v", err)
-		_ = stdout.Close()
-		_ = stderr.Close()
+	if err := n.cmd.Start(); err != nil {
+		log.Error(ctx, err)
+		if err := stdout.Close(); err != nil {
+			log.Warning(ctx, err)
+		}
+		if err := stderr.Close(); err != nil {
+			log.Warning(ctx, err)
+		}
 		return
 	}
 
+	pid := n.cmd.Process.Pid
+	log.Infof(ctx, "process %d started: %s", pid, n.cmd.Args)
+
 	go func(cmd *exec.Cmd) {
 		if err := cmd.Wait(); err != nil {
-			log.Errorf(context.Background(), "waiting for command: %v", err)
+			log.Errorf(ctx, "waiting for command: %s", err)
 		}
-		_ = stdout.Close()
-		_ = stderr.Close()
+		if err := stdout.Close(); err != nil {
+			log.Warning(ctx, err)
+		}
+		if err := stderr.Close(); err != nil {
+			log.Warning(ctx, err)
+		}
 
-		ps := cmd.ProcessState
-		sy := ps.Sys().(syscall.WaitStatus)
-
-		log.Infof(context.Background(), "Process %d exited with status %d",
-			ps.Pid(), sy.ExitStatus())
-		log.Infof(context.Background(), ps.String())
+		log.Infof(ctx, "Process %d: %s", pid, cmd.ProcessState)
 
 		n.Lock()
 		n.cmd = nil
 		n.Unlock()
 	}(n.cmd)
 }
-
-// Pause pauses a node by sending it SIGSTOP.
-func (n *Node) Pause() {
-	n.Lock()
-	defer n.Unlock()
-	if n.cmd == nil || n.cmd.Process == nil {
-		return
-	}
-	_ = n.cmd.Process.Signal(syscall.SIGSTOP)
-}
-
-// TODO(peter): Node.Pause is currently unused.
-var _ = (*Node).Pause
-
-// Resume resumes a node by sending it SIGCONT.
-func (n *Node) Resume() {
-	n.Lock()
-	defer n.Unlock()
-	if n.cmd == nil || n.cmd.Process == nil {
-		return
-	}
-	_ = n.cmd.Process.Signal(syscall.SIGCONT)
-}
-
-// TODO(peter): Node.Resume is currently unused.
-var _ = (*Node).Resume
 
 // Kill stops a node abruptly by sending it SIGKILL.
 func (n *Node) Kill() {

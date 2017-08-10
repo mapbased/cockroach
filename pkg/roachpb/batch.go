@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Tobias Schottdorf
 
 package roachpb
 
@@ -33,18 +31,20 @@ import (
 // and it will be set to txn.OrigTimestamp. For non-transactional requests, if
 // no timestamp is specified, nowFn is used to create and set one.
 func (ba *BatchRequest) SetActiveTimestamp(nowFn func() hlc.Timestamp) error {
-	if ba.Txn == nil {
-		// When not transactional, allow empty timestamp and  use nowFn instead.
-		if ba.Timestamp.Equal(hlc.ZeroTimestamp) {
-			ba.Timestamp.Forward(nowFn())
+	if txn := ba.Txn; txn != nil {
+		if ba.Timestamp != (hlc.Timestamp{}) {
+			return errors.New("transactional request must not set batch timestamp")
 		}
-	} else if !ba.Timestamp.Equal(hlc.ZeroTimestamp) {
-		return errors.New("transactional request must not set batch timestamp")
-	} else {
+
 		// Always use the original timestamp for reads and writes, even
 		// though some intents may be written at higher timestamps in the
 		// event of a WriteTooOldError.
-		ba.Timestamp = ba.Txn.OrigTimestamp
+		ba.Timestamp = txn.OrigTimestamp
+	} else {
+		// When not transactional, allow empty timestamp and use nowFn instead
+		if ba.Timestamp == (hlc.Timestamp{}) {
+			ba.Timestamp = nowFn()
+		}
 	}
 	return nil
 }
@@ -63,26 +63,6 @@ func (ba *BatchRequest) UpdateTxn(otherTxn *Transaction) {
 	clonedTxn := ba.Txn.Clone()
 	clonedTxn.Update(otherTxn)
 	ba.Txn = &clonedTxn
-}
-
-// IsConsistencyRelated returns whether the batch consists of a single
-// ComputeChecksum or CheckConsistency request.
-func (ba *BatchRequest) IsConsistencyRelated() bool {
-	if !ba.IsSingleRequest() {
-		return false
-	}
-	_, ok1 := ba.GetArg(ComputeChecksum)
-	_, ok2 := ba.GetArg(CheckConsistency)
-	return ok1 || ok2
-}
-
-// IsFreeze returns whether the batch consists of a single ChangeFrozen request.
-func (ba *BatchRequest) IsFreeze() bool {
-	if !ba.IsSingleRequest() {
-		return false
-	}
-	_, ok := ba.GetArg(ChangeFrozen)
-	return ok
 }
 
 // IsLeaseRequest returns whether the batch consists of a single RequestLease
@@ -133,27 +113,36 @@ func (ba *BatchRequest) IsSingleRequest() bool {
 	return len(ba.Requests) == 1
 }
 
-// IsNonKV returns true iff all of the requests in the batch have the non-KV
-// flag set.
-func (ba *BatchRequest) IsNonKV() bool {
-	for _, union := range ba.Requests {
-		if (union.GetInner().flags() & isNonKV) == 0 {
-			return false
-		}
-	}
-	return true
-}
-
 // IsSingleSkipLeaseCheckRequest returns true iff the batch contains a single
 // request, and that request has the skipLeaseCheck flag set.
 func (ba *BatchRequest) IsSingleSkipLeaseCheckRequest() bool {
 	return ba.IsSingleRequest() && ba.hasFlag(skipLeaseCheck)
 }
 
+// IsSinglePushTxnRequest returns true iff the batch contains a single
+// request, and that request is for a PushTxn.
+func (ba *BatchRequest) IsSinglePushTxnRequest() bool {
+	if ba.IsSingleRequest() {
+		_, ok := ba.Requests[0].GetInner().(*PushTxnRequest)
+		return ok
+	}
+	return false
+}
+
+// IsSingleQueryTxnRequest returns true iff the batch contains a single
+// request, and that request is for a QueryTxn.
+func (ba *BatchRequest) IsSingleQueryTxnRequest() bool {
+	if ba.IsSingleRequest() {
+		_, ok := ba.Requests[0].GetInner().(*QueryTxnRequest)
+		return ok
+	}
+	return false
+}
+
 // GetPrevLeaseForLeaseRequest returns the previous lease, at the time
 // of proposal, for a request lease or transfer lease request. If the
 // batch does not contain a single lease request, this method will panic.
-func (ba *BatchRequest) GetPrevLeaseForLeaseRequest() *Lease {
+func (ba *BatchRequest) GetPrevLeaseForLeaseRequest() Lease {
 	return ba.Requests[0].GetInner().(leaseRequestor).prevLease()
 }
 
@@ -234,14 +223,19 @@ func (ba *BatchRequest) IntentSpanIterate(br *BatchResponse, fn func(key, endKey
 // Combine implements the Combinable interface. It combines each slot of the
 // given request into the corresponding slot of the base response. The number
 // of slots must be equal and the respective slots must be combinable.
-// On error, the receiver BatchResponse is in an invalid state.
-// TODO(tschottdorf): write tests.
-func (br *BatchResponse) Combine(otherBatch *BatchResponse) error {
-	if len(otherBatch.Responses) != len(br.Responses) {
-		return errors.New("unable to combine batch responses of different length")
+// On error, the receiver BatchResponse is in an invalid state. In either case,
+// the supplied BatchResponse must not be used any more.
+func (br *BatchResponse) Combine(otherBatch *BatchResponse, positions []int) error {
+	if err := br.BatchResponse_Header.combine(otherBatch.BatchResponse_Header); err != nil {
+		return err
 	}
-	for i, l := 0, len(br.Responses); i < l; i++ {
-		valLeft := br.Responses[i].GetInner()
+	for i := range otherBatch.Responses {
+		pos := positions[i]
+		if br.Responses[pos] == (ResponseUnion{}) {
+			br.Responses[pos] = otherBatch.Responses[i]
+			continue
+		}
+		valLeft := br.Responses[pos].GetInner()
 		valRight := otherBatch.Responses[i].GetInner()
 		cValLeft, lOK := valLeft.(combinable)
 		cValRight, rOK := valRight.(combinable)
@@ -250,16 +244,11 @@ func (br *BatchResponse) Combine(otherBatch *BatchResponse) error {
 				return err
 			}
 			continue
-		}
-		// If our slot is a NoopResponse, then whatever the other batch has is
-		// the result. Note that the result can still be a NoopResponse, to be
-		// filled in by a future Combine().
-		if _, ok := valLeft.(*NoopResponse); ok {
-			br.Responses[i] = otherBatch.Responses[i]
+		} else if lOK != rOK {
+			return errors.Errorf("can not combine %T and %T", valLeft, valRight)
 		}
 	}
 	br.Txn.Update(otherBatch.Txn)
-	br.CollectedSpans = append(br.CollectedSpans, otherBatch.CollectedSpans...)
 	return nil
 }
 

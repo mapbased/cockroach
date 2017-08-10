@@ -11,9 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Jiang-Ming Yang (jiangming.yang@gmail.com)
-// Author: Spencer Kimball (spencer.kimball@gmail.com)
 
 package enginepb
 
@@ -67,7 +64,10 @@ func (ms *MVCCStats) AgeTo(nowNanos int64) {
 	if ms.LastUpdateNanos >= nowNanos {
 		return
 	}
-	diffSeconds := nowNanos/1E9 - ms.LastUpdateNanos/1E9 // not (...)/1E9!
+	// Seconds are counted every time each individual nanosecond timestamp
+	// crosses a whole second boundary (i.e. is zero mod 1E9). Thus it would
+	// be a mistake to use the (nonequivalent) expression (a-b)/1E9.
+	diffSeconds := nowNanos/1E9 - ms.LastUpdateNanos/1E9
 
 	ms.GCBytesAge += ms.GCBytes() * diffSeconds
 	ms.IntentAge += ms.IntentCount * diffSeconds

@@ -11,13 +11,12 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Marc Berhault (marc@cockroachlabs.com)
 
 package privilege
 
 import (
 	"bytes"
+	"fmt"
 	"sort"
 	"strings"
 )
@@ -77,7 +76,7 @@ func (pl List) Less(i, j int) bool {
 // names returns a list of privilege names in the same
 // order as 'pl'.
 func (pl List) names() []string {
-	ret := make([]string, len(pl), len(pl))
+	ret := make([]string, len(pl))
 	for i, p := range pl {
 		ret[i] = p.String()
 	}
@@ -137,4 +136,33 @@ func ListFromBitField(m uint32) List {
 		}
 	}
 	return ret
+}
+
+// Lists is a list of privilege lists
+type Lists []List
+
+// Contains returns whether the list of privilege lists contains exactly the
+// privilege list represented by bitfield m. This intentionally treats ALL and
+// {CREATE, ..., UPDATE} as distinct privilege lists.
+func (pls Lists) Contains(m uint32) bool {
+	for _, pl := range pls {
+		if pl.ToBitField() == m {
+			return true
+		}
+	}
+	return false
+}
+
+// String stringifies each constituent list of privileges, groups each inside of
+// {} braces, and joins them with " or ".
+//
+// Examples:
+//   {{SELECT}}.String() -> "{SELECT}"
+//   {{SELECT}, {SELECT, GRANT}}.String() -> "{SELECT} or {SELECT, GRANT}"
+func (pls Lists) String() string {
+	ret := make([]string, len(pls))
+	for i, pl := range pls {
+		ret[i] = fmt.Sprintf("{%s}", pl)
+	}
+	return strings.Join(ret, " or ")
 }

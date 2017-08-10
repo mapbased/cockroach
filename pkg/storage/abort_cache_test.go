@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Spencer Kimball (spencer.kimball@gmail.com)
 
 package storage
 
@@ -42,7 +40,7 @@ var (
 	testTxnID        = uuidFromString("0ce61c17-5eb4-4587-8c36-dcf4062ada4c")
 	testTxnID2       = uuidFromString("9855a1ef-8eb9-4c06-a106-cab1dda78a2b")
 	testTxnKey       = []byte("a")
-	testTxnTimestamp = hlc.ZeroTimestamp.Add(123, 456)
+	testTxnTimestamp = hlc.Timestamp{WallTime: 123, Logical: 456}
 	testTxnPriority  = int32(123)
 )
 
@@ -61,7 +59,7 @@ func createTestAbortCache(
 func TestAbortCachePutGetClearData(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	stopper := stop.NewStopper()
-	defer stopper.Stop()
+	defer stopper.Stop(context.Background())
 	sc, e := createTestAbortCache(t, 1, stopper)
 	// Start with a get for an uncached id.
 	entry := roachpb.AbortCacheEntry{}
@@ -102,7 +100,7 @@ func TestAbortCachePutGetClearData(t *testing.T) {
 func TestAbortCacheEmptyParams(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	stopper := stop.NewStopper()
-	defer stopper.Stop()
+	defer stopper.Stop(context.Background())
 	sc, e := createTestAbortCache(t, 1, stopper)
 
 	entry := roachpb.AbortCacheEntry{
@@ -121,7 +119,7 @@ func TestAbortCacheEmptyParams(t *testing.T) {
 func TestAbortCacheCopyInto(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	stopper := stop.NewStopper()
-	defer stopper.Stop()
+	defer stopper.Stop(context.Background())
 	rc1, e := createTestAbortCache(t, 1, stopper)
 	rc2, _ := createTestAbortCache(t, 2, stopper)
 
@@ -155,7 +153,7 @@ func TestAbortCacheCopyInto(t *testing.T) {
 func TestAbortCacheCopyFrom(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	stopper := stop.NewStopper()
-	defer stopper.Stop()
+	defer stopper.Stop(context.Background())
 	rc1, e := createTestAbortCache(t, 1, stopper)
 	rc2, _ := createTestAbortCache(t, 2, stopper)
 

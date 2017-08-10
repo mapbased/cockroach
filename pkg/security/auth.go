@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Marc Berhault (marc@cockroachlabs.com)
 
 package security
 
@@ -42,10 +40,9 @@ func GetCertificateUser(tlsState *tls.ConnectionState) (string, error) {
 	if len(tlsState.PeerCertificates) == 0 {
 		return "", errors.Errorf("no client certificates in request")
 	}
-	if len(tlsState.VerifiedChains) != len(tlsState.PeerCertificates) {
-		// TODO(marc): can this happen? Should we require exactly one?
-		return "", errors.Errorf("client cerficates not verified")
-	}
+	// The go server handshake code verifies the first certificate, using
+	// any following certificates as intermediates. See:
+	// https://github.com/golang/go/blob/go1.8.1/src/crypto/tls/handshake_server.go#L723:L742
 	return tlsState.PeerCertificates[0].Subject.CommonName, nil
 }
 
@@ -136,11 +133,11 @@ func UserAuthPasswordHook(insecureMode bool, password string, hashedPassword []b
 		}
 
 		if requestedUser == RootUser {
-			return errors.Errorf("user %s must authenticate using a client certificate ", RootUser)
+			return errors.Errorf("user %s must use certificate authentication instead of password authentication", RootUser)
 		}
 
 		// If the requested user has an empty password, disallow authentication.
-		if len(password) == 0 || compareHashAndPassword(hashedPassword, password) != nil {
+		if len(password) == 0 || CompareHashAndPassword(hashedPassword, password) != nil {
 			return errors.New("invalid password")
 		}
 

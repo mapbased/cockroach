@@ -11,19 +11,20 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Matt Jibson
 
 package sql
 
 import (
 	"bytes"
 	"fmt"
-	"time"
+	"io"
 	"unsafe"
+
+	"golang.org/x/net/context"
 
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 )
 
 // COPY FROM is not a usual planNode. After a COPY FROM is executed as a
@@ -43,42 +44,22 @@ type copyNode struct {
 	p             *planner
 	table         parser.TableExpr
 	columns       parser.UnresolvedNames
-	resultColumns ResultColumns
+	resultColumns sqlbase.ResultColumns
 	buf           bytes.Buffer
 	rows          []*parser.Tuple
 	rowsMemAcc    WrappableMemoryAccount
 }
 
-func (n *copyNode) Columns() ResultColumns            { return n.resultColumns }
-func (*copyNode) Ordering() orderingInfo              { return orderingInfo{} }
-func (*copyNode) Values() parser.DTuple               { return nil }
-func (*copyNode) ExplainTypes(_ func(string, string)) {}
-func (*copyNode) SetLimitHint(_ int64, _ bool)        {}
-func (*copyNode) setNeededColumns(_ []bool)           {}
-func (*copyNode) MarkDebug(_ explainMode)             {}
-func (*copyNode) expandPlan() error                   { return nil }
-func (*copyNode) Next() (bool, error)                 { return false, nil }
+func (*copyNode) Values() parser.Datums        { return nil }
+func (*copyNode) Next(runParams) (bool, error) { return false, nil }
 
-func (n *copyNode) Close() {
-	n.rowsMemAcc.Wtxn(n.p.session).Close()
-}
-
-func (*copyNode) ExplainPlan(_ bool) (name, description string, children []planNode) {
-	return "copy", "-", nil
-}
-
-func (*copyNode) DebugValues() debugValues {
-	return debugValues{
-		rowIdx: 0,
-		key:    "",
-		value:  parser.DNull.String(),
-		output: debugValueRow,
-	}
+func (n *copyNode) Close(ctx context.Context) {
+	n.rowsMemAcc.Wsession(n.p.session).Close(ctx)
 }
 
 // CopyFrom begins a COPY.
 // Privileges: INSERT on table.
-func (p *planner) CopyFrom(n *parser.CopyFrom, autoCommit bool) (planNode, error) {
+func (p *planner) CopyFrom(ctx context.Context, n *parser.CopyFrom) (planNode, error) {
 	cn := &copyNode{
 		table:   &n.Table,
 		columns: n.Columns,
@@ -88,7 +69,7 @@ func (p *planner) CopyFrom(n *parser.CopyFrom, autoCommit bool) (planNode, error
 	if err != nil {
 		return nil, err
 	}
-	en, err := p.makeEditNode(tn, autoCommit, privilege.INSERT)
+	en, err := p.makeEditNode(ctx, tn, privilege.INSERT)
 	if err != nil {
 		return nil, err
 	}
@@ -96,9 +77,9 @@ func (p *planner) CopyFrom(n *parser.CopyFrom, autoCommit bool) (planNode, error
 	if err != nil {
 		return nil, err
 	}
-	cn.resultColumns = make(ResultColumns, len(cols))
+	cn.resultColumns = make(sqlbase.ResultColumns, len(cols))
 	for i, c := range cols {
-		cn.resultColumns[i] = ResultColumn{Typ: c.Type.ToDatumType()}
+		cn.resultColumns[i] = sqlbase.ResultColumn{Typ: c.Type.ToDatumType()}
 	}
 	cn.p = p
 	cn.rowsMemAcc = p.session.OpenAccount()
@@ -106,13 +87,13 @@ func (p *planner) CopyFrom(n *parser.CopyFrom, autoCommit bool) (planNode, error
 }
 
 // Start implements the planNode interface.
-func (n *copyNode) Start() error {
+func (n *copyNode) Start(runParams) error {
 	// Should never happen because the executor prevents non-COPY messages during
 	// a COPY.
-	if n.p.copyFrom != nil {
+	if n.p.session.copyFrom != nil {
 		return fmt.Errorf("COPY already in progress")
 	}
-	n.p.copyFrom = n
+	n.p.session.copyFrom = n
 	return nil
 }
 
@@ -141,8 +122,10 @@ var (
 // sent in a message, there's no guarantee that data contains a complete row
 // (or even a complete datum). It is thus valid to have no new rows added
 // to the internal state after this call.
-func (p *planner) ProcessCopyData(data string, msg copyMsg) (parser.StatementList, error) {
-	cf := p.copyFrom
+func (s *Session) ProcessCopyData(
+	ctx context.Context, data string, msg copyMsg,
+) (StatementList, error) {
+	cf := s.copyFrom
 	buf := cf.buf
 
 	switch msg {
@@ -152,108 +135,79 @@ func (p *planner) ProcessCopyData(data string, msg copyMsg) (parser.StatementLis
 		var err error
 		// If there's a line in the buffer without \n at EOL, add it here.
 		if buf.Len() > 0 {
-			err = cf.addRow(buf.Bytes())
+			err = cf.addRow(ctx, buf.Bytes())
 		}
-		return parser.StatementList{CopyDataBlock{Done: true}}, err
+		return StatementList{{AST: CopyDataBlock{Done: true}}}, err
 	default:
 		return nil, fmt.Errorf("expected copy command")
 	}
 
 	buf.WriteString(data)
 	for buf.Len() > 0 {
-		b := buf.Bytes()
-		// Don't blindly use buf.ReadBytes because if lineDelim is not present we
-		// must rewrite the bytes to buf. Instead check if lineDelim is present.
-		if bytes.IndexByte(b, lineDelim) == -1 {
-			continue
-		}
 		line, err := buf.ReadBytes(lineDelim)
 		if err != nil {
-			return nil, err
-		}
-		// Remove lineDelim from end.
-		line = line[:len(line)-1]
-		// Remove a single '\r' at EOL, if present.
-		if len(line) > 0 && line[len(line)-1] == '\r' {
+			if err != io.EOF {
+				return nil, err
+			}
+		} else {
+			// Remove lineDelim from end.
 			line = line[:len(line)-1]
+			// Remove a single '\r' at EOL, if present.
+			if len(line) > 0 && line[len(line)-1] == '\r' {
+				line = line[:len(line)-1]
+			}
 		}
-		if err := cf.addRow(line); err != nil {
+		if buf.Len() == 0 && bytes.Equal(line, []byte(`\.`)) {
+			break
+		}
+		if err := cf.addRow(ctx, line); err != nil {
 			return nil, err
 		}
 	}
-	return parser.StatementList{CopyDataBlock{}}, nil
+	return StatementList{{AST: CopyDataBlock{}}}, nil
 }
 
-func (n *copyNode) addRow(line []byte) error {
+func (n *copyNode) addRow(ctx context.Context, line []byte) error {
 	var err error
 	parts := bytes.Split(line, fieldDelim)
 	if len(parts) != len(n.resultColumns) {
 		return fmt.Errorf("expected %d values, got %d", len(n.resultColumns), len(parts))
 	}
 	exprs := make(parser.Exprs, len(parts))
-	acc := n.rowsMemAcc.Wtxn(n.p.session)
+	acc := n.rowsMemAcc.Wsession(n.p.session)
 	for i, part := range parts {
 		s := string(part)
 		if s == nullString {
 			exprs[i] = parser.DNull
 			continue
 		}
-		var d parser.Datum
 		switch t := n.resultColumns[i].Typ; t {
-		case parser.TypeBool:
-			d, err = parser.ParseDBool(s)
-		case parser.TypeBytes:
-			s, err = decodeCopy(s)
-			d = parser.NewDBytes(parser.DBytes(s))
-		case parser.TypeDate:
-			s, err = decodeCopy(s)
-			if err != nil {
-				break
-			}
-			d, err = parser.ParseDDate(s, n.p.session.Location)
-		case parser.TypeDecimal:
-			d, err = parser.ParseDDecimal(s)
-		case parser.TypeFloat:
-			d, err = parser.ParseDFloat(s)
-		case parser.TypeInt:
-			d, err = parser.ParseDInt(s)
-		case parser.TypeInterval:
+		case parser.TypeBytes,
+			parser.TypeDate,
+			parser.TypeInterval,
+			parser.TypeString,
+			parser.TypeTimestamp,
+			parser.TypeTimestampTZ,
+			parser.TypeUUID:
 			s, err = decodeCopy(s)
 			if err != nil {
-				break
+				return err
 			}
-			d, err = parser.ParseDInterval(s)
-		case parser.TypeString:
-			s, err = decodeCopy(s)
-			d = parser.NewDString(s)
-		case parser.TypeTimestamp:
-			s, err = decodeCopy(s)
-			if err != nil {
-				break
-			}
-			d, err = parser.ParseDTimestamp(s, time.Microsecond)
-		case parser.TypeTimestampTZ:
-			s, err = decodeCopy(s)
-			if err != nil {
-				break
-			}
-			d, err = parser.ParseDTimestampTZ(s, n.p.session.Location, time.Microsecond)
-		default:
-			return fmt.Errorf("unknown type %s", t)
 		}
+		d, err := parser.ParseStringAs(n.resultColumns[i].Typ, s, n.p.session.Location)
 		if err != nil {
 			return err
 		}
 
 		sz := d.Size()
-		if err := acc.Grow(int64(sz)); err != nil {
+		if err := acc.Grow(ctx, int64(sz)); err != nil {
 			return err
 		}
 
 		exprs[i] = d
 	}
 	tuple := &parser.Tuple{Exprs: exprs}
-	if err := acc.Grow(int64(unsafe.Sizeof(*tuple))); err != nil {
+	if err := acc.Grow(ctx, int64(unsafe.Sizeof(*tuple))); err != nil {
 		return err
 	}
 
@@ -357,11 +311,11 @@ var decodeMap = map[byte]byte{
 // CopyData is the statement type after a block of COPY data has been
 // received. There may be additional rows ready to insert. If so, return an
 // insertNode, otherwise emptyNode.
-func (p *planner) CopyData(n CopyDataBlock, autoCommit bool) (planNode, error) {
+func (p *planner) CopyData(ctx context.Context, n CopyDataBlock) (planNode, error) {
 	// When this many rows are in the copy buffer, they are inserted.
 	const copyRowSize = 100
 
-	cf := p.copyFrom
+	cf := p.session.copyFrom
 
 	// Only do work if we have lots of rows or this is the end.
 	if ln := len(cf.rows); ln == 0 || (ln < copyRowSize && !n.Done) {
@@ -371,7 +325,7 @@ func (p *planner) CopyData(n CopyDataBlock, autoCommit bool) (planNode, error) {
 	vc := &parser.ValuesClause{Tuples: cf.rows}
 	// Reuse the same backing array once the Insert is complete.
 	cf.rows = cf.rows[:0]
-	cf.rowsMemAcc.Wtxn(p.session).Clear()
+	cf.rowsMemAcc.Wsession(p.session).Clear(ctx)
 
 	in := parser.Insert{
 		Table:   cf.table,
@@ -379,8 +333,9 @@ func (p *planner) CopyData(n CopyDataBlock, autoCommit bool) (planNode, error) {
 		Rows: &parser.Select{
 			Select: vc,
 		},
+		Returning: parser.AbsentReturningClause,
 	}
-	return p.Insert(&in, nil, autoCommit)
+	return p.Insert(ctx, &in, nil)
 }
 
 // Format implements the NodeFormatter interface.

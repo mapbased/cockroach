@@ -12,8 +12,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Radu Berinde (radu@cockroachlabs.com)
 
 package sqlbase
 
@@ -30,5 +28,5 @@ func RunFilter(filter parser.TypedExpr, evalCtx *parser.EvalContext) (bool, erro
 		return false, err
 	}
 
-	return d != parser.DNull && bool(*d.(*parser.DBool)), nil
+	return d == parser.DBoolTrue, nil
 }

@@ -12,12 +12,14 @@
 // implied. See the License for the specific language governing
 // permissions and limitations under the License. See the AUTHORS file
 // for names of contributors.
-//
-// Author: Ben Darnell
 
 package storage
 
 import (
+	"fmt"
+	"sort"
+	"sync"
+
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/internal/client"
 	"github.com/cockroachdb/cockroach/pkg/keys"
@@ -29,7 +31,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
-	"github.com/pkg/errors"
 	"golang.org/x/net/context"
 )
 
@@ -39,6 +40,14 @@ import (
 // This is a last line of defense against issues like #4925.
 // TODO(bdarnell): how to determine best value?
 const intentResolverTaskLimit = 100
+
+// intentResolverBatchSize is the maximum number of intents that will
+// be resolved in a single batch. Batches that span many ranges (which
+// is possible for the commit of a transaction that spans many ranges)
+// will be split into many batches with NoopRequests by the
+// DistSender, leading to high CPU overhead and quadratic memory
+// usage.
+const intentResolverBatchSize = 100
 
 // intentResolver manages the process of pushing transactions and
 // resolving intents.
@@ -67,12 +76,6 @@ func newIntentResolver(store *Store) *intentResolver {
 // transaction(s) responsible for the given WriteIntentError, and to
 // resolve those intents if possible. Returns a new error to be used
 // in place of the original.
-//
-// The returned error may be a copy of the original WriteIntentError,
-// with or without the Resolved flag set, which governs the client's
-// retry behavior (if the transaction is pushed, the Resolved flag is
-// set to tell the client to retry immediately; otherwise it is false
-// to cause the client to back off).
 func (ir *intentResolver) processWriteIntentError(
 	ctx context.Context,
 	wiPErr *roachpb.Error,
@@ -89,50 +92,17 @@ func (ir *intentResolver) processWriteIntentError(
 		log.Infof(ctx, "resolving write intent %s", wiErr)
 	}
 
-	method := args.Method()
-	readOnly := roachpb.IsReadOnly(args) // TODO(tschottdorf): pass as param
-
-	resolveIntents, pushErr := ir.maybePushTransactions(ctx, wiErr.Intents, h, pushType, false)
-
-	if resErr := ir.resolveIntents(ctx, resolveIntents,
-		false /* !wait */, pushType == roachpb.PUSH_ABORT /* poison */); resErr != nil {
-		// When resolving without waiting, errors should not
-		// usually be returned here, although there are some cases
-		// when they may be (especially when a test cluster is in
-		// the process of shutting down).
-		log.Warningf(ctx, "asynchronous resolveIntents failed: %s", resErr)
+	resolveIntents, pErr := ir.maybePushTransactions(ctx, wiErr.Intents, h, pushType, false)
+	if pErr != nil {
+		return pErr
 	}
 
-	if pushErr != nil {
-		if log.V(1) {
-			log.Infof(ctx, "on %s: %s", method, pushErr)
-		}
-
-		if _, isExpected := pushErr.GetDetail().(*roachpb.TransactionPushError); !isExpected {
-			// If an unexpected error occurred, make sure it bubbles up to the
-			// client. Examples are timeouts and logic errors.
-			return pushErr
-		}
-
-		// For write/write conflicts within a transaction, propagate the
-		// push failure, not the original write intent error. The push
-		// failure will instruct the client to restart the transaction
-		// with a backoff.
-		if h.Txn != nil && h.Txn.ID != nil && !readOnly {
-			return pushErr
-		}
-
-		// For read/write conflicts, and non-transactional write/write
-		// conflicts, return the write intent error which engages
-		// backoff/retry (with !Resolved). We don't need to restart the
-		// txn, only resend the read with a backoff.
-		return wiPErr
+	if err := ir.resolveIntents(ctx, resolveIntents,
+		false /* !wait */, pushType == roachpb.PUSH_ABORT /* poison */); err != nil {
+		return roachpb.NewError(err)
 	}
 
-	// We pushed all transactions, so tell the client everything's
-	// resolved and it can retry immediately.
-	wiErr.Resolved = true
-	return wiPErr // references wiErr
+	return nil
 }
 
 // maybePushTransactions tries to push the conflicting transaction(s)
@@ -179,13 +149,12 @@ func (ir *intentResolver) maybePushTransactions(
 		}
 	}
 
-	log.Event(ctx, "pushing transaction")
-
 	// Split intents into those we need to push and those which are good to
 	// resolve.
 	ir.mu.Lock()
 	// TODO(tschottdorf): can optimize this and use same underlying slice.
 	var pushIntents, nonPendingIntents []roachpb.Intent
+	pushTxns := map[uuid.UUID]enginepb.TxnMeta{}
 	for _, intent := range intents {
 		if intent.Status != roachpb.PENDING {
 			// The current intent does not need conflict resolution
@@ -201,25 +170,29 @@ func (ir *intentResolver) maybePushTransactions(
 			}
 			continue
 		} else {
+			pushTxns[*intent.Txn.ID] = intent.Txn
 			pushIntents = append(pushIntents, intent)
 			ir.mu.inFlight[*intent.Txn.ID]++
 		}
 	}
 	ir.mu.Unlock()
 	if len(nonPendingIntents) > 0 {
-		return nil, roachpb.NewError(errors.Errorf("unexpected aborted/resolved intents: %+v",
-			nonPendingIntents))
+		return nil, roachpb.NewErrorf("unexpected aborted/resolved intents: %+v", nonPendingIntents)
+	} else if len(pushIntents) == 0 {
+		return []roachpb.Intent(nil), nil
 	}
+
+	log.Eventf(ctx, "pushing %d transaction(s)", len(pushTxns))
 
 	// Attempt to push the transaction(s) which created the conflicting intent(s).
 	var pushReqs []roachpb.Request
-	for _, intent := range pushIntents {
+	for _, pushTxn := range pushTxns {
 		pushReqs = append(pushReqs, &roachpb.PushTxnRequest{
 			Span: roachpb.Span{
-				Key: intent.Txn.Key,
+				Key: pushTxn.Key,
 			},
 			PusherTxn: *partialPusherTxn,
-			PusheeTxn: intent.Txn,
+			PusheeTxn: pushTxn,
 			PushTo:    h.Timestamp,
 			// The timestamp is used by PushTxn for figuring out whether the
 			// transaction is abandoned. If we used the argument's timestamp
@@ -247,11 +220,23 @@ func (ir *intentResolver) maybePushTransactions(
 	if pErr != nil {
 		return nil, pErr
 	}
+
 	br := b.RawResponse()
+	pushedTxns := map[uuid.UUID]roachpb.Transaction{}
+	for _, resp := range br.Responses {
+		txn := resp.GetInner().(*roachpb.PushTxnResponse).PusheeTxn
+		if _, ok := pushedTxns[*txn.ID]; ok {
+			panic(fmt.Sprintf("have two PushTxn responses for %s", txn.ID))
+		}
+		pushedTxns[*txn.ID] = txn
+	}
 
 	var resolveIntents []roachpb.Intent
-	for i, intent := range pushIntents {
-		pushee := br.Responses[i].GetInner().(*roachpb.PushTxnResponse).PusheeTxn
+	for _, intent := range pushIntents {
+		pushee, ok := pushedTxns[*intent.Txn.ID]
+		if !ok {
+			panic(fmt.Sprintf("no PushTxn response for intent %+v", intent))
+		}
 		intent.Txn = pushee.TxnMeta
 		intent.Status = pushee.Status
 		resolveIntents = append(resolveIntents, intent)
@@ -267,13 +252,17 @@ func (ir *intentResolver) maybePushTransactions(
 // differently and would be better served by different entry points,
 // but combining them simplifies the plumbing necessary in Replica.
 func (ir *intentResolver) processIntentsAsync(r *Replica, intents []intentsWithArg) {
+	if r.store.TestingKnobs().DisableAsyncIntentResolution {
+		return
+	}
 	now := r.store.Clock().Now()
 	ctx := context.TODO()
 	stopper := r.store.Stopper()
 
 	for _, item := range intents {
 		err := stopper.RunLimitedAsyncTask(
-			ctx, ir.sem, false /* wait */, func(ctx context.Context) {
+			ctx, "storage.intentResolver: processing intents", ir.sem, false, /* wait */
+			func(ctx context.Context) {
 				ir.processIntents(ctx, r, item, now)
 			})
 		if err != nil {
@@ -412,7 +401,7 @@ func (ir *intentResolver) resolveIntents(
 		return nil
 	}
 	// We're doing async stuff below; those need new traces.
-	ctx, cleanup := tracing.EnsureContext(ctx, ir.store.Tracer())
+	ctx, cleanup := tracing.EnsureContext(ctx, ir.store.Tracer(), "resolve intents")
 	defer cleanup()
 	log.Eventf(ctx, "resolving intents [wait=%t]", wait)
 
@@ -441,26 +430,69 @@ func (ir *intentResolver) resolveIntents(
 		reqs = append(reqs, resolveArgs)
 	}
 
+	// Sort the intents to maximize batching by range.
+	sort.Slice(reqs, func(i, j int) bool {
+		return reqs[i].Header().Key.Compare(reqs[j].Header().Key) < 0
+	})
+
 	// Resolve all of the intents.
-	if len(reqs) > 0 {
+	var wg sync.WaitGroup
+	var errCh chan error
+	if wait {
+		// If the caller is waiting, use this channel to collect the first
+		// non-nil error (if any) from the async tasks.
+		errCh = make(chan error, 1)
+	}
+	for len(reqs) > 0 {
 		b := &client.Batch{}
-		b.AddRawRequest(reqs...)
+		if len(reqs) > intentResolverBatchSize {
+			b.AddRawRequest(reqs[:intentResolverBatchSize]...)
+			reqs = reqs[intentResolverBatchSize:]
+		} else {
+			b.AddRawRequest(reqs...)
+			reqs = nil
+		}
+		wg.Add(1)
 		action := func() error {
 			// TODO(tschottdorf): no tracing here yet.
 			return ir.store.DB().Run(ctx, b)
 		}
-		if wait || ir.store.Stopper().RunLimitedAsyncTask(
-			ctx, ir.sem, true /* wait */, func(ctx context.Context) {
+		if ir.store.Stopper().RunLimitedAsyncTask(
+			ctx, "storage.intentResolve: resolving intents", ir.sem, true, /* wait */
+			func(ctx context.Context) {
+				defer wg.Done()
+
 				if err := action(); err != nil {
+					// If we have a waiting caller, pass the first non-nil
+					// error out on the channel.
+					select {
+					case errCh <- err:
+						return
+					default:
+					}
+					// No caller waiting or channel full, so just log the error.
 					log.Warningf(ctx, "unable to resolve external intents: %s", err)
 				}
 			}) != nil {
+			wg.Done()
 			// Try async to not keep the caller waiting, but when draining
 			// just go ahead and do it synchronously. See #1684.
 			// TODO(tschottdorf): This is ripe for removal.
 			if err := action(); err != nil {
 				return err
 			}
+		}
+	}
+
+	if wait {
+		// Wait for all resolutions to complete. We don't want to return
+		// as soon as the first one fails because of issue #8360 (see
+		// comment at the top of this method)
+		wg.Wait()
+		select {
+		case err := <-errCh:
+			return err
+		default:
 		}
 	}
 

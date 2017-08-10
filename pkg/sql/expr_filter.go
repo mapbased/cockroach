@@ -12,8 +12,6 @@
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
 //
-// Author: Radu Berinde (radu@cockroachlabs.com)
-//
 // This file implements routines for manipulating filtering expressions.
 
 package sql
@@ -51,7 +49,7 @@ import (
 //          return false, nil
 //       }
 //    }
-type varConvertFunc func(expr parser.VariableExpr) (ok bool, newExpr parser.VariableExpr)
+type varConvertFunc func(expr parser.VariableExpr) (ok bool, newExpr parser.Expr)
 
 type varConvertVisitor struct {
 	// If justCheck is true, the visitor only checks that all VariableExpr in the expression can be
@@ -108,6 +106,9 @@ func exprCheckVars(expr parser.Expr, conv varConvertFunc) bool {
 // Convert the variables in the given expression; the expression must only contain
 // variables known to the conversion function (exprCheckVars should be used first).
 func exprConvertVars(expr parser.TypedExpr, conv varConvertFunc) parser.TypedExpr {
+	if expr == nil {
+		return expr
+	}
 	v := varConvertVisitor{justCheck: false, conv: conv}
 	ret, _ := parser.WalkExpr(&v, expr)
 	return ret.(parser.TypedExpr)

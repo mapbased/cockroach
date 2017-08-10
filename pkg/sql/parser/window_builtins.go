@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Nathan VanBenschoten (nvanbenschoten@gmail.com)
 
 package parser
 
@@ -20,6 +18,7 @@ import (
 	"fmt"
 
 	"github.com/pkg/errors"
+	"golang.org/x/net/context"
 )
 
 func initWindowBuiltins() {
@@ -45,7 +44,7 @@ func initWindowBuiltins() {
 // IndexedRow is a row with a corresponding index.
 type IndexedRow struct {
 	Idx int
-	Row DTuple
+	Row Datums
 }
 
 // WindowFrame is a view into a subset of data over which calculations are made.
@@ -82,11 +81,11 @@ func (wf WindowFrame) firstInPeerGroup() bool {
 	return wf.RowIdx == wf.FirstPeerIdx
 }
 
-func (wf WindowFrame) args() []Datum {
+func (wf WindowFrame) args() Datums {
 	return wf.argsWithRowOffset(0)
 }
 
-func (wf WindowFrame) argsWithRowOffset(offset int) []Datum {
+func (wf WindowFrame) argsWithRowOffset(offset int) Datums {
 	return wf.Rows[wf.RowIdx+offset].Row[wf.ArgIdxStart : wf.ArgIdxStart+wf.ArgCount]
 }
 
@@ -98,7 +97,11 @@ type WindowFunc interface {
 	// because there is an implicit carried dependency between each row and all those
 	// that have come before it (like in an AggregateFunc). As such, this approach does
 	// not present any exploitable associativity/commutativity for optimization.
-	Compute(WindowFrame) (Datum, error)
+	Compute(context.Context, *EvalContext, WindowFrame) (Datum, error)
+
+	// Close allows the window function to free any memory it requested during execution,
+	// such as during the execution of an aggregation like CONCAT_AGG or ARRAY_AGG.
+	Close(context.Context, *EvalContext)
 }
 
 // windows are a special class of builtin functions that can only be applied
@@ -121,65 +124,56 @@ var windows = map[string][]Builtin{
 		makeWindowBuiltin(ArgTypes{}, TypeFloat, newCumulativeDistWindow),
 	},
 	"ntile": {
-		makeWindowBuiltin(ArgTypes{TypeInt}, TypeInt, newNtileWindow),
+		makeWindowBuiltin(ArgTypes{{"n", TypeInt}}, TypeInt, newNtileWindow),
 	},
 	"lag": mergeBuiltinSlices(
-		collectWindowBuiltins(func(t Type) Builtin {
-			return makeWindowBuiltin(ArgTypes{t}, t, makeLeadLagWindowConstructor(false, false, false))
-		}, anyElementTypes...),
-		collectWindowBuiltins(func(t Type) Builtin {
-			return makeWindowBuiltin(ArgTypes{t, TypeInt}, t, makeLeadLagWindowConstructor(false, true, false))
-		}, anyElementTypes...),
-		collectWindowBuiltins(func(t Type) Builtin {
-			return makeWindowBuiltin(ArgTypes{t, TypeInt, t}, t, makeLeadLagWindowConstructor(false, true, true))
-		}, anyElementTypes...),
+		collectBuiltins(func(t Type) Builtin {
+			return makeWindowBuiltin(ArgTypes{{"val", t}}, t, makeLeadLagWindowConstructor(false, false, false))
+		}, TypesAnyNonArray...),
+		collectBuiltins(func(t Type) Builtin {
+			return makeWindowBuiltin(ArgTypes{{"val", t}, {"n", TypeInt}}, t, makeLeadLagWindowConstructor(false, true, false))
+		}, TypesAnyNonArray...),
+		// TODO(nvanbenschoten): We still have no good way to represent two parameters that
+		// can be any types but must be the same (eg. lag(T, Int, T)).
+		collectBuiltins(func(t Type) Builtin {
+			return makeWindowBuiltin(ArgTypes{{"val", t}, {"n", TypeInt}, {"default", t}},
+				t, makeLeadLagWindowConstructor(false, true, true))
+		}, TypesAnyNonArray...),
 	),
 	"lead": mergeBuiltinSlices(
-		collectWindowBuiltins(func(t Type) Builtin {
-			return makeWindowBuiltin(ArgTypes{t}, t, makeLeadLagWindowConstructor(true, false, false))
-		}, anyElementTypes...),
-		collectWindowBuiltins(func(t Type) Builtin {
-			return makeWindowBuiltin(ArgTypes{t, TypeInt}, t, makeLeadLagWindowConstructor(true, true, false))
-		}, anyElementTypes...),
-		collectWindowBuiltins(func(t Type) Builtin {
-			return makeWindowBuiltin(ArgTypes{t, TypeInt, t}, t, makeLeadLagWindowConstructor(true, true, true))
-		}, anyElementTypes...),
+		collectBuiltins(func(t Type) Builtin {
+			return makeWindowBuiltin(ArgTypes{{"val", t}}, t, makeLeadLagWindowConstructor(true, false, false))
+		}, TypesAnyNonArray...),
+		collectBuiltins(func(t Type) Builtin {
+			return makeWindowBuiltin(ArgTypes{{"val", t}, {"n", TypeInt}}, t, makeLeadLagWindowConstructor(true, true, false))
+		}, TypesAnyNonArray...),
+		collectBuiltins(func(t Type) Builtin {
+			return makeWindowBuiltin(ArgTypes{{"val", t}, {"n", TypeInt}, {"default", t}},
+				t, makeLeadLagWindowConstructor(true, true, true))
+		}, TypesAnyNonArray...),
 	),
-	"first_value": collectWindowBuiltins(func(t Type) Builtin {
-		return makeWindowBuiltin(ArgTypes{t}, t, newFirstValueWindow)
-	}, anyElementTypes...),
-	"last_value": collectWindowBuiltins(func(t Type) Builtin {
-		return makeWindowBuiltin(ArgTypes{t}, t, newLastValueWindow)
-	}, anyElementTypes...),
-	"nth_value": collectWindowBuiltins(func(t Type) Builtin {
-		return makeWindowBuiltin(ArgTypes{t, TypeInt}, t, newNthValueWindow)
-	}, anyElementTypes...),
+	"first_value": collectBuiltins(func(t Type) Builtin {
+		return makeWindowBuiltin(ArgTypes{{"val", t}}, t, newFirstValueWindow)
+	}, TypesAnyNonArray...),
+	"last_value": collectBuiltins(func(t Type) Builtin {
+		return makeWindowBuiltin(ArgTypes{{"val", t}}, t, newLastValueWindow)
+	}, TypesAnyNonArray...),
+	"nth_value": collectBuiltins(func(t Type) Builtin {
+		return makeWindowBuiltin(ArgTypes{{"val", t}, {"n", TypeInt}}, t, newNthValueWindow)
+	}, TypesAnyNonArray...),
 }
 
-var anyElementTypes = []Type{
-	TypeBool,
-	TypeInt,
-	TypeFloat,
-	TypeDecimal,
-	TypeString,
-	TypeBytes,
-	TypeDate,
-	TypeTimestamp,
-	TypeInterval,
-	TypeTuple,
-}
-
-func makeWindowBuiltin(in ArgTypes, ret Type, f func() WindowFunc) Builtin {
+func makeWindowBuiltin(in ArgTypes, ret Type, f func([]Type, *EvalContext) WindowFunc) Builtin {
 	return Builtin{
 		impure:     true,
 		class:      WindowClass,
 		Types:      in,
-		ReturnType: ret,
+		ReturnType: fixedReturnType(ret),
 		WindowFunc: f,
 	}
 }
 
-func collectWindowBuiltins(f func(Type) Builtin, types ...Type) []Builtin {
+func collectBuiltins(f func(Type) Builtin, types ...Type) []Builtin {
 	r := make([]Builtin, len(types))
 	for i := range types {
 		r[i] = f(types[i])
@@ -218,7 +212,9 @@ func newAggregateWindow(agg AggregateFunc) WindowFunc {
 	return &aggregateWindowFunc{agg: agg}
 }
 
-func (w *aggregateWindowFunc) Compute(wf WindowFrame) (Datum, error) {
+func (w *aggregateWindowFunc) Compute(
+	ctx context.Context, evalCtx *EvalContext, wf WindowFrame,
+) (Datum, error) {
 	if !wf.firstInPeerGroup() {
 		return w.peerRes, nil
 	}
@@ -226,41 +222,62 @@ func (w *aggregateWindowFunc) Compute(wf WindowFrame) (Datum, error) {
 	// Accumulate all values in the peer group at the same time, as these
 	// must return the same value.
 	for i := 0; i < wf.PeerRowCount; i++ {
-		w.agg.Add(wf.argsWithRowOffset(i)[0])
+		args := wf.argsWithRowOffset(i)
+		var value Datum
+		// COUNT_ROWS takes no arguments.
+		if len(args) > 0 {
+			value = args[0]
+		}
+		if err := w.agg.Add(ctx, value); err != nil {
+			return nil, err
+		}
 	}
 
 	// Retrieve the value for the entire peer group, save it, and return it.
-	w.peerRes = w.agg.Result()
+
+	peerRes, err := w.agg.Result()
+	if err != nil {
+		return nil, err
+	}
+	w.peerRes = peerRes
 	return w.peerRes, nil
+}
+
+func (w *aggregateWindowFunc) Close(ctx context.Context, evalCtx *EvalContext) {
+	w.agg.Close(ctx)
 }
 
 // rowNumberWindow computes the number of the current row within its partition,
 // counting from 1.
 type rowNumberWindow struct{}
 
-func newRowNumberWindow() WindowFunc {
+func newRowNumberWindow([]Type, *EvalContext) WindowFunc {
 	return &rowNumberWindow{}
 }
 
-func (rowNumberWindow) Compute(wf WindowFrame) (Datum, error) {
+func (rowNumberWindow) Compute(_ context.Context, _ *EvalContext, wf WindowFrame) (Datum, error) {
 	return NewDInt(DInt(wf.RowIdx + 1 /* one-indexed */)), nil
 }
+
+func (rowNumberWindow) Close(context.Context, *EvalContext) {}
 
 // rankWindow computes the rank of the current row with gaps.
 type rankWindow struct {
 	peerRes *DInt
 }
 
-func newRankWindow() WindowFunc {
+func newRankWindow([]Type, *EvalContext) WindowFunc {
 	return &rankWindow{}
 }
 
-func (w *rankWindow) Compute(wf WindowFrame) (Datum, error) {
+func (w *rankWindow) Compute(_ context.Context, _ *EvalContext, wf WindowFrame) (Datum, error) {
 	if wf.firstInPeerGroup() {
 		w.peerRes = NewDInt(DInt(wf.rank()))
 	}
 	return w.peerRes, nil
 }
+
+func (w *rankWindow) Close(context.Context, *EvalContext) {}
 
 // denseRankWindow computes the rank of the current row without gaps (it counts peer groups).
 type denseRankWindow struct {
@@ -268,11 +285,13 @@ type denseRankWindow struct {
 	peerRes   *DInt
 }
 
-func newDenseRankWindow() WindowFunc {
+func newDenseRankWindow([]Type, *EvalContext) WindowFunc {
 	return &denseRankWindow{}
 }
 
-func (w *denseRankWindow) Compute(wf WindowFrame) (Datum, error) {
+func (w *denseRankWindow) Compute(
+	_ context.Context, _ *EvalContext, wf WindowFrame,
+) (Datum, error) {
 	if wf.firstInPeerGroup() {
 		w.denseRank++
 		w.peerRes = NewDInt(DInt(w.denseRank))
@@ -280,19 +299,23 @@ func (w *denseRankWindow) Compute(wf WindowFrame) (Datum, error) {
 	return w.peerRes, nil
 }
 
+func (w *denseRankWindow) Close(context.Context, *EvalContext) {}
+
 // percentRankWindow computes the relative rank of the current row using:
 //   (rank - 1) / (total rows - 1)
 type percentRankWindow struct {
 	peerRes *DFloat
 }
 
-func newPercentRankWindow() WindowFunc {
+func newPercentRankWindow([]Type, *EvalContext) WindowFunc {
 	return &percentRankWindow{}
 }
 
 var dfloatZero = NewDFloat(0)
 
-func (w *percentRankWindow) Compute(wf WindowFrame) (Datum, error) {
+func (w *percentRankWindow) Compute(
+	_ context.Context, _ *EvalContext, wf WindowFrame,
+) (Datum, error) {
 	// Return zero if there's only one row, per spec.
 	if wf.rowCount() <= 1 {
 		return dfloatZero, nil
@@ -305,23 +328,29 @@ func (w *percentRankWindow) Compute(wf WindowFrame) (Datum, error) {
 	return w.peerRes, nil
 }
 
+func (w *percentRankWindow) Close(context.Context, *EvalContext) {}
+
 // cumulativeDistWindow computes the relative rank of the current row using:
 //   (number of rows preceding or peer with current row) / (total rows)
 type cumulativeDistWindow struct {
 	peerRes *DFloat
 }
 
-func newCumulativeDistWindow() WindowFunc {
+func newCumulativeDistWindow([]Type, *EvalContext) WindowFunc {
 	return &cumulativeDistWindow{}
 }
 
-func (w *cumulativeDistWindow) Compute(wf WindowFrame) (Datum, error) {
+func (w *cumulativeDistWindow) Compute(
+	_ context.Context, _ *EvalContext, wf WindowFrame,
+) (Datum, error) {
 	if wf.firstInPeerGroup() {
 		// (number of rows preceding or peer with current row) / (total rows)
 		w.peerRes = NewDFloat(DFloat(wf.frameSize()) / DFloat(wf.rowCount()))
 	}
 	return w.peerRes, nil
 }
+
+func (w *cumulativeDistWindow) Close(context.Context, *EvalContext) {}
 
 // ntileWindow computes an integer ranging from 1 to the argument value, dividing
 // the partition as equally as possible.
@@ -332,13 +361,13 @@ type ntileWindow struct {
 	remainder      int   // (total rows) % (bucket num)
 }
 
-func newNtileWindow() WindowFunc {
+func newNtileWindow([]Type, *EvalContext) WindowFunc {
 	return &ntileWindow{}
 }
 
 var errInvalidArgumentForNtile = errors.Errorf("argument of ntile() must be greater than zero")
 
-func (w *ntileWindow) Compute(wf WindowFrame) (Datum, error) {
+func (w *ntileWindow) Compute(_ context.Context, _ *EvalContext, wf WindowFrame) (Datum, error) {
 	if w.ntile == nil {
 		// If this is the first call to ntileWindow.Compute, set up the buckets.
 		total := wf.rowCount()
@@ -349,7 +378,7 @@ func (w *ntileWindow) Compute(wf WindowFrame) (Datum, error) {
 			return DNull, nil
 		}
 
-		nbuckets := int(*arg.(*DInt))
+		nbuckets := int(MustBeDInt(arg))
 		if nbuckets <= 0 {
 			// per spec: If argument is less than or equal to 0, then an error is returned.
 			return nil, errInvalidArgumentForNtile
@@ -382,6 +411,8 @@ func (w *ntileWindow) Compute(wf WindowFrame) (Datum, error) {
 	return w.ntile, nil
 }
 
+func (w *ntileWindow) Close(context.Context, *EvalContext) {}
+
 type leadLagWindow struct {
 	forward     bool
 	withOffset  bool
@@ -396,20 +427,22 @@ func newLeadLagWindow(forward, withOffset, withDefault bool) WindowFunc {
 	}
 }
 
-func makeLeadLagWindowConstructor(forward, withOffset, withDefault bool) func() WindowFunc {
-	return func() WindowFunc {
+func makeLeadLagWindowConstructor(
+	forward, withOffset, withDefault bool,
+) func([]Type, *EvalContext) WindowFunc {
+	return func([]Type, *EvalContext) WindowFunc {
 		return newLeadLagWindow(forward, withOffset, withDefault)
 	}
 }
 
-func (w *leadLagWindow) Compute(wf WindowFrame) (Datum, error) {
+func (w *leadLagWindow) Compute(_ context.Context, _ *EvalContext, wf WindowFrame) (Datum, error) {
 	offset := 1
 	if w.withOffset {
 		offsetArg := wf.args()[1]
 		if offsetArg == DNull {
 			return DNull, nil
 		}
-		offset = int(*offsetArg.(*DInt))
+		offset = int(MustBeDInt(offsetArg))
 	}
 	if !w.forward {
 		offset *= -1
@@ -427,45 +460,51 @@ func (w *leadLagWindow) Compute(wf WindowFrame) (Datum, error) {
 	return wf.argsWithRowOffset(offset)[0], nil
 }
 
+func (w *leadLagWindow) Close(context.Context, *EvalContext) {}
+
 // firstValueWindow returns value evaluated at the row that is the first row of the window frame.
 type firstValueWindow struct{}
 
-func newFirstValueWindow() WindowFunc {
+func newFirstValueWindow([]Type, *EvalContext) WindowFunc {
 	return &firstValueWindow{}
 }
 
-func (firstValueWindow) Compute(wf WindowFrame) (Datum, error) {
+func (firstValueWindow) Compute(_ context.Context, _ *EvalContext, wf WindowFrame) (Datum, error) {
 	return wf.Rows[0].Row[wf.ArgIdxStart], nil
 }
+
+func (firstValueWindow) Close(context.Context, *EvalContext) {}
 
 // lastValueWindow returns value evaluated at the row that is the last row of the window frame.
 type lastValueWindow struct{}
 
-func newLastValueWindow() WindowFunc {
+func newLastValueWindow([]Type, *EvalContext) WindowFunc {
 	return &lastValueWindow{}
 }
 
-func (lastValueWindow) Compute(wf WindowFrame) (Datum, error) {
+func (lastValueWindow) Compute(_ context.Context, _ *EvalContext, wf WindowFrame) (Datum, error) {
 	return wf.Rows[wf.frameSize()-1].Row[wf.ArgIdxStart], nil
 }
+
+func (lastValueWindow) Close(context.Context, *EvalContext) {}
 
 // nthValueWindow returns value evaluated at the row that is the nth row of the window frame
 // (counting from 1). Returns null if no such row.
 type nthValueWindow struct{}
 
-func newNthValueWindow() WindowFunc {
+func newNthValueWindow([]Type, *EvalContext) WindowFunc {
 	return &nthValueWindow{}
 }
 
 var errInvalidArgumentForNthValue = errors.Errorf("argument of nth_value() must be greater than zero")
 
-func (nthValueWindow) Compute(wf WindowFrame) (Datum, error) {
+func (nthValueWindow) Compute(_ context.Context, _ *EvalContext, wf WindowFrame) (Datum, error) {
 	arg := wf.args()[1]
 	if arg == DNull {
 		return DNull, nil
 	}
 
-	nth := int(*arg.(*DInt))
+	nth := int(MustBeDInt(arg))
 	if nth <= 0 {
 		return nil, errInvalidArgumentForNthValue
 	}
@@ -477,6 +516,8 @@ func (nthValueWindow) Compute(wf WindowFrame) (Datum, error) {
 	}
 	return wf.Rows[nth-1].Row[wf.ArgIdxStart], nil
 }
+
+func (nthValueWindow) Close(context.Context, *EvalContext) {}
 
 var _ Visitor = &ContainsWindowVisitor{}
 

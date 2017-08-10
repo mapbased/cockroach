@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Andrei Matei (andreimatei1@gmail.com)
 
 // This file contains tests for pgwire that need to be in the sql package.
 
@@ -25,6 +23,7 @@ import (
 
 	"github.com/lib/pq"
 	"github.com/pkg/errors"
+	"golang.org/x/net/context"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/security"
@@ -40,7 +39,7 @@ import (
 func TestPGWireConnectionCloseReleasesLeases(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	s, _, kvDB := serverutils.StartServer(t, base.TestServerArgs{})
-	defer s.Stopper().Stop()
+	defer s.Stopper().Stop(context.TODO())
 	url, cleanupConn := sqlutils.PGUrl(t, s.ServingAddr(), "SetupServer", url.User(security.RootUser))
 	defer cleanupConn()
 	conn, err := pq.Open(url.String())
@@ -76,7 +75,7 @@ func TestPGWireConnectionCloseReleasesLeases(t *testing.T) {
 		t.Fatal("table state not found")
 	}
 	ts.mu.Lock()
-	leases := ts.active.data
+	leases := ts.mu.active.data
 	ts.mu.Unlock()
 	if len(leases) != 1 {
 		t.Fatalf("expected one lease, found: %d", len(leases))
@@ -84,7 +83,7 @@ func TestPGWireConnectionCloseReleasesLeases(t *testing.T) {
 	// Wait for the lease to be released.
 	testutils.SucceedsSoon(t, func() error {
 		ts.mu.Lock()
-		refcount := ts.active.data[0].refcount
+		refcount := ts.mu.active.data[0].refcount
 		ts.mu.Unlock()
 		if refcount != 0 {
 			return errors.Errorf(

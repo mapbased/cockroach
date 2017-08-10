@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Peter Mattis (peter@cockroachlabs.com)
 
 // This code was derived from https://github.com/youtube/vitess.
 //
@@ -117,4 +115,19 @@ func (node *DropView) Format(buf *bytes.Buffer, f FmtFlags) {
 		buf.WriteByte(' ')
 		buf.WriteString(node.DropBehavior.String())
 	}
+}
+
+// DropUser represents a DROP USER statement
+type DropUser struct {
+	Names    NameList
+	IfExists bool
+}
+
+// Format implements the NodeFormatter interface.
+func (node *DropUser) Format(buf *bytes.Buffer, f FmtFlags) {
+	buf.WriteString("DROP USER ")
+	if node.IfExists {
+		buf.WriteString("IF EXISTS ")
+	}
+	FormatNode(buf, f, node.Names)
 }

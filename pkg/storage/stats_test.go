@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Spencer Kimball (spencer.kimball@gmail.com)
 
 package storage
 
@@ -33,8 +31,8 @@ import (
 // writeInitialState().
 func initialStats() enginepb.MVCCStats {
 	return enginepb.MVCCStats{
-		SysBytes: 237,
-		SysCount: 7,
+		SysBytes: 208,
+		SysCount: 6,
 	}
 }
 func TestRangeStatsEmpty(t *testing.T) {
@@ -43,7 +41,7 @@ func TestRangeStatsEmpty(t *testing.T) {
 		bootstrapMode: bootstrapRangeOnly,
 	}
 	stopper := stop.NewStopper()
-	defer stopper.Stop()
+	defer stopper.Stop(context.TODO())
 	tc.Start(t, stopper)
 
 	ms := tc.repl.GetMVCCStats()
@@ -56,7 +54,7 @@ func TestRangeStatsInit(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	tc := testContext{}
 	stopper := stop.NewStopper()
-	defer stopper.Stop()
+	defer stopper.Stop(context.TODO())
 	tc.Start(t, stopper)
 	ms := enginepb.MVCCStats{
 		LiveBytes:       1,

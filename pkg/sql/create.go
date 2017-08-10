@@ -11,31 +11,31 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Peter Mattis (peter@cockroachlabs.com)
 
 package sql
 
 import (
 	"bytes"
 	"fmt"
-	"reflect"
+	"regexp"
 	"strings"
 
 	"golang.org/x/net/context"
 
 	"github.com/cockroachdb/cockroach/pkg/internal/client"
+	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/util"
+	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/pkg/errors"
 )
 
 type createDatabaseNode struct {
-	p *planner
 	n *parser.CreateDatabase
 }
 
@@ -48,109 +48,78 @@ func (p *planner) CreateDatabase(n *parser.CreateDatabase) (planNode, error) {
 		return nil, errEmptyDatabaseName
 	}
 
-	if n.Template != nil {
-		template, err := n.Template.ResolveAsType(&p.semaCtx, parser.TypeString)
-		if err != nil {
-			return nil, err
-		}
-		templateStr := string(*template.(*parser.DString))
+	if tmpl := n.Template; tmpl != "" {
 		// See https://www.postgresql.org/docs/current/static/manage-ag-templatedbs.html
-		if !strings.EqualFold(templateStr, "template0") {
-			return nil, fmt.Errorf("unsupported template: %s", templateStr)
+		if !strings.EqualFold(tmpl, "template0") {
+			return nil, fmt.Errorf("unsupported template: %s", tmpl)
 		}
 	}
 
-	if n.Encoding != nil {
-		encoding, err := n.Encoding.ResolveAsType(&p.semaCtx, parser.TypeString)
-		if err != nil {
-			return nil, err
-		}
-		encodingStr := string(*encoding.(*parser.DString))
+	if enc := n.Encoding; enc != "" {
 		// We only support UTF8 (and aliases for UTF8).
-		if !(strings.EqualFold(encodingStr, "UTF8") ||
-			strings.EqualFold(encodingStr, "UTF-8") ||
-			strings.EqualFold(encodingStr, "UNICODE")) {
-			return nil, fmt.Errorf("unsupported encoding: %s", encoding)
+		if !(strings.EqualFold(enc, "UTF8") ||
+			strings.EqualFold(enc, "UTF-8") ||
+			strings.EqualFold(enc, "UNICODE")) {
+			return nil, fmt.Errorf("unsupported encoding: %s", enc)
 		}
 	}
 
-	if n.Collate != nil {
-		collate, err := n.Collate.ResolveAsType(&p.semaCtx, parser.TypeString)
-		if err != nil {
-			return nil, err
-		}
-		collateStr := string(*collate.(*parser.DString))
+	if col := n.Collate; col != "" {
 		// We only support C and C.UTF-8.
-		if collateStr != "C" && collateStr != "C.UTF-8" {
-			return nil, fmt.Errorf("unsupported collation: %s", collate)
+		if col != "C" && col != "C.UTF-8" {
+			return nil, fmt.Errorf("unsupported collation: %s", col)
 		}
 	}
 
-	if n.CType != nil {
-		ctype, err := n.CType.ResolveAsType(&p.semaCtx, parser.TypeString)
-		if err != nil {
-			return nil, err
-		}
-		ctypeStr := string(*ctype.(*parser.DString))
+	if ctype := n.CType; ctype != "" {
 		// We only support C and C.UTF-8.
-		if ctypeStr != "C" && ctypeStr != "C.UTF-8" {
+		if ctype != "C" && ctype != "C.UTF-8" {
 			return nil, fmt.Errorf("unsupported character classification: %s", ctype)
 		}
 	}
 
-	if p.session.User != security.RootUser {
-		return nil, fmt.Errorf("only %s is allowed to create databases", security.RootUser)
+	if err := p.RequireSuperUser("CREATE DATABASE"); err != nil {
+		return nil, err
 	}
 
-	return &createDatabaseNode{p: p, n: n}, nil
+	return &createDatabaseNode{n: n}, nil
 }
 
-func (n *createDatabaseNode) expandPlan() error {
-	return nil
-}
-
-func (n *createDatabaseNode) Start() error {
+func (n *createDatabaseNode) Start(params runParams) error {
 	desc := makeDatabaseDesc(n.n)
 
-	created, err := n.p.createDatabase(&desc, n.n.IfNotExists)
+	created, err := params.p.createDatabase(params.ctx, &desc, n.n.IfNotExists)
 	if err != nil {
 		return err
 	}
 	if created {
 		// Log Create Database event. This is an auditable log event and is
 		// recorded in the same transaction as the table descriptor update.
-		if err := MakeEventLogger(n.p.leaseMgr).InsertEventRecord(n.p.txn,
+		if err := MakeEventLogger(params.p.LeaseMgr()).InsertEventRecord(
+			params.ctx,
+			params.p.txn,
 			EventLogCreateDatabase,
 			int32(desc.ID),
-			int32(n.p.evalCtx.NodeID),
+			int32(params.p.evalCtx.NodeID),
 			struct {
 				DatabaseName string
 				Statement    string
 				User         string
-			}{n.n.Name.String(), n.n.String(), n.p.session.User},
+			}{n.n.Name.String(), n.n.String(), params.p.session.User},
 		); err != nil {
 			return err
 		}
+		params.p.session.tables.addUncommittedDatabase(
+			desc.Name, desc.ID, false /* dropped */)
 	}
 	return nil
 }
 
-func (n *createDatabaseNode) Next() (bool, error)                 { return false, nil }
-func (n *createDatabaseNode) Close()                              {}
-func (n *createDatabaseNode) Columns() ResultColumns              { return make(ResultColumns, 0) }
-func (n *createDatabaseNode) Ordering() orderingInfo              { return orderingInfo{} }
-func (n *createDatabaseNode) Values() parser.DTuple               { return parser.DTuple{} }
-func (n *createDatabaseNode) DebugValues() debugValues            { return debugValues{} }
-func (n *createDatabaseNode) ExplainTypes(_ func(string, string)) {}
-func (n *createDatabaseNode) SetLimitHint(_ int64, _ bool)        {}
-func (n *createDatabaseNode) setNeededColumns(_ []bool)           {}
-func (n *createDatabaseNode) MarkDebug(mode explainMode)          {}
-func (n *createDatabaseNode) ExplainPlan(v bool) (string, string, []planNode) {
-	return "create database", "", nil
-}
+func (*createDatabaseNode) Next(runParams) (bool, error) { return false, nil }
+func (*createDatabaseNode) Close(context.Context)        {}
+func (*createDatabaseNode) Values() parser.Datums        { return parser.Datums{} }
 
 type createIndexNode struct {
-	p         *planner
 	n         *parser.CreateIndex
 	tableDesc *sqlbase.TableDescriptor
 }
@@ -159,39 +128,29 @@ type createIndexNode struct {
 // Privileges: CREATE on table.
 //   notes: postgres requires CREATE on the table.
 //          mysql requires INDEX on the table.
-func (p *planner) CreateIndex(n *parser.CreateIndex) (planNode, error) {
+func (p *planner) CreateIndex(ctx context.Context, n *parser.CreateIndex) (planNode, error) {
 	tn, err := n.Table.NormalizeWithDatabaseName(p.session.Database)
 	if err != nil {
 		return nil, err
 	}
 
-	tableDesc, err := p.mustGetTableDesc(tn)
+	tableDesc, err := MustGetTableDesc(ctx, p.txn, p.getVirtualTabler(), tn, true /*allowAdding*/)
 	if err != nil {
 		return nil, err
 	}
 
-	if err := p.checkPrivilege(tableDesc, privilege.CREATE); err != nil {
+	if err := p.CheckPrivilege(tableDesc, privilege.CREATE); err != nil {
 		return nil, err
 	}
 
-	return &createIndexNode{p: p, tableDesc: tableDesc, n: n}, nil
+	return &createIndexNode{tableDesc: tableDesc, n: n}, nil
 }
 
-func (n *createIndexNode) expandPlan() error {
-	return nil
-}
-
-func (n *createIndexNode) Start() error {
-	status, i, err := n.tableDesc.FindIndexByName(n.n.Name)
+func (n *createIndexNode) Start(params runParams) error {
+	_, dropped, err := n.tableDesc.FindIndexByName(string(n.n.Name))
 	if err == nil {
-		if status == sqlbase.DescriptorIncomplete {
-			switch n.tableDesc.Mutations[i].Direction {
-			case sqlbase.DescriptorMutation_DROP:
-				return fmt.Errorf("index %q being dropped, try again later", string(n.n.Name))
-
-			case sqlbase.DescriptorMutation_ADD:
-				// Noop, will fail in AllocateIDs below.
-			}
+		if dropped {
+			return fmt.Errorf("index %q being dropped, try again later", string(n.n.Name))
 		}
 		if n.n.IfNotExists {
 			return nil
@@ -208,9 +167,7 @@ func (n *createIndexNode) Start() error {
 	}
 
 	mutationIdx := len(n.tableDesc.Mutations)
-	n.tableDesc.AddIndexMutation(indexDesc, sqlbase.DescriptorMutation_ADD)
-	mutationID, err := n.tableDesc.FinalizeMutation()
-	if err != nil {
+	if err := n.tableDesc.AddIndexMutation(indexDesc, sqlbase.DescriptorMutation_ADD); err != nil {
 		return err
 	}
 	if err := n.tableDesc.AllocateIDs(); err != nil {
@@ -219,58 +176,51 @@ func (n *createIndexNode) Start() error {
 
 	if n.n.Interleave != nil {
 		index := n.tableDesc.Mutations[mutationIdx].GetIndex()
-		if err := n.p.addInterleave(n.tableDesc, index, n.n.Interleave); err != nil {
+		if err := params.p.addInterleave(params.ctx, n.tableDesc, index, n.n.Interleave); err != nil {
 			return err
 		}
-		if err := n.p.finalizeInterleave(n.tableDesc, *index); err != nil {
+		if err := params.p.finalizeInterleave(params.ctx, n.tableDesc, *index); err != nil {
 			return err
 		}
 	}
 
-	if err := n.p.txn.Put(
-		sqlbase.MakeDescMetadataKey(n.tableDesc.GetID()),
-		sqlbase.WrapDescriptor(n.tableDesc)); err != nil {
+	mutationID, err := params.p.createSchemaChangeJob(params.ctx, n.tableDesc, parser.AsString(n.n))
+	if err != nil {
+		return err
+	}
+	if err := params.p.writeTableDesc(params.ctx, n.tableDesc); err != nil {
 		return err
 	}
 
 	// Record index creation in the event log. This is an auditable log
 	// event and is recorded in the same transaction as the table descriptor
 	// update.
-	if err := MakeEventLogger(n.p.leaseMgr).InsertEventRecord(n.p.txn,
+	if err := MakeEventLogger(params.p.LeaseMgr()).InsertEventRecord(
+		params.ctx,
+		params.p.txn,
 		EventLogCreateIndex,
 		int32(n.tableDesc.ID),
-		int32(n.p.evalCtx.NodeID),
+		int32(params.p.evalCtx.NodeID),
 		struct {
 			TableName  string
 			IndexName  string
 			Statement  string
 			User       string
 			MutationID uint32
-		}{n.tableDesc.Name, n.n.Name.String(), n.n.String(), n.p.session.User, uint32(mutationID)},
+		}{n.tableDesc.Name, n.n.Name.String(), n.n.String(), params.p.session.User, uint32(mutationID)},
 	); err != nil {
 		return err
 	}
-	n.p.notifySchemaChange(n.tableDesc.ID, mutationID)
+	params.p.notifySchemaChange(n.tableDesc, mutationID)
 
 	return nil
 }
 
-func (n *createIndexNode) Next() (bool, error)                 { return false, nil }
-func (n *createIndexNode) Close()                              {}
-func (n *createIndexNode) Columns() ResultColumns              { return make(ResultColumns, 0) }
-func (n *createIndexNode) Ordering() orderingInfo              { return orderingInfo{} }
-func (n *createIndexNode) Values() parser.DTuple               { return parser.DTuple{} }
-func (n *createIndexNode) DebugValues() debugValues            { return debugValues{} }
-func (n *createIndexNode) ExplainTypes(_ func(string, string)) {}
-func (n *createIndexNode) SetLimitHint(_ int64, _ bool)        {}
-func (n *createIndexNode) setNeededColumns(_ []bool)           {}
-func (n *createIndexNode) MarkDebug(mode explainMode)          {}
-func (n *createIndexNode) ExplainPlan(v bool) (string, string, []planNode) {
-	return "create index", "", nil
-}
+func (*createIndexNode) Next(runParams) (bool, error) { return false, nil }
+func (*createIndexNode) Close(context.Context)        {}
+func (*createIndexNode) Values() parser.Datums        { return parser.Datums{} }
 
 type createUserNode struct {
-	p        *planner
 	n        *parser.CreateUser
 	password string
 }
@@ -279,41 +229,54 @@ type createUserNode struct {
 // Privileges: INSERT on system.users.
 //   notes: postgres allows the creation of users with an empty password. We do
 //          as well, but disallow password authentication for these users.
-func (p *planner) CreateUser(n *parser.CreateUser) (planNode, error) {
+func (p *planner) CreateUser(ctx context.Context, n *parser.CreateUser) (planNode, error) {
 	if n.Name == "" {
 		return nil, errors.New("no username specified")
 	}
 
-	tDesc, err := p.getTableDesc(&parser.TableName{DatabaseName: "system", TableName: "users"})
+	tDesc, err := getTableDesc(ctx, p.txn, p.getVirtualTabler(), &parser.TableName{DatabaseName: "system", TableName: "users"})
 	if err != nil {
 		return nil, err
 	}
 
-	if err := p.checkPrivilege(tDesc, privilege.INSERT); err != nil {
+	if err := p.CheckPrivilege(tDesc, privilege.INSERT); err != nil {
 		return nil, err
 	}
 
 	var resolvedPassword string
-	if n.Password != nil {
-		password, err := n.Password.ResolveAsType(&p.semaCtx, parser.TypeString)
-		if err != nil {
-			return nil, err
-		}
-
-		resolvedPassword = string(*password.(*parser.DString))
+	if n.HasPassword() {
+		resolvedPassword = *n.Password
 		if resolvedPassword == "" {
 			return nil, security.ErrEmptyPassword
 		}
 	}
 
-	return &createUserNode{p: p, n: n, password: resolvedPassword}, nil
+	return &createUserNode{n: n, password: resolvedPassword}, nil
 }
 
-func (n *createUserNode) expandPlan() error {
-	return nil
+const usernameHelp = "usernames are case insensitive, must start with a letter " +
+	"or underscore, may contain letters, digits or underscores, and must not exceed 63 characters"
+
+var usernameRE = regexp.MustCompile(`^[\p{Ll}_][\p{Ll}0-9_]{0,62}$`)
+
+var blacklistedUsernames = map[string]struct{}{
+	security.NodeUser: {},
 }
 
-func (n *createUserNode) Start() error {
+// NormalizeAndValidateUsername case folds the specified username and verifies
+// it validates according to the usernameRE regular expression.
+func NormalizeAndValidateUsername(username string) (string, error) {
+	username = parser.Name(username).Normalize()
+	if !usernameRE.MatchString(username) {
+		return "", errors.Errorf("username %q invalid; %s", username, usernameHelp)
+	}
+	if _, ok := blacklistedUsernames[username]; ok {
+		return "", errors.Errorf("username %q reserved", username)
+	}
+	return username, nil
+}
+
+func (n *createUserNode) Start(params runParams) error {
 	var hashedPassword []byte
 	if n.password != "" {
 		var err error
@@ -323,21 +286,24 @@ func (n *createUserNode) Start() error {
 		}
 	}
 
-	normalizedUsername := n.n.Name.Normalize()
+	normalizedUsername, err := NormalizeAndValidateUsername(string(n.n.Name))
+	if err != nil {
+		return err
+	}
 
-	internalExecutor := InternalExecutor{LeaseManager: n.p.leaseMgr}
+	internalExecutor := InternalExecutor{LeaseManager: params.p.LeaseMgr()}
 	rowsAffected, err := internalExecutor.ExecuteStatementInTransaction(
+		params.ctx,
 		"create-user",
-		n.p.txn,
+		params.p.txn,
 		"INSERT INTO system.users VALUES ($1, $2);",
 		normalizedUsername,
 		hashedPassword,
 	)
 	if err != nil {
-		if _, ok := err.(*sqlbase.ErrUniquenessConstraintViolation); ok {
-			err = fmt.Errorf("user %s already exists", normalizedUsername)
+		if sqlbase.IsUniquenessConstraintViolationError(err) {
+			err = errors.Errorf("user %s already exists", normalizedUsername)
 		}
-
 		return err
 	} else if rowsAffected != 1 {
 		return errors.Errorf(
@@ -348,25 +314,20 @@ func (n *createUserNode) Start() error {
 	return nil
 }
 
-func (n *createUserNode) Next() (bool, error)                 { return false, nil }
-func (n *createUserNode) Close()                              {}
-func (n *createUserNode) Columns() ResultColumns              { return make(ResultColumns, 0) }
-func (n *createUserNode) Ordering() orderingInfo              { return orderingInfo{} }
-func (n *createUserNode) Values() parser.DTuple               { return parser.DTuple{} }
-func (n *createUserNode) DebugValues() debugValues            { return debugValues{} }
-func (n *createUserNode) ExplainTypes(_ func(string, string)) {}
-func (n *createUserNode) SetLimitHint(_ int64, _ bool)        {}
-func (n *createUserNode) setNeededColumns(_ []bool)           {}
-func (n *createUserNode) MarkDebug(mode explainMode)          {}
-func (n *createUserNode) ExplainPlan(v bool) (string, string, []planNode) {
-	return "create user", "", nil
-}
+func (*createUserNode) Next(runParams) (bool, error) { return false, nil }
+func (*createUserNode) Close(context.Context)        {}
+func (*createUserNode) Values() parser.Datums        { return parser.Datums{} }
 
+// createViewNode represents a CREATE VIEW statement.
 type createViewNode struct {
-	p          *planner
-	n          *parser.CreateView
-	dbDesc     *sqlbase.DatabaseDescriptor
-	sourcePlan planNode
+	p             *planner
+	n             *parser.CreateView
+	dbDesc        *sqlbase.DatabaseDescriptor
+	sourceColumns sqlbase.ResultColumns
+	// planDeps tracks which tables and views the view being created
+	// depends on. This is collected during the construction of
+	// the view query's logical plan.
+	planDeps planDependencies
 }
 
 // CreateView creates a view.
@@ -374,53 +335,87 @@ type createViewNode struct {
 //   notes: postgres requires CREATE on database plus SELECT on all the
 //						selected columns.
 //          mysql requires CREATE VIEW plus SELECT on all the selected columns.
-func (p *planner) CreateView(n *parser.CreateView) (planNode, error) {
+func (p *planner) CreateView(ctx context.Context, n *parser.CreateView) (planNode, error) {
 	name, err := n.Name.NormalizeWithDatabaseName(p.session.Database)
 	if err != nil {
 		return nil, err
 	}
 
-	dbDesc, err := p.mustGetDatabaseDesc(name.Database())
+	dbDesc, err := MustGetDatabaseDesc(ctx, p.txn, p.getVirtualTabler(), name.Database())
 	if err != nil {
 		return nil, err
 	}
 
-	if err := p.checkPrivilege(dbDesc, privilege.CREATE); err != nil {
+	if err := p.CheckPrivilege(dbDesc, privilege.CREATE); err != nil {
 		return nil, err
 	}
 
-	// To avoid races with ongoing schema changes to tables that the view
-	// depends on, make sure we use the most recent versions of table
-	// descriptors rather than the copies in the lease cache.
-	p.avoidCachedDescriptors = true
-	sourcePlan, err := p.Select(n.AsSource, []parser.Type{}, false)
+	// Ensure that all the table names are properly qualified.  The
+	// traversal will update the NormalizableTableNames in-place, so the
+	// changes are persisted in n.AsSource. We use parser.FormatNode
+	// merely as a traversal method; its output buffer is discarded
+	// immediately after the traversal because it is not needed further.
+	var queryBuf bytes.Buffer
+	var fmtErr error
+	parser.FormatNode(
+		&queryBuf,
+		parser.FmtReformatTableNames(
+			parser.FmtParsable,
+			func(t *parser.NormalizableTableName, buf *bytes.Buffer, f parser.FmtFlags) {
+				tn, err := p.QualifyWithDatabase(ctx, t)
+				if err != nil {
+					log.Warningf(ctx, "failed to qualify table name %q with database name: %v",
+						parser.ErrString(t), err)
+					fmtErr = err
+					return
+				}
+				// Persist the database prefix expansion.
+				tn.DBNameOriginallyOmitted = false
+			},
+		),
+		n.AsSource,
+	)
+	if fmtErr != nil {
+		return nil, fmtErr
+	}
+
+	planDeps, sourceColumns, err := p.analyzeViewQuery(ctx, n.AsSource)
 	if err != nil {
 		return nil, err
 	}
+
 	numColNames := len(n.ColumnNames)
-	numColumns := len(sourcePlan.Columns())
+	numColumns := len(sourceColumns)
 	if numColNames != 0 && numColNames != numColumns {
-		sourcePlan.Close()
 		return nil, sqlbase.NewSyntaxError(fmt.Sprintf(
 			"CREATE VIEW specifies %d column name%s, but data source has %d column%s",
 			numColNames, util.Pluralize(int64(numColNames)),
 			numColumns, util.Pluralize(int64(numColumns))))
 	}
 
-	return &createViewNode{p: p, n: n, dbDesc: dbDesc, sourcePlan: sourcePlan}, nil
+	log.VEventf(ctx, 2, "collected view dependencies:\n%s", planDeps.String())
+
+	return &createViewNode{
+		p:             p,
+		n:             n,
+		dbDesc:        dbDesc,
+		sourceColumns: sourceColumns,
+		planDeps:      planDeps,
+	}, nil
 }
 
-func (n *createViewNode) Start() error {
-	tKey := tableKey{parentID: n.dbDesc.ID, name: n.n.Name.TableName().Table()}
+func (n *createViewNode) Start(params runParams) error {
+	viewName := n.n.Name.TableName().Table()
+	tKey := tableKey{parentID: n.dbDesc.ID, name: viewName}
 	key := tKey.Key()
-	if exists, err := n.p.descExists(key); err == nil && exists {
+	if exists, err := descExists(params.ctx, n.p.txn, key); err == nil && exists {
 		// TODO(a-robinson): Support CREATE OR REPLACE commands.
 		return sqlbase.NewRelationAlreadyExistsError(tKey.Name())
 	} else if err != nil {
 		return err
 	}
 
-	id, err := GenerateUniqueDescID(n.p.txn)
+	id, err := GenerateUniqueDescID(params.ctx, n.p.session.execCfg.DB)
 	if err != nil {
 		return nil
 	}
@@ -428,38 +423,62 @@ func (n *createViewNode) Start() error {
 	// Inherit permissions from the database descriptor.
 	privs := n.dbDesc.GetPrivileges()
 
-	affected := make(map[sqlbase.ID]*sqlbase.TableDescriptor)
-	desc, err := n.makeViewTableDesc(n.n, n.dbDesc.ID, id, n.sourcePlan.Columns(), privs, affected)
+	desc, err := n.makeViewTableDesc(
+		params.ctx,
+		viewName,
+		n.n.ColumnNames,
+		n.dbDesc.ID,
+		id,
+		n.sourceColumns,
+		privs,
+		&n.p.evalCtx,
+	)
 	if err != nil {
 		return err
 	}
 
-	err = desc.ValidateTable()
-	if err != nil {
+	if err = desc.ValidateTable(); err != nil {
 		return err
 	}
 
-	err = n.p.createDescriptorWithID(key, id, &desc)
-	if err != nil {
+	// Collect all the tables/views this view depends on.
+	for backrefID := range n.planDeps {
+		desc.DependsOn = append(desc.DependsOn, backrefID)
+	}
+
+	if err = n.p.createDescriptorWithID(params.ctx, key, id, &desc); err != nil {
 		return err
 	}
 
 	// Persist the back-references in all referenced table descriptors.
-	for _, updated := range affected {
-		if err := n.p.saveNonmutationAndNotify(updated); err != nil {
+	for _, updated := range n.planDeps {
+		backrefDesc := *updated.desc
+		for _, dep := range updated.deps {
+			// The logical plan constructor merely registered the dependencies.
+			// It did not populate the "ID" field of TableDescriptor_Reference,
+			// because the ID of the newly created view descriptor was not
+			// yet known.
+			// We need to do it here.
+			dep.ID = desc.ID
+			backrefDesc.DependedOnBy = append(backrefDesc.DependedOnBy, dep)
+		}
+		if err := n.p.saveNonmutationAndNotify(params.ctx, &backrefDesc); err != nil {
 			return err
 		}
 	}
+
 	if desc.Adding() {
-		n.p.notifySchemaChange(desc.ID, sqlbase.InvalidMutationID)
+		n.p.notifySchemaChange(&desc, sqlbase.InvalidMutationID)
 	}
-	if err := desc.Validate(n.p.txn); err != nil {
+	if err := desc.Validate(params.ctx, n.p.txn); err != nil {
 		return err
 	}
 
 	// Log Create View event. This is an auditable log event and is
 	// recorded in the same transaction as the table descriptor update.
-	if err := MakeEventLogger(n.p.leaseMgr).InsertEventRecord(n.p.txn,
+	if err := MakeEventLogger(n.p.LeaseMgr()).InsertEventRecord(
+		params.ctx,
+		n.p.txn,
 		EventLogCreateView,
 		int32(desc.ID),
 		int32(n.p.evalCtx.NodeID),
@@ -475,47 +494,33 @@ func (n *createViewNode) Start() error {
 	return nil
 }
 
-func (n *createViewNode) Close() {
-	n.sourcePlan.Close()
-	n.sourcePlan = nil
-}
+func (n *createViewNode) Close(ctx context.Context) {}
 
-func (n *createViewNode) expandPlan() error                   { return n.sourcePlan.expandPlan() }
-func (n *createViewNode) Next() (bool, error)                 { return false, nil }
-func (n *createViewNode) Columns() ResultColumns              { return make(ResultColumns, 0) }
-func (n *createViewNode) Ordering() orderingInfo              { return orderingInfo{} }
-func (n *createViewNode) Values() parser.DTuple               { return parser.DTuple{} }
-func (n *createViewNode) DebugValues() debugValues            { return debugValues{} }
-func (n *createViewNode) ExplainTypes(_ func(string, string)) {}
-func (n *createViewNode) setNeededColumns(_ []bool)           {}
-func (n *createViewNode) SetLimitHint(_ int64, _ bool)        {}
-func (n *createViewNode) MarkDebug(mode explainMode)          {}
-func (n *createViewNode) ExplainPlan(v bool) (string, string, []planNode) {
-	return "create view", "", nil
-}
+func (*createViewNode) Next(runParams) (bool, error) { return false, nil }
+func (*createViewNode) Values() parser.Datums        { return parser.Datums{} }
 
 type createTableNode struct {
-	p          *planner
 	n          *parser.CreateTable
 	dbDesc     *sqlbase.DatabaseDescriptor
 	sourcePlan planNode
+	count      int
 }
 
 // CreateTable creates a table.
 // Privileges: CREATE on database.
 //   Notes: postgres/mysql require CREATE on database.
-func (p *planner) CreateTable(n *parser.CreateTable) (planNode, error) {
+func (p *planner) CreateTable(ctx context.Context, n *parser.CreateTable) (planNode, error) {
 	tn, err := n.Table.NormalizeWithDatabaseName(p.session.Database)
 	if err != nil {
 		return nil, err
 	}
 
-	dbDesc, err := p.mustGetDatabaseDesc(tn.Database())
+	dbDesc, err := MustGetDatabaseDesc(ctx, p.txn, p.getVirtualTabler(), tn.Database())
 	if err != nil {
 		return nil, err
 	}
 
-	if err := p.checkPrivilege(dbDesc, privilege.CREATE); err != nil {
+	if err := p.CheckPrivilege(dbDesc, privilege.CREATE); err != nil {
 		return nil, err
 	}
 
@@ -535,14 +540,14 @@ func (p *planner) CreateTable(n *parser.CreateTable) (planNode, error) {
 		// to populate the new table descriptor in Start() below. We
 		// instantiate the sourcePlan as early as here so that EXPLAIN has
 		// something useful to show about CREATE TABLE .. AS ...
-		sourcePlan, err = p.Select(n.AsSource, []parser.Type{}, false)
+		sourcePlan, err = p.Select(ctx, n.AsSource, []parser.Type{})
 		if err != nil {
 			return nil, err
 		}
 		numColNames := len(n.AsColumnNames)
-		numColumns := len(sourcePlan.Columns())
+		numColumns := len(planColumns(sourcePlan))
 		if numColNames != 0 && numColNames != numColumns {
-			sourcePlan.Close()
+			sourcePlan.Close(ctx)
 			return nil, sqlbase.NewSyntaxError(fmt.Sprintf(
 				"CREATE TABLE specifies %d column name%s, but data source has %d column%s",
 				numColNames, util.Pluralize(int64(numColNames)),
@@ -550,7 +555,7 @@ func (p *planner) CreateTable(n *parser.CreateTable) (planNode, error) {
 		}
 	}
 
-	return &createTableNode{p: p, n: n, dbDesc: dbDesc, sourcePlan: sourcePlan}, nil
+	return &createTableNode{n: n, dbDesc: dbDesc, sourcePlan: sourcePlan}, nil
 }
 
 func hoistConstraints(n *parser.CreateTable) {
@@ -582,17 +587,10 @@ func hoistConstraints(n *parser.CreateTable) {
 	}
 }
 
-func (n *createTableNode) expandPlan() error {
-	if n.sourcePlan != nil {
-		return n.sourcePlan.expandPlan()
-	}
-	return nil
-}
-
-func (n *createTableNode) Start() error {
+func (n *createTableNode) Start(params runParams) error {
 	tKey := tableKey{parentID: n.dbDesc.ID, name: n.n.Table.TableName().Table()}
 	key := tKey.Key()
-	if exists, err := n.p.descExists(key); err == nil && exists {
+	if exists, err := descExists(params.ctx, params.p.txn, key); err == nil && exists {
 		if n.n.IfNotExists {
 			return nil
 		}
@@ -601,19 +599,26 @@ func (n *createTableNode) Start() error {
 		return err
 	}
 
-	id, err := GenerateUniqueDescID(n.p.txn)
+	id, err := GenerateUniqueDescID(params.ctx, params.p.session.execCfg.DB)
 	if err != nil {
 		return err
 	}
 
+	// If a new system table is being created (which should only be doable by
+	// an internal user account), make sure it gets the correct privileges.
 	privs := n.dbDesc.GetPrivileges()
+	if n.dbDesc.ID == keys.SystemDatabaseID {
+		privs = sqlbase.NewDefaultPrivilegeDescriptor()
+	}
+
 	var desc sqlbase.TableDescriptor
 	var affected map[sqlbase.ID]*sqlbase.TableDescriptor
+	creationTime := params.p.txn.OrigTimestamp()
 	if n.n.As() {
-		desc, err = makeTableDescIfAs(n.n, n.dbDesc.ID, id, n.sourcePlan.Columns(), privs)
+		desc, err = makeTableDescIfAs(n.n, n.dbDesc.ID, id, creationTime, planColumns(n.sourcePlan), privs, &params.p.evalCtx)
 	} else {
 		affected = make(map[sqlbase.ID]*sqlbase.TableDescriptor)
-		desc, err = n.p.makeTableDesc(n.n, n.dbDesc.ID, id, privs, affected)
+		desc, err = params.p.makeTableDesc(params.ctx, n.n, n.dbDesc.ID, id, creationTime, privs, affected)
 	}
 	if err != nil {
 		return err
@@ -627,42 +632,44 @@ func (n *createTableNode) Start() error {
 		return err
 	}
 
-	if err := n.p.createDescriptorWithID(key, id, &desc); err != nil {
+	if err := params.p.createDescriptorWithID(params.ctx, key, id, &desc); err != nil {
 		return err
 	}
 
 	for _, updated := range affected {
-		if err := n.p.saveNonmutationAndNotify(updated); err != nil {
+		if err := params.p.saveNonmutationAndNotify(params.ctx, updated); err != nil {
 			return err
 		}
 	}
 	if desc.Adding() {
-		n.p.notifySchemaChange(desc.ID, sqlbase.InvalidMutationID)
+		params.p.notifySchemaChange(&desc, sqlbase.InvalidMutationID)
 	}
 
 	for _, index := range desc.AllNonDropIndexes() {
 		if len(index.Interleave.Ancestors) > 0 {
-			if err := n.p.finalizeInterleave(&desc, index); err != nil {
+			if err := params.p.finalizeInterleave(params.ctx, &desc, index); err != nil {
 				return err
 			}
 		}
 	}
 
-	if err := desc.Validate(n.p.txn); err != nil {
+	if err := desc.Validate(params.ctx, params.p.txn); err != nil {
 		return err
 	}
 
 	// Log Create Table event. This is an auditable log event and is
 	// recorded in the same transaction as the table descriptor update.
-	if err := MakeEventLogger(n.p.leaseMgr).InsertEventRecord(n.p.txn,
+	if err := MakeEventLogger(params.p.LeaseMgr()).InsertEventRecord(
+		params.ctx,
+		params.p.txn,
 		EventLogCreateTable,
 		int32(desc.ID),
-		int32(n.p.evalCtx.NodeID),
+		int32(params.p.evalCtx.NodeID),
 		struct {
 			TableName string
 			Statement string
 			User      string
-		}{n.n.Table.String(), n.n.String(), n.p.session.User},
+		}{n.n.Table.String(), n.n.String(), params.p.session.User},
 	); err != nil {
 		return err
 	}
@@ -671,59 +678,53 @@ func (n *createTableNode) Start() error {
 		// TODO(knz): Ideally we would want to plug the sourcePlan which
 		// was already computed as a data source into the insertNode. Now
 		// unfortunately this is not so easy: when this point is reached,
-		// sourcePlan.expandPlan() has already been called (for EXPLAIN),
-		// and insertPlan.expandPlan() below would cause a 2nd invocation
-		// and cause a panic. So instead we close this sourcePlan and let
-		// the insertNode create it anew from the AsSource syntax node.
-		n.sourcePlan.Close()
+		// expandPlan() has already been called on sourcePlan (for
+		// EXPLAIN), and expandPlan() on insertPlan (via optimizePlan)
+		// below would cause a 2nd invocation and cause a panic. So
+		// instead we close this sourcePlan and let the insertNode create
+		// it anew from the AsSource syntax node.
+		n.sourcePlan.Close(params.ctx)
 		n.sourcePlan = nil
 
-		insert := &parser.Insert{Table: &n.n.Table, Rows: n.n.AsSource}
-		insertPlan, err := n.p.Insert(insert, nil, false)
+		insert := &parser.Insert{
+			Table:     &n.n.Table,
+			Rows:      n.n.AsSource,
+			Returning: parser.AbsentReturningClause,
+		}
+		insertPlan, err := params.p.Insert(params.ctx, insert, nil /* desiredTypes */)
 		if err != nil {
 			return err
 		}
-		defer insertPlan.Close()
-		if err := insertPlan.expandPlan(); err != nil {
+		defer insertPlan.Close(params.ctx)
+		insertPlan, err = params.p.optimizePlan(params.ctx, insertPlan, allColumns(insertPlan))
+		if err != nil {
 			return err
 		}
-		if err = insertPlan.Start(); err != nil {
+		if err = params.p.startPlan(params.ctx, insertPlan); err != nil {
 			return err
 		}
-		// This loop is done here instead of in the Next method
-		// since CREATE TABLE is a DDL statement and Executor only
+		// This driver function call is done here instead of in the Next
+		// method since CREATE TABLE is a DDL statement and Executor only
 		// runs Next() for statements with type "Rows".
-		for done := true; done; done, err = insertPlan.Next() {
-			if err != nil {
-				return err
-			}
+		count, err := countRowsAffected(params, insertPlan)
+		if err != nil {
+			return err
 		}
+		// Passing the affected rows num back
+		n.count = count
 	}
 	return nil
 }
 
-func (n *createTableNode) Close() {
+func (n *createTableNode) Close(ctx context.Context) {
 	if n.sourcePlan != nil {
-		n.sourcePlan.Close()
+		n.sourcePlan.Close(ctx)
 		n.sourcePlan = nil
 	}
 }
 
-func (n *createTableNode) Next() (bool, error)                 { return false, nil }
-func (n *createTableNode) Columns() ResultColumns              { return make(ResultColumns, 0) }
-func (n *createTableNode) Ordering() orderingInfo              { return orderingInfo{} }
-func (n *createTableNode) Values() parser.DTuple               { return parser.DTuple{} }
-func (n *createTableNode) DebugValues() debugValues            { return debugValues{} }
-func (n *createTableNode) ExplainTypes(_ func(string, string)) {}
-func (n *createTableNode) SetLimitHint(_ int64, _ bool)        {}
-func (n *createTableNode) setNeededColumns(_ []bool)           {}
-func (n *createTableNode) MarkDebug(mode explainMode)          {}
-func (n *createTableNode) ExplainPlan(v bool) (string, string, []planNode) {
-	if n.n.As() {
-		return "create table", "create table as", []planNode{n.sourcePlan}
-	}
-	return "create table", "", nil
-}
+func (*createTableNode) Next(runParams) (bool, error) { return false, nil }
+func (*createTableNode) Values() parser.Datums        { return parser.Datums{} }
 
 type indexMatch bool
 
@@ -751,12 +752,13 @@ func matchesIndex(
 }
 
 func (p *planner) resolveFK(
+	ctx context.Context,
 	tbl *sqlbase.TableDescriptor,
 	d *parser.ForeignKeyConstraintTableDef,
 	backrefs map[sqlbase.ID]*sqlbase.TableDescriptor,
 	mode sqlbase.ConstraintValidity,
 ) error {
-	return resolveFK(p.txn, &p.session.virtualSchemas, tbl, d, backrefs, mode)
+	return resolveFK(ctx, p.txn, &p.session.virtualSchemas, tbl, d, backrefs, mode)
 }
 
 // resolveFK looks up the tables and columns mentioned in a `REFERENCES`
@@ -768,6 +770,7 @@ func (p *planner) resolveFK(
 // data imples no existing violations, and thus the constraint can be created
 // without the unvalidated flag.
 func resolveFK(
+	ctx context.Context,
 	txn *client.Txn,
 	vt VirtualTabler,
 	tbl *sqlbase.TableDescriptor,
@@ -776,7 +779,7 @@ func resolveFK(
 	mode sqlbase.ConstraintValidity,
 ) error {
 	targetTable := d.Table.TableName()
-	target, err := getTableDesc(txn, vt, targetTable)
+	target, err := getTableDesc(ctx, txn, vt, targetTable)
 	if err != nil {
 		return err
 	}
@@ -800,12 +803,18 @@ func resolveFK(
 			}
 		}
 
-		// If we resolve the same table more than once, we only want to edit a
-		// single instance of it, so replace target with previously resolved table.
-		if prev, ok := backrefs[target.ID]; ok {
-			target = prev
+		// When adding a self-ref FK to an _existing_ table, we want to make sure
+		// we edit the same copy.
+		if target.ID == tbl.ID {
+			target = tbl
 		} else {
-			backrefs[target.ID] = target
+			// If we resolve the same table more than once, we only want to edit a
+			// single instance of it, so replace target with previously resolved table.
+			if prev, ok := backrefs[target.ID]; ok {
+				target = prev
+			} else {
+				backrefs[target.ID] = target
+			}
 		}
 	}
 
@@ -834,15 +843,15 @@ func resolveFK(
 	}
 
 	for i := range srcCols {
-		if s, t := srcCols[i], targetCols[i]; s.Type.Kind != t.Type.Kind {
+		if s, t := srcCols[i], targetCols[i]; s.Type.SemanticType != t.Type.SemanticType {
 			return fmt.Errorf("type of %q (%s) does not match foreign key %q.%q (%s)",
-				s.Name, s.Type.Kind, target.Name, t.Name, t.Type.Kind)
+				s.Name, s.Type.SemanticType, target.Name, t.Name, t.Type.SemanticType)
 		}
 	}
 
 	constraintName := string(d.Name)
 	if constraintName == "" {
-		constraintName = fmt.Sprintf("fk_%s_ref_%s", d.FromCols[0], target.Name)
+		constraintName = fmt.Sprintf("fk_%s_ref_%s", string(d.FromCols[0]), target.Name)
 	}
 
 	var targetIdx *sqlbase.IndexDescriptor
@@ -859,11 +868,20 @@ func resolveFK(
 			}
 		}
 		if !found {
-			return fmt.Errorf("foreign key requires table %q have a unique index on %s", targetTable.String(), colNames(targetCols))
+			return pgerror.NewErrorf(
+				pgerror.CodeInvalidForeignKeyError,
+				"there is no unique constraint matching given keys for referenced table %s",
+				targetTable.String(),
+			)
 		}
 	}
 
-	ref := sqlbase.ForeignKeyReference{Table: target.ID, Index: targetIdx.ID, Name: constraintName}
+	ref := sqlbase.ForeignKeyReference{
+		Table:           target.ID,
+		Index:           targetIdx.ID,
+		Name:            constraintName,
+		SharedPrefixLen: int32(len(srcCols)),
+	}
 	if mode == sqlbase.ConstraintValidity_Unvalidated {
 		ref.Validity = sqlbase.ConstraintValidity_Unvalidated
 	}
@@ -871,7 +889,8 @@ func resolveFK(
 
 	if matchesIndex(srcCols, tbl.PrimaryIndex, matchPrefix) {
 		if tbl.PrimaryIndex.ForeignKey.IsSet() {
-			return fmt.Errorf("columns cannot be used by multiple foreign key constraints")
+			return pgerror.NewErrorf(pgerror.CodeInvalidForeignKeyError,
+				"columns cannot be used by multiple foreign key constraints")
 		}
 		tbl.PrimaryIndex.ForeignKey = ref
 		backref.Index = tbl.PrimaryIndex.ID
@@ -880,7 +899,8 @@ func resolveFK(
 		for i := range tbl.Indexes {
 			if matchesIndex(srcCols, tbl.Indexes[i], matchPrefix) {
 				if tbl.Indexes[i].ForeignKey.IsSet() {
-					return fmt.Errorf("columns cannot be used by multiple foreign key constraints")
+					return pgerror.NewErrorf(pgerror.CodeInvalidForeignKeyError,
+						"columns cannot be used by multiple foreign key constraints")
 				}
 				tbl.Indexes[i].ForeignKey = ref
 				backref.Index = tbl.Indexes[i].ID
@@ -889,6 +909,11 @@ func resolveFK(
 			}
 		}
 		if !found {
+			// Avoid unexpected index builds from ALTER TABLE ADD CONSTRAINT.
+			if mode == sqlbase.ConstraintValidity_Unvalidated {
+				return pgerror.NewErrorf(pgerror.CodeInvalidForeignKeyError,
+					"foreign key requires an existing index on columns %s", colNames(srcCols))
+			}
 			added, err := addIndexForFK(tbl, srcCols, constraintName, ref)
 			if err != nil {
 				return err
@@ -952,29 +977,33 @@ func colNames(cols []sqlbase.ColumnDescriptor) string {
 	return s.String()
 }
 
-func (p *planner) saveNonmutationAndNotify(td *sqlbase.TableDescriptor) error {
+func (p *planner) saveNonmutationAndNotify(ctx context.Context, td *sqlbase.TableDescriptor) error {
 	if err := td.SetUpVersion(); err != nil {
 		return err
 	}
 	if err := td.ValidateTable(); err != nil {
 		return err
 	}
-	if err := p.writeTableDesc(td); err != nil {
+	if err := p.writeTableDesc(ctx, td); err != nil {
 		return err
 	}
-	p.notifySchemaChange(td.ID, sqlbase.InvalidMutationID)
+	p.notifySchemaChange(td, sqlbase.InvalidMutationID)
 	return nil
 }
 
 func (p *planner) addInterleave(
-	desc *sqlbase.TableDescriptor, index *sqlbase.IndexDescriptor, interleave *parser.InterleaveDef,
+	ctx context.Context,
+	desc *sqlbase.TableDescriptor,
+	index *sqlbase.IndexDescriptor,
+	interleave *parser.InterleaveDef,
 ) error {
-	return addInterleave(p.txn, &p.session.virtualSchemas, desc, index, interleave, p.session.Database)
+	return addInterleave(ctx, p.txn, &p.session.virtualSchemas, desc, index, interleave, p.session.Database)
 }
 
 // addInterleave marks an index as one that is interleaved in some parent data
 // according to the given definition.
 func addInterleave(
+	ctx context.Context,
 	txn *client.Txn,
 	vt VirtualTabler,
 	desc *sqlbase.TableDescriptor,
@@ -983,7 +1012,7 @@ func addInterleave(
 	sessionDB string,
 ) error {
 	if interleave.DropBehavior != parser.DropDefault {
-		return util.UnimplementedWithIssueErrorf(
+		return pgerror.UnimplementedWithIssueErrorf(
 			7854, "unsupported shorthand %s", interleave.DropBehavior)
 	}
 
@@ -992,7 +1021,7 @@ func addInterleave(
 		return err
 	}
 
-	parentTable, err := mustGetTableDesc(txn, vt, tn)
+	parentTable, err := MustGetTableDesc(ctx, txn, vt, tn, true /*allowAdding*/)
 	if err != nil {
 		return err
 	}
@@ -1013,12 +1042,10 @@ func addInterleave(
 		if err != nil {
 			return err
 		}
-		if interleave.Fields[i].Normalize() != parser.ReNormalizeName(col.Name) {
+		if string(interleave.Fields[i]) != col.Name {
 			return fmt.Errorf("declared columns must match index being interleaved")
 		}
-		if !reflect.DeepEqual(col.Type, targetCol.Type) ||
-			index.ColumnDirections[i] != parentIndex.ColumnDirections[i] {
-
+		if !col.Type.Equal(targetCol.Type) || index.ColumnDirections[i] != parentIndex.ColumnDirections[i] {
 			return fmt.Errorf("interleaved columns must match parent")
 		}
 	}
@@ -1042,7 +1069,7 @@ func addInterleave(
 // finalizeInterleave creats backreferences from an interleaving parent to the
 // child data being interleaved.
 func (p *planner) finalizeInterleave(
-	desc *sqlbase.TableDescriptor, index sqlbase.IndexDescriptor,
+	ctx context.Context, desc *sqlbase.TableDescriptor, index sqlbase.IndexDescriptor,
 ) error {
 	// TODO(dan): This is similar to finalizeFKs. Consolidate them
 	if len(index.Interleave.Ancestors) == 0 {
@@ -1055,7 +1082,7 @@ func (p *planner) finalizeInterleave(
 		ancestorTable = desc
 	} else {
 		var err error
-		ancestorTable, err = sqlbase.GetTableDescFromID(p.txn, ancestor.TableID)
+		ancestorTable, err = sqlbase.GetTableDescFromID(ctx, p.txn, ancestor.TableID)
 		if err != nil {
 			return err
 		}
@@ -1067,19 +1094,36 @@ func (p *planner) finalizeInterleave(
 	ancestorIndex.InterleavedBy = append(ancestorIndex.InterleavedBy,
 		sqlbase.ForeignKeyReference{Table: desc.ID, Index: index.ID})
 
-	if err := p.saveNonmutationAndNotify(ancestorTable); err != nil {
+	if err := p.saveNonmutationAndNotify(ctx, ancestorTable); err != nil {
 		return err
 	}
 
 	if desc.State == sqlbase.TableDescriptor_ADD {
 		desc.State = sqlbase.TableDescriptor_PUBLIC
 
-		if err := p.saveNonmutationAndNotify(desc); err != nil {
+		if err := p.saveNonmutationAndNotify(ctx, desc); err != nil {
 			return err
 		}
 	}
 
 	return nil
+}
+
+func initTableDescriptor(
+	id, parentID sqlbase.ID,
+	name string,
+	creationTime hlc.Timestamp,
+	privileges *sqlbase.PrivilegeDescriptor,
+) sqlbase.TableDescriptor {
+	return sqlbase.TableDescriptor{
+		ID:               id,
+		Name:             name,
+		ParentID:         parentID,
+		FormatVersion:    sqlbase.InterleavedFormatVersion,
+		Version:          1,
+		ModificationTime: creationTime,
+		Privileges:       privileges,
+	}
 }
 
 // makeViewTableDesc returns the table descriptor for a new view.
@@ -1090,62 +1134,33 @@ func (p *planner) finalizeInterleave(
 // doesn't matter if reads/writes use a cached descriptor that doesn't
 // include the back-references.
 func (n *createViewNode) makeViewTableDesc(
-	p *parser.CreateView,
+	ctx context.Context,
+	viewName string,
+	columnNames parser.NameList,
 	parentID sqlbase.ID,
 	id sqlbase.ID,
-	resultColumns []ResultColumn,
+	resultColumns []sqlbase.ResultColumn,
 	privileges *sqlbase.PrivilegeDescriptor,
-	affected map[sqlbase.ID]*sqlbase.TableDescriptor,
+	evalCtx *parser.EvalContext,
 ) (sqlbase.TableDescriptor, error) {
-	desc := sqlbase.TableDescriptor{
-		ID:            id,
-		ParentID:      parentID,
-		FormatVersion: sqlbase.FamilyFormatVersion,
-		Version:       1,
-		Privileges:    privileges,
-	}
-	viewName, err := p.Name.Normalize()
-	if err != nil {
-		return desc, err
-	}
-	desc.Name = viewName.Table()
+	desc := initTableDescriptor(id, parentID, viewName, n.p.txn.OrigTimestamp(), privileges)
+	desc.ViewQuery = parser.AsStringWithFlags(n.n.AsSource, parser.FmtParsable)
 	for i, colRes := range resultColumns {
-		colType, _ := parser.DatumTypeToColumnType(colRes.Typ)
+		colType, err := parser.DatumTypeToColumnType(colRes.Typ)
+		if err != nil {
+			return desc, err
+		}
 		columnTableDef := parser.ColumnTableDef{Name: parser.Name(colRes.Name), Type: colType}
-		if len(p.ColumnNames) > i {
-			columnTableDef.Name = p.ColumnNames[i]
+		if len(columnNames) > i {
+			columnTableDef.Name = columnNames[i]
 		}
 		// We pass an empty search path here because there are no names to resolve.
-		col, _, err := sqlbase.MakeColumnDefDescs(&columnTableDef, nil)
+		col, _, err := sqlbase.MakeColumnDefDescs(&columnTableDef, nil, evalCtx)
 		if err != nil {
 			return desc, err
 		}
 		desc.AddColumn(*col)
 	}
-
-	// TODO(a-robinson): Support star expressions as soon as we can (#10028).
-	if planContainsStar(n.sourcePlan) {
-		return desc, fmt.Errorf("views do not currently support * expressions")
-	}
-
-	n.resolveViewDependencies(&desc, affected)
-
-	var buf bytes.Buffer
-	var fmtErr error
-	p.AsSource.Format(&buf, parser.FmtNormalizeTableNames(
-		func(t *parser.NormalizableTableName) *parser.TableName {
-			tn, err := n.p.QualifyWithDatabase(t)
-			if err != nil {
-				log.Warningf(n.p.ctx(), "failed to qualify table name %q with database name: %v", t, err)
-				fmtErr = err
-				return nil
-			}
-			return tn
-		}))
-	if fmtErr != nil {
-		return desc, fmtErr
-	}
-	desc.ViewQuery = buf.String()
 
 	return desc, desc.AllocateIDs()
 }
@@ -1155,29 +1170,28 @@ func (n *createViewNode) makeViewTableDesc(
 func makeTableDescIfAs(
 	p *parser.CreateTable,
 	parentID, id sqlbase.ID,
-	resultColumns []ResultColumn,
+	creationTime hlc.Timestamp,
+	resultColumns []sqlbase.ResultColumn,
 	privileges *sqlbase.PrivilegeDescriptor,
-) (sqlbase.TableDescriptor, error) {
-	desc := sqlbase.TableDescriptor{
-		ID:            id,
-		ParentID:      parentID,
-		FormatVersion: sqlbase.InterleavedFormatVersion,
-		Version:       1,
-		Privileges:    privileges,
-	}
+	evalCtx *parser.EvalContext,
+) (desc sqlbase.TableDescriptor, err error) {
 	tableName, err := p.Table.Normalize()
 	if err != nil {
 		return desc, err
 	}
-	desc.Name = tableName.Table()
+	desc = initTableDescriptor(id, parentID, tableName.Table(), creationTime, privileges)
 	for i, colRes := range resultColumns {
-		colType, _ := parser.DatumTypeToColumnType(colRes.Typ)
+		colType, err := parser.DatumTypeToColumnType(colRes.Typ)
+		if err != nil {
+			return desc, err
+		}
 		columnTableDef := parser.ColumnTableDef{Name: parser.Name(colRes.Name), Type: colType}
+		columnTableDef.Nullable.Nullability = parser.SilentNull
 		if len(p.AsColumnNames) > i {
 			columnTableDef.Name = p.AsColumnNames[i]
 		}
 		// We pass an empty search path here because we do not have any expressions to resolve.
-		col, _, err := sqlbase.MakeColumnDefDescs(&columnTableDef, nil)
+		col, _, err := sqlbase.MakeColumnDefDescs(&columnTableDef, nil, evalCtx)
 		if err != nil {
 			return desc, err
 		}
@@ -1189,40 +1203,39 @@ func makeTableDescIfAs(
 
 // MakeTableDesc creates a table descriptor from a CreateTable statement.
 func MakeTableDesc(
+	ctx context.Context,
 	txn *client.Txn,
 	vt VirtualTabler,
 	searchPath parser.SearchPath,
 	n *parser.CreateTable,
 	parentID, id sqlbase.ID,
+	creationTime hlc.Timestamp,
 	privileges *sqlbase.PrivilegeDescriptor,
 	affected map[sqlbase.ID]*sqlbase.TableDescriptor,
 	sessionDB string,
+	evalCtx *parser.EvalContext,
 ) (sqlbase.TableDescriptor, error) {
-	desc := sqlbase.TableDescriptor{
-		ID:            id,
-		ParentID:      parentID,
-		FormatVersion: sqlbase.InterleavedFormatVersion,
-		Version:       1,
-		Privileges:    privileges,
-	}
 	tableName, err := n.Table.Normalize()
 	if err != nil {
-		return desc, err
+		return sqlbase.TableDescriptor{}, err
 	}
-	desc.Name = tableName.Table()
+	desc := initTableDescriptor(id, parentID, tableName.Table(), creationTime, privileges)
 
 	for _, def := range n.Defs {
 		if d, ok := def.(*parser.ColumnTableDef); ok {
 			if !desc.IsVirtualTable() {
-				if _, ok := d.Type.(*parser.ArrayColType); ok {
-					return desc, util.UnimplementedWithIssueErrorf(2115, "ARRAY column types are unsupported")
+				if _, ok := d.Type.(*parser.VectorColType); ok {
+					return desc, pgerror.NewErrorf(
+						pgerror.CodeFeatureNotSupportedError,
+						"VECTOR column types are unsupported",
+					)
 				}
 			}
-
-			col, idx, err := sqlbase.MakeColumnDefDescs(d, searchPath)
+			col, idx, err := sqlbase.MakeColumnDefDescs(d, searchPath, evalCtx)
 			if err != nil {
 				return desc, err
 			}
+
 			desc.AddColumn(*col)
 			if idx != nil {
 				if err := desc.AddIndex(*idx, d.PrimaryKey); err != nil {
@@ -1259,7 +1272,7 @@ func MakeTableDesc(
 				return desc, err
 			}
 			if d.Interleave != nil {
-				return desc, util.UnimplementedWithIssueErrorf(9148, "use CREATE INDEX to make interleaved indexes")
+				return desc, pgerror.UnimplementedWithIssueErrorf(9148, "use CREATE INDEX to make interleaved indexes")
 			}
 		case *parser.UniqueConstraintTableDef:
 			idx := sqlbase.IndexDescriptor{
@@ -1276,11 +1289,11 @@ func MakeTableDesc(
 			if d.PrimaryKey {
 				primaryIndexColumnSet = make(map[string]struct{})
 				for _, c := range d.Columns {
-					primaryIndexColumnSet[c.Column.Normalize()] = struct{}{}
+					primaryIndexColumnSet[string(c.Column)] = struct{}{}
 				}
 			}
 			if d.Interleave != nil {
-				return desc, util.UnimplementedWithIssueErrorf(9148, "use CREATE INDEX to make interleaved indexes")
+				return desc, pgerror.UnimplementedWithIssueErrorf(9148, "use CREATE INDEX to make interleaved indexes")
 			}
 
 		case *parser.CheckConstraintTableDef, *parser.ForeignKeyConstraintTableDef, *parser.FamilyTableDef:
@@ -1294,7 +1307,7 @@ func MakeTableDesc(
 	if primaryIndexColumnSet != nil {
 		// Primary index columns are not nullable.
 		for i := range desc.Columns {
-			if _, ok := primaryIndexColumnSet[parser.ReNormalizeName(desc.Columns[i].Name)]; ok {
+			if _, ok := primaryIndexColumnSet[desc.Columns[i].Name]; ok {
 				desc.Columns[i].Nullable = false
 			}
 		}
@@ -1318,7 +1331,7 @@ func MakeTableDesc(
 	}
 
 	if n.Interleave != nil {
-		if err := addInterleave(txn, vt, &desc, &desc.PrimaryIndex, n.Interleave, sessionDB); err != nil {
+		if err := addInterleave(ctx, txn, vt, &desc, &desc.PrimaryIndex, n.Interleave, sessionDB); err != nil {
 			return desc, err
 		}
 	}
@@ -1343,8 +1356,7 @@ func MakeTableDesc(
 			desc.Checks = append(desc.Checks, ck)
 
 		case *parser.ForeignKeyConstraintTableDef:
-			err := resolveFK(txn, vt, &desc, d, affected, sqlbase.ConstraintValidity_Validated)
-			if err != nil {
+			if err := resolveFK(ctx, txn, vt, &desc, d, affected, sqlbase.ConstraintValidity_Validated); err != nil {
 				return desc, err
 			}
 		default:
@@ -1357,7 +1369,11 @@ func MakeTableDesc(
 	colsInFKs := make(map[sqlbase.ColumnID]struct{})
 	for _, idx := range desc.Indexes {
 		if idx.ForeignKey.IsSet() {
-			for i := range idx.ColumnIDs {
+			numCols := len(idx.ColumnIDs)
+			if idx.ForeignKey.SharedPrefixLen > 0 {
+				numCols = int(idx.ForeignKey.SharedPrefixLen)
+			}
+			for i := 0; i < numCols; i++ {
 				if _, ok := colsInFKs[idx.ColumnIDs[i]]; ok {
 					return desc, fmt.Errorf(
 						"column %q cannot be used by multiple foreign key constraints", idx.ColumnNames[i])
@@ -1372,12 +1388,27 @@ func MakeTableDesc(
 
 // makeTableDesc creates a table descriptor from a CreateTable statement.
 func (p *planner) makeTableDesc(
+	ctx context.Context,
 	n *parser.CreateTable,
 	parentID, id sqlbase.ID,
+	creationTime hlc.Timestamp,
 	privileges *sqlbase.PrivilegeDescriptor,
 	affected map[sqlbase.ID]*sqlbase.TableDescriptor,
 ) (sqlbase.TableDescriptor, error) {
-	return MakeTableDesc(p.txn, &p.session.virtualSchemas, p.session.SearchPath, n, parentID, id, privileges, affected, p.session.Database)
+	return MakeTableDesc(
+		ctx,
+		p.txn,
+		&p.session.virtualSchemas,
+		p.session.SearchPath,
+		n,
+		parentID,
+		id,
+		creationTime,
+		privileges,
+		affected,
+		p.session.Database,
+		&p.evalCtx,
+	)
 }
 
 // dummyColumnItem is used in makeCheckConstraint to construct an expression
@@ -1457,7 +1488,7 @@ func makeCheckConstraint(
 			return nil, true, expr
 		}
 
-		col, err := desc.FindActiveColumnByName(c.ColumnName)
+		col, err := desc.FindActiveColumnByName(string(c.ColumnName))
 		if err != nil {
 			return fmt.Errorf("column %q not found for constraint %q",
 				c.ColumnName, d.Expr.String()), false, nil
@@ -1480,7 +1511,7 @@ func makeCheckConstraint(
 		return nil, err
 	}
 
-	if err := sqlbase.SanitizeVarFreeExpr(expr, parser.TypeBool, "CHECK", searchPath); err != nil {
+	if _, err := sqlbase.SanitizeVarFreeExpr(expr, parser.TypeBool, "CHECK", searchPath); err != nil {
 		return nil, err
 	}
 	if generateName {
@@ -1503,128 +1534,32 @@ func makeCheckConstraint(
 			inuseNames[name] = struct{}{}
 		}
 	}
-	return &sqlbase.TableDescriptor_CheckConstraint{Expr: d.Expr.String(), Name: name}, nil
+	return &sqlbase.TableDescriptor_CheckConstraint{Expr: parser.Serialize(d.Expr), Name: name}, nil
 }
 
-// CreateTestTableDescriptor converts a SQL string to a table for test purposes.
-// Will fail on complex tables where that operation requires e.g. looking up
-// other tables or otherwise utilizing a planner, since the planner used here is
-// just a zero value placeholder.
-func CreateTestTableDescriptor(
-	parentID, id sqlbase.ID, schema string, privileges *sqlbase.PrivilegeDescriptor,
-) (sqlbase.TableDescriptor, error) {
-	stmt, err := parser.ParseOneTraditional(schema)
-	if err != nil {
-		return sqlbase.TableDescriptor{}, err
-	}
-	p := planner{session: &Session{context: context.Background()}}
-	return p.makeTableDesc(stmt.(*parser.CreateTable), parentID, id, privileges, nil)
+// planContainsStar returns true if one of the render nodes in the
+// plan contains a star expansion.
+func (p *planner) planContainsStar(ctx context.Context, plan planNode) bool {
+	s := &starDetector{}
+	_ = walkPlan(ctx, plan, planObserver{enterNode: s.enterNode})
+	return s.foundStar
 }
 
-// resolveViewDependencies looks up the tables included in a view's query
-// and adds metadata representing those dependencies to both the new view's
-// descriptor and the dependend-upon tables' descriptors. The modified table
-// descriptors are put into the backrefs map of other tables so that they can
-// be updated when this view is created.
-func (n *createViewNode) resolveViewDependencies(
-	tbl *sqlbase.TableDescriptor, backrefs map[sqlbase.ID]*sqlbase.TableDescriptor,
-) {
-	// Add the necessary back-references to the descriptor for each referenced
-	// table / view.
-	populateViewBackrefs(n.sourcePlan, tbl, backrefs)
-
-	// Also create the forward references in the new view's descriptor.
-	tbl.DependsOn = make([]sqlbase.ID, 0, len(backrefs))
-	for _, backref := range backrefs {
-		tbl.DependsOn = append(tbl.DependsOn, backref.ID)
-	}
+// starDetector supports planContainsStar().
+type starDetector struct {
+	foundStar bool
 }
 
-func populateViewBackrefs(
-	plan planNode, tbl *sqlbase.TableDescriptor, backrefs map[sqlbase.ID]*sqlbase.TableDescriptor,
-) {
-	// I was initially concerned about doing type assertions on every node in
-	// the tree, but it's actually faster than a string comparison on the name
-	// returned by ExplainPlan, judging by a mini-benchmark run on my laptop
-	// with go 1.7.1.
-	if sel, ok := plan.(*selectNode); ok {
-		// If this is a view, we don't want to resolve the underlying scan(s).
-		// We instead prefer to track the dependency on the view itself rather
-		// than on its indirect dependencies.
-		if sel.source.info.viewDesc != nil {
-			populateViewBackrefFromViewDesc(sel.source.info.viewDesc, tbl, backrefs)
-			// Return early to avoid processing the view's underlying query.
-			return
-		}
-	} else if join, ok := plan.(*joinNode); ok {
-		if join.left.info.viewDesc != nil {
-			populateViewBackrefFromViewDesc(join.left.info.viewDesc, tbl, backrefs)
-		} else {
-			populateViewBackrefs(join.left.plan, tbl, backrefs)
-		}
-		if join.right.info.viewDesc != nil {
-			populateViewBackrefFromViewDesc(join.right.info.viewDesc, tbl, backrefs)
-		} else {
-			populateViewBackrefs(join.right.plan, tbl, backrefs)
-		}
-		// Return early to avoid re-processing the children.
-		return
-	} else if scan, ok := plan.(*scanNode); ok {
-		desc, ok := backrefs[scan.desc.ID]
-		if !ok {
-			desc = &scan.desc
-			backrefs[desc.ID] = desc
-		}
-		ref := sqlbase.TableDescriptor_Reference{
-			ID:        tbl.ID,
-			ColumnIDs: make([]sqlbase.ColumnID, 0, len(scan.cols)),
-		}
-		if scan.specifiedIndex != nil {
-			ref.IndexID = scan.specifiedIndex.ID
-		}
-		for i := range scan.cols {
-			// Only include the columns that are actually needed.
-			if scan.valNeededForCol[i] {
-				ref.ColumnIDs = append(ref.ColumnIDs, scan.cols[i].ID)
-			}
-		}
-		desc.DependedOnBy = append(desc.DependedOnBy, ref)
+// enterNode implements the planObserver interface.
+func (s *starDetector) enterNode(_ context.Context, _ string, plan planNode) bool {
+	if s.foundStar {
+		return false
 	}
-
-	// We have to use the verbose version of ExplainPlan because the non-verbose
-	// form skips over some layers of the tree (e.g. selectTopNode, selectNode).
-	_, _, children := plan.ExplainPlan(true)
-	for _, child := range children {
-		populateViewBackrefs(child, tbl, backrefs)
-	}
-}
-
-func populateViewBackrefFromViewDesc(
-	dependency *sqlbase.TableDescriptor,
-	tbl *sqlbase.TableDescriptor,
-	backrefs map[sqlbase.ID]*sqlbase.TableDescriptor,
-) {
-	desc, ok := backrefs[dependency.ID]
-	if !ok {
-		desc = dependency
-		backrefs[desc.ID] = desc
-	}
-	ref := sqlbase.TableDescriptor_Reference{ID: tbl.ID}
-	desc.DependedOnBy = append(desc.DependedOnBy, ref)
-}
-
-func planContainsStar(plan planNode) bool {
-	if sel, ok := plan.(*selectNode); ok {
+	if sel, ok := plan.(*renderNode); ok {
 		if sel.isStar {
-			return true
+			s.foundStar = true
+			return false
 		}
 	}
-
-	_, _, children := plan.ExplainPlan(true)
-	for _, child := range children {
-		if containsStar := planContainsStar(child); containsStar {
-			return true
-		}
-	}
-	return false
+	return true
 }

@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Spencer Kimball (spencer.kimball@gmail.com)
 
 package roachpb
 
@@ -26,8 +24,9 @@ import (
 	"time"
 
 	"github.com/gogo/protobuf/proto"
-	"gopkg.in/inf.v0"
+	"github.com/kr/pretty"
 
+	"github.com/cockroachdb/apd"
 	"github.com/cockroachdb/cockroach/pkg/storage/engine/enginepb"
 	"github.com/cockroachdb/cockroach/pkg/testutils/zerofields"
 	"github.com/cockroachdb/cockroach/pkg/util"
@@ -61,7 +60,7 @@ func TestKeyNext(t *testing.T) {
 	extraCap[0] = 'x'
 	extraCap[1] = 'o'
 
-	noExtraCap := make([]byte, 2, 2)
+	noExtraCap := make([]byte, 2)
 	noExtraCap[0] = 'x'
 	noExtraCap[1] = 'o'
 
@@ -283,14 +282,14 @@ func TestSetGetChecked(t *testing.T) {
 		t.Errorf("set %d on a value and extracted it, expected %d back, but got %d", i, i, r)
 	}
 
-	dec := inf.NewDec(11, 1)
+	dec := apd.New(11, -1)
 	if err := v.SetDecimal(dec); err != nil {
 		t.Fatal(err)
 	}
 	if r, err := v.GetDecimal(); err != nil {
 		t.Fatal(err)
-	} else if dec.Cmp(r) != 0 {
-		t.Errorf("set %s on a value and extracted it, expected %s back, but got %s", dec, dec, r)
+	} else if dec.Cmp(&r) != 0 {
+		t.Errorf("set %s on a value and extracted it, expected %s back, but got %s", dec, dec, &r)
 	}
 
 	if err := v.SetProto(&Value{}); err != nil {
@@ -316,23 +315,6 @@ func TestSetGetChecked(t *testing.T) {
 		t.Fatal(err)
 	} else if !ti.Equal(r) {
 		t.Errorf("set %s on a value and extracted it, expected %s back, but got %s", ti, ti, r)
-	}
-}
-
-func TestTxnEqual(t *testing.T) {
-	u1, u2 := uuid.MakeV4(), uuid.MakeV4()
-	tc := []struct {
-		txn1, txn2 *Transaction
-		eq         bool
-	}{
-		{nil, nil, true},
-		{&Transaction{}, nil, false},
-		{&Transaction{TxnMeta: enginepb.TxnMeta{ID: &u1}}, &Transaction{TxnMeta: enginepb.TxnMeta{ID: &u2}}, false},
-	}
-	for i, c := range tc {
-		if c.txn1.Equal(c.txn2) != c.txn2.Equal(c.txn1) || c.txn1.Equal(c.txn2) != c.eq {
-			t.Errorf("%d: wanted %t", i, c.eq)
-		}
 	}
 }
 
@@ -364,7 +346,7 @@ func TestTransactionObservedTimestamp(t *testing.T) {
 	ids := append([]int{109, 104, 102, 108, 1000}, rand.Perm(100)...)
 	timestamps := make(map[NodeID]hlc.Timestamp, len(ids))
 	for i := 0; i < len(ids); i++ {
-		timestamps[NodeID(i)] = hlc.ZeroTimestamp.Add(rng.Int63(), 0)
+		timestamps[NodeID(i)] = hlc.Timestamp{WallTime: rng.Int63()}
 	}
 	for i, n := range ids {
 		nodeID := NodeID(n)
@@ -379,16 +361,16 @@ func TestTransactionObservedTimestamp(t *testing.T) {
 	}
 	for _, m := range ids {
 		checkID := NodeID(m)
-		exp := timestamps[checkID]
-		if act, _ := txn.GetObservedTimestamp(checkID); !act.Equal(exp) {
-			t.Fatalf("%d: expected %s, got %s", checkID, exp, act)
+		expTS := timestamps[checkID]
+		if actTS, _ := txn.GetObservedTimestamp(checkID); actTS != expTS {
+			t.Fatalf("%d: expected %s, got %s", checkID, expTS, actTS)
 		}
 	}
 
 	var emptyTxn Transaction
-	ts := hlc.ZeroTimestamp.Add(1, 2)
+	ts := hlc.Timestamp{WallTime: 1, Logical: 2}
 	emptyTxn.UpdateObservedTimestamp(NodeID(1), ts)
-	if actTS, _ := emptyTxn.GetObservedTimestamp(NodeID(1)); !actTS.Equal(ts) {
+	if actTS, _ := emptyTxn.GetObservedTimestamp(NodeID(1)); actTS != ts {
 		t.Fatalf("unexpected: %s (wanted %s)", actTS, ts)
 	}
 }
@@ -409,10 +391,10 @@ var nonZeroTxn = Transaction{
 	},
 	Name:               "name",
 	Status:             COMMITTED,
-	LastHeartbeat:      &hlc.Timestamp{WallTime: 1, Logical: 2},
+	LastHeartbeat:      makeTS(1, 2),
 	OrigTimestamp:      makeTS(30, 31),
 	MaxTimestamp:       makeTS(40, 41),
-	ObservedTimestamps: map[NodeID]hlc.Timestamp{1: makeTS(1, 2)},
+	ObservedTimestamps: []ObservedTimestamp{{NodeID: 1, Timestamp: makeTS(1, 2)}},
 	Writing:            true,
 	WriteTooOld:        true,
 	RetryOnPush:        true,
@@ -477,8 +459,16 @@ func checkVal(val, expected, errFraction float64) bool {
 // in MakePriority returning priorities that are P times more likely
 // to be higher than a priority with user priority = 1.
 func TestMakePriority(t *testing.T) {
+	// Verify min & max.
+	if a, e := MakePriority(MinUserPriority), int32(MinTxnPriority); a != e {
+		t.Errorf("expected min txn priority %d; got %d", e, a)
+	}
+	if a, e := MakePriority(MaxUserPriority), int32(MaxTxnPriority); a != e {
+		t.Errorf("expected max txn priority %d; got %d", e, a)
+	}
+
 	userPs := []UserPriority{
-		0.001,
+		0.0011,
 		0.01,
 		0.1,
 		0.5,
@@ -487,10 +477,10 @@ func TestMakePriority(t *testing.T) {
 		2.0,
 		10.0,
 		100.0,
-		1000.0,
+		999.0,
 	}
 
-	// Generate values for all priorities
+	// Generate values for all priorities.
 	const trials = 100000
 	values := make([][trials]int32, len(userPs))
 	for i, userPri := range userPs {
@@ -558,7 +548,7 @@ func TestMakePriorityExplicit(t *testing.T) {
 }
 
 // TestMakePriorityLimits verifies that min & max priorities are
-// enforced and still yield randomized values.
+// enforced and yield txn priority limits.
 func TestMakePriorityLimits(t *testing.T) {
 	userPs := []UserPriority{
 		0.000000001,
@@ -568,14 +558,13 @@ func TestMakePriorityLimits(t *testing.T) {
 		100000,
 		math.MaxFloat64,
 	}
-	const trials = 100
 	for _, userPri := range userPs {
-		seen := map[int32]struct{}{} // set of priorities
-		for j := 0; j < trials; j++ {
-			seen[MakePriority(userPri)] = struct{}{}
+		expected := int32(MinTxnPriority)
+		if userPri > 1 {
+			expected = int32(MaxTxnPriority)
 		}
-		if len(seen) < 85 {
-			t.Errorf("%f: expected randomized values, got %d: %v", userPri, len(seen), seen)
+		if actual := MakePriority(userPri); actual != expected {
+			t.Errorf("%f: expected txn priority %d; got %d", userPri, expected, actual)
 		}
 	}
 }
@@ -621,8 +610,8 @@ func TestLeaseEquivalence(t *testing.T) {
 	}
 
 	for i, tc := range testCases {
-		if err := tc.l.Equivalent(tc.ol); tc.expSuccess != (err == nil) {
-			t.Errorf("%d: expected success? %t; got %s", i, tc.expSuccess, err)
+		if ok := tc.l.Equivalent(tc.ol); tc.expSuccess != ok {
+			t.Errorf("%d: expected success? %t; got %t", i, tc.expSuccess, ok)
 		}
 	}
 }
@@ -652,6 +641,41 @@ func TestSpanOverlaps(t *testing.T) {
 	for i, test := range testData {
 		if o := test.s1.Overlaps(test.s2); o != test.overlaps {
 			t.Errorf("%d: expected overlap %t; got %t between %s vs. %s", i, test.overlaps, o, test.s1, test.s2)
+		}
+	}
+}
+
+// TestSpanContains verifies methods to check whether a key
+// or key range is contained within the span.
+func TestSpanContains(t *testing.T) {
+	s := Span{Key: []byte("a"), EndKey: []byte("b")}
+
+	testData := []struct {
+		start, end []byte
+		contains   bool
+	}{
+		// Single keys.
+		{[]byte("a"), nil, true},
+		{[]byte("aa"), nil, true},
+		{[]byte("`"), nil, false},
+		{[]byte("b"), nil, false},
+		{[]byte("c"), nil, false},
+		// Key ranges.
+		{[]byte("a"), []byte("b"), true},
+		{[]byte("a"), []byte("aa"), true},
+		{[]byte("aa"), []byte("b"), true},
+		{[]byte("0"), []byte("9"), false},
+		{[]byte("`"), []byte("a"), false},
+		{[]byte("b"), []byte("bb"), false},
+		{[]byte("0"), []byte("bb"), false},
+		{[]byte("aa"), []byte("bb"), false},
+		// TODO(bdarnell): check for invalid ranges in Span.Contains?
+		//{[]byte("b"), []byte("a"), false},
+	}
+	for i, test := range testData {
+		if s.Contains(Span{test.start, test.end}) != test.contains {
+			t.Errorf("%d: expected span %q-%q within range to be %v",
+				i, test.start, test.end, test.contains)
 		}
 	}
 }
@@ -829,7 +853,7 @@ func BenchmarkValueSetTime(b *testing.B) {
 
 func BenchmarkValueSetDecimal(b *testing.B) {
 	v := Value{}
-	dec := inf.NewDec(11, 1)
+	dec := apd.New(11, -1)
 
 	for i := 0; i < b.N; i++ {
 		if err := v.SetDecimal(dec); err != nil {
@@ -923,7 +947,7 @@ func BenchmarkValueGetTime(b *testing.B) {
 
 func BenchmarkValueGetDecimal(b *testing.B) {
 	v := Value{}
-	dec := inf.NewDec(11, 1)
+	dec := apd.New(11, -1)
 	if err := v.SetDecimal(dec); err != nil {
 		b.Fatal(err)
 	}
@@ -961,7 +985,7 @@ func TestValuePrettyPrint(t *testing.T) {
 	timeValue.SetTime(time.Date(2016, 6, 29, 16, 2, 50, 5, time.UTC))
 
 	var decimalValue Value
-	_ = decimalValue.SetDecimal(inf.NewDec(628, 2))
+	_ = decimalValue.SetDecimal(apd.New(628, -2))
 
 	var durationValue Value
 	_ = durationValue.SetDuration(duration.Duration{Months: 1, Days: 2, Nanos: 3})
@@ -987,7 +1011,7 @@ func TestValuePrettyPrint(t *testing.T) {
 		{floatValue, "/FLOAT/6.28"},
 		{timeValue, "/TIME/2016-06-29T16:02:50.000000005Z"},
 		{decimalValue, "/DECIMAL/6.28"},
-		{durationValue, "/DURATION/1m2d3ns"},
+		{durationValue, "/DURATION/1mon2d3ns"},
 		{MakeValueFromBytes([]byte{0x1, 0x2, 0xF, 0xFF}), "/BYTES/01020fff"},
 		{MakeValueFromString("foo"), "/BYTES/foo"},
 		{tupleValue, "/TUPLE/1:1:Int/8/2:3:Bytes/foo"},
@@ -999,5 +1023,66 @@ func TestValuePrettyPrint(t *testing.T) {
 		if str := test.v.PrettyPrint(); str != test.expected {
 			t.Errorf("%d: got %q expected %q", i, str, test.expected)
 		}
+	}
+}
+
+func TestUpdateObservedTimestamps(t *testing.T) {
+	f := func(nodeID NodeID, walltime int64) ObservedTimestamp {
+		return ObservedTimestamp{
+			NodeID: nodeID,
+			Timestamp: hlc.Timestamp{
+				WallTime: walltime,
+			},
+		}
+	}
+
+	testCases := []struct {
+		input    observedTimestampSlice
+		expected observedTimestampSlice
+	}{
+		{nil, nil},
+		{
+			observedTimestampSlice{f(1, 1)},
+			observedTimestampSlice{f(1, 1)},
+		},
+		{
+			observedTimestampSlice{f(1, 1), f(1, 2)},
+			observedTimestampSlice{f(1, 1)},
+		},
+		{
+			observedTimestampSlice{f(1, 2), f(1, 1)},
+			observedTimestampSlice{f(1, 1)},
+		},
+		{
+			observedTimestampSlice{f(1, 1), f(2, 1)},
+			observedTimestampSlice{f(1, 1), f(2, 1)},
+		},
+		{
+			observedTimestampSlice{f(2, 1), f(1, 1)},
+			observedTimestampSlice{f(1, 1), f(2, 1)},
+		},
+		{
+			observedTimestampSlice{f(1, 1), f(2, 1), f(3, 1)},
+			observedTimestampSlice{f(1, 1), f(2, 1), f(3, 1)},
+		},
+		{
+			observedTimestampSlice{f(3, 1), f(2, 1), f(1, 1)},
+			observedTimestampSlice{f(1, 1), f(2, 1), f(3, 1)},
+		},
+		{
+			observedTimestampSlice{f(2, 1), f(3, 1), f(1, 1)},
+			observedTimestampSlice{f(1, 1), f(2, 1), f(3, 1)},
+		},
+	}
+	for _, c := range testCases {
+		t.Run("", func(t *testing.T) {
+			var s observedTimestampSlice
+			for _, v := range c.input {
+				s = s.update(v.NodeID, v.Timestamp)
+			}
+			if !reflect.DeepEqual(c.expected, s) {
+				t.Fatalf("%s", pretty.Diff(c.expected, s))
+			}
+		})
 	}
 }

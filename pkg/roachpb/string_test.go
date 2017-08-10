@@ -11,14 +11,10 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Tamir Duberstein (tamird@gmail.com)
 
 package roachpb_test
 
 import (
-	"fmt"
-	"strings"
 	"testing"
 
 	// Hook up the pretty printer.
@@ -26,7 +22,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 
 	"github.com/cockroachdb/cockroach/pkg/storage/engine/enginepb"
-	"github.com/cockroachdb/cockroach/pkg/storage/storagebase"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 )
@@ -36,7 +31,6 @@ func TestTransactionString(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	ts1 := hlc.Timestamp{WallTime: 10, Logical: 11}
 	txn := roachpb.Transaction{
 		TxnMeta: enginepb.TxnMeta{
 			Isolation: enginepb.SERIALIZABLE,
@@ -45,15 +39,16 @@ func TestTransactionString(t *testing.T) {
 			Epoch:     2,
 			Timestamp: hlc.Timestamp{WallTime: 20, Logical: 21},
 			Priority:  957356782,
+			Sequence:  15,
 		},
 		Name:          "name",
 		Status:        roachpb.COMMITTED,
-		LastHeartbeat: &ts1,
+		LastHeartbeat: hlc.Timestamp{WallTime: 10, Logical: 11},
 		OrigTimestamp: hlc.Timestamp{WallTime: 30, Logical: 31},
 		MaxTimestamp:  hlc.Timestamp{WallTime: 40, Logical: 41},
 	}
 	expStr := `"name" id=d7aa0f5e key="foo" rw=false pri=44.58039917 iso=SERIALIZABLE stat=COMMITTED ` +
-		`epo=2 ts=0.000000020,21 orig=0.000000030,31 max=0.000000040,41 wto=false rop=false`
+		`epo=2 ts=0.000000020,21 orig=0.000000030,31 max=0.000000040,41 wto=false rop=false seq=15`
 
 	if str := txn.String(); str != expStr {
 		t.Errorf("expected txn %s; got %s", expStr, str)
@@ -61,14 +56,6 @@ func TestTransactionString(t *testing.T) {
 
 	var txnEmpty roachpb.Transaction
 	_ = txnEmpty.String() // prevent regression of NPE
-
-	cmd := storagebase.RaftCommand{
-		BatchRequest: &roachpb.BatchRequest{},
-	}
-	cmd.BatchRequest.Txn = &txn
-	if actStr, idStr := fmt.Sprintf("%s", &cmd), txnID.String(); !strings.Contains(actStr, idStr) {
-		t.Fatalf("expected to find '%s' in '%s'", idStr, actStr)
-	}
 }
 
 func TestBatchRequestString(t *testing.T) {

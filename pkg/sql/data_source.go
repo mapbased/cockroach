@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Raphael 'kena' Poss (knz@cockroachlabs.com)
 
 package sql
 
@@ -20,11 +18,14 @@ import (
 	"bytes"
 	"fmt"
 
+	"github.com/pkg/errors"
+	"golang.org/x/net/context"
+
+	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
-	"github.com/cockroachdb/cockroach/pkg/util"
-	"github.com/pkg/errors"
 )
 
 // To understand dataSourceInfo below it is crucial to understand the
@@ -115,7 +116,7 @@ import (
 type dataSourceInfo struct {
 	// sourceColumns match the plan.Columns() 1-to-1. However the column
 	// names might be different if the statement renames them using AS.
-	sourceColumns ResultColumns
+	sourceColumns sqlbase.ResultColumns
 
 	// sourceAliases indicates to which table alias column ranges
 	// belong.
@@ -123,10 +124,6 @@ type dataSourceInfo struct {
 	// column but might be different if the statement renames
 	// them using AS.
 	sourceAliases sourceAliases
-
-	// viewDesc is nothing more than an annotation used to indicate that the
-	// columns are defined as part of a view.
-	viewDesc *sqlbase.TableDescriptor
 }
 
 // planDataSource contains the data source information for data
@@ -164,7 +161,7 @@ func (src *dataSourceInfo) String() string {
 		if i > 0 {
 			buf.WriteByte('\t')
 		}
-		if c.hidden {
+		if c.Hidden {
 			buf.WriteByte('*')
 		}
 		buf.WriteString(c.Name)
@@ -231,62 +228,96 @@ func fillColumnRange(firstIdx, lastIdx int) columnRange {
 
 // newSourceInfoForSingleTable creates a simple dataSourceInfo
 // which maps the same tableAlias to all columns.
-func newSourceInfoForSingleTable(tn parser.TableName, columns ResultColumns) *dataSourceInfo {
-	norm := tn.NormalizedTableName()
+func newSourceInfoForSingleTable(
+	tn parser.TableName, columns sqlbase.ResultColumns,
+) *dataSourceInfo {
 	return &dataSourceInfo{
 		sourceColumns: columns,
-		sourceAliases: sourceAliases{{name: norm, columnRange: fillColumnRange(0, len(columns)-1)}},
+		sourceAliases: sourceAliases{{name: tn, columnRange: fillColumnRange(0, len(columns)-1)}},
 	}
 }
 
 // getSources combines zero or more FROM sources into cross-joins.
 func (p *planner) getSources(
-	sources []parser.TableExpr, scanVisibility scanVisibility,
+	ctx context.Context, sources []parser.TableExpr, scanVisibility scanVisibility,
 ) (planDataSource, error) {
 	switch len(sources) {
 	case 0:
 		plan := &emptyNode{results: true}
 		return planDataSource{
-			info: newSourceInfoForSingleTable(anonymousTable, plan.Columns()),
+			info: newSourceInfoForSingleTable(anonymousTable, planColumns(plan)),
 			plan: plan,
 		}, nil
 
 	case 1:
-		return p.getDataSource(sources[0], nil, scanVisibility)
+		return p.getDataSource(ctx, sources[0], nil, scanVisibility)
 
 	default:
-		left, err := p.getDataSource(sources[0], nil, scanVisibility)
+		left, err := p.getDataSource(ctx, sources[0], nil, scanVisibility)
 		if err != nil {
 			return planDataSource{}, err
 		}
-		right, err := p.getSources(sources[1:], scanVisibility)
+		right, err := p.getSources(ctx, sources[1:], scanVisibility)
 		if err != nil {
 			return planDataSource{}, err
 		}
-		return p.makeJoin("CROSS JOIN", left, right, nil)
+		return p.makeJoin(ctx, "CROSS JOIN", left, right, nil)
 	}
 }
 
 // getVirtualDataSource attempts to find a virtual table with the
 // given name.
-func (p *planner) getVirtualDataSource(tn *parser.TableName) (planDataSource, bool, error) {
+func (p *planner) getVirtualDataSource(
+	ctx context.Context, tn *parser.TableName,
+) (planDataSource, bool, error) {
 	virtual, err := p.session.virtualSchemas.getVirtualTableEntry(tn)
 	if err != nil {
 		return planDataSource{}, false, err
 	}
 	if virtual.desc != nil {
-		columns, constructor := virtual.getPlanInfo()
+		columns, constructor := virtual.getPlanInfo(ctx)
+
+		// The virtual table constructor takes the target database
+		// as "prefix" argument. This is either the prefix in the
+		// virtual table name given in the SQL query explicitly,
+		// or, if no prefix is given,
+		// the current database if one is set,
+		// or the empty prefix if the user is root (to show everything),
+		// or "system" otherwise (to only show virt tables to non-root users).
+		//
+		// It is particularly important to not use the empty prefix for
+		// non-root users, because client libraries that mistakenly do not
+		// set a current database tend to be badly, badly behaved if they
+		// see tables from multiple databases (as in, "drop tables from
+		// the wrong db" mis-behaved). Lack of data in the vtable in the
+		// case where there is no current database is thus safer.
+		//
+		// Meanwhile the root user probably would be inconvenienced by
+		// this.
+		prefix := string(tn.PrefixName)
+		if !tn.PrefixOriginallySpecified {
+			prefix = p.session.Database
+			if prefix == "" && p.session.User != security.RootUser {
+				prefix = sqlbase.SystemDB.Name
+			}
+		}
+
+		// Define the name of the source visible in EXPLAIN(NOEXPAND).
 		sourceName := parser.TableName{
+			PrefixName:   parser.Name(prefix),
 			TableName:    parser.Name(virtual.desc.Name),
 			DatabaseName: tn.DatabaseName,
 		}
+
+		// The resulting node.
 		return planDataSource{
 			info: newSourceInfoForSingleTable(sourceName, columns),
 			plan: &delayedNode{
-				p:           p,
-				name:        sourceName.String(),
-				columns:     columns,
-				constructor: constructor,
+				name:    sourceName.String(),
+				columns: columns,
+				constructor: func(ctx context.Context, p *planner) (planNode, error) {
+					return constructor(ctx, p, prefix)
+				},
 			},
 		}, true, nil
 	}
@@ -296,50 +327,71 @@ func (p *planner) getVirtualDataSource(tn *parser.TableName) (planDataSource, bo
 // getDataSource builds a planDataSource from a single data source clause
 // (TableExpr) in a SelectClause.
 func (p *planner) getDataSource(
-	src parser.TableExpr, hints *parser.IndexHints, scanVisibility scanVisibility,
+	ctx context.Context,
+	src parser.TableExpr,
+	hints *parser.IndexHints,
+	scanVisibility scanVisibility,
 ) (planDataSource, error) {
 	switch t := src.(type) {
 	case *parser.NormalizableTableName:
 		// Usual case: a table.
-		tn, err := p.QualifyWithDatabase(t)
+		tn, err := p.QualifyWithDatabase(ctx, t)
 		if err != nil {
 			return planDataSource{}, err
 		}
 
 		// Is this perhaps a name for a virtual table?
-		ds, foundVirtual, err := p.getVirtualDataSource(tn)
+		ds, foundVirtual, err := p.getVirtualDataSource(ctx, tn)
 		if err != nil {
 			return planDataSource{}, err
 		}
 		if foundVirtual {
 			return ds, nil
 		}
-		return p.getTableScanOrViewPlan(tn, hints, scanVisibility)
+		return p.getTableScanOrViewPlan(ctx, tn, hints, scanVisibility)
 
 	case *parser.FuncExpr:
-		return p.getGeneratorPlan(t)
+		return p.getGeneratorPlan(ctx, t)
 
 	case *parser.Subquery:
-		return p.getSubqueryPlan(t.Select, nil)
+		return p.getSubqueryPlan(ctx, anonymousTable, t.Select, nil)
 
 	case *parser.JoinTableExpr:
 		// Joins: two sources.
-		left, err := p.getDataSource(t.Left, nil, scanVisibility)
+		left, err := p.getDataSource(ctx, t.Left, nil, scanVisibility)
 		if err != nil {
 			return left, err
 		}
-		right, err := p.getDataSource(t.Right, nil, scanVisibility)
+		right, err := p.getDataSource(ctx, t.Right, nil, scanVisibility)
 		if err != nil {
 			return right, err
 		}
-		return p.makeJoin(t.Join, left, right, t.Cond)
+		return p.makeJoin(ctx, t.Join, left, right, t.Cond)
+
+	case *parser.StatementSource:
+		plan, err := p.newPlan(ctx, t.Statement, nil)
+		if err != nil {
+			return planDataSource{}, err
+		}
+		return planDataSource{
+			info: newSourceInfoForSingleTable(anonymousTable, planColumns(plan)),
+			plan: plan,
+		}, nil
 
 	case *parser.ParenTableExpr:
-		return p.getDataSource(t.Expr, hints, scanVisibility)
+		return p.getDataSource(ctx, t.Expr, hints, scanVisibility)
+
+	case *parser.TableRef:
+		return p.getTableScanByRef(ctx, t, hints, scanVisibility)
 
 	case *parser.AliasedTableExpr:
 		// Alias clause: source AS alias(cols...)
-		src, err := p.getDataSource(t.Expr, t.Hints, scanVisibility)
+
+		if t.Hints != nil {
+			hints = t.Hints
+		}
+
+		src, err := p.getDataSource(ctx, t.Expr, hints, scanVisibility)
 		if err != nil {
 			return src, err
 		}
@@ -352,100 +404,177 @@ func (p *planner) getDataSource(
 			src = p.wrapOrdinality(src)
 		}
 
-		var tableAlias parser.TableName
-		if t.As.Alias != "" {
-			// If an alias was specified, use that.
-			tableAlias.TableName = parser.Name(t.As.Alias.Normalize())
-			src.info.sourceAliases = sourceAliases{{
-				name:        tableAlias,
-				columnRange: fillColumnRange(0, len(src.info.sourceColumns)-1),
-			}}
-		}
-		colAlias := t.As.Cols
-
-		if len(colAlias) > 0 {
-			// Make a copy of the slice since we are about to modify the contents.
-			src.info.sourceColumns = append(ResultColumns(nil), src.info.sourceColumns...)
-
-			// The column aliases can only refer to explicit columns.
-			for colIdx, aliasIdx := 0, 0; aliasIdx < len(colAlias); colIdx++ {
-				if colIdx >= len(src.info.sourceColumns) {
-					var srcName string
-					if tableAlias.DatabaseName != "" {
-						srcName = tableAlias.String()
-					} else {
-						srcName = tableAlias.TableName.String()
-					}
-
-					return planDataSource{}, errors.Errorf(
-						"source %q has %d columns available but %d columns specified",
-						srcName, aliasIdx, len(colAlias))
-				}
-				if src.info.sourceColumns[colIdx].hidden {
-					continue
-				}
-				src.info.sourceColumns[colIdx].Name = string(colAlias[aliasIdx])
-				aliasIdx++
-			}
-		}
-		return src, nil
+		return renameSource(src, t.As, false)
 
 	default:
 		return planDataSource{}, errors.Errorf("unsupported FROM type %T", src)
 	}
 }
 
-func (p *planner) QualifyWithDatabase(t *parser.NormalizableTableName) (*parser.TableName, error) {
+func (p *planner) QualifyWithDatabase(
+	ctx context.Context, t *parser.NormalizableTableName,
+) (*parser.TableName, error) {
 	tn, err := t.Normalize()
 	if err != nil {
 		return nil, err
 	}
 	if tn.DatabaseName == "" {
-		database, err := p.databaseFromSearchPath(tn)
-		if err != nil {
-			return nil, err
-		}
-		if err := tn.QualifyWithDatabase(database); err != nil {
+		if err := p.searchAndQualifyDatabase(ctx, tn); err != nil {
 			return nil, err
 		}
 	}
 	return tn, nil
 }
 
+func (p *planner) getTableDescByID(
+	ctx context.Context, tableID sqlbase.ID,
+) (*sqlbase.TableDescriptor, error) {
+	descFunc := p.session.tables.getTableVersionByID
+	if p.avoidCachedDescriptors {
+		descFunc = sqlbase.GetTableDescFromID
+	}
+	return descFunc(ctx, p.txn, tableID)
+}
+
+func (p *planner) getTableScanByRef(
+	ctx context.Context,
+	tref *parser.TableRef,
+	hints *parser.IndexHints,
+	scanVisibility scanVisibility,
+) (planDataSource, error) {
+	desc, err := p.getTableDescByID(ctx, sqlbase.ID(tref.TableID))
+	if err != nil {
+		return planDataSource{}, errors.Errorf("%s: %v", parser.ErrString(tref), err)
+	}
+
+	tn := parser.TableName{
+		TableName: parser.Name(desc.Name),
+		// Ideally, we'd like to populate DatabaseName here, however that
+		// would require a reverse-lookup from DB ID to database name, and
+		// we do not provide an API to do this without a KV lookup. The
+		// cost of a KV lookup to populate a field only used in (uncommon)
+		// error messages is unwarranted.
+		// So instead, we mark the "database name as originally omitted"
+		// so as to prevent pretty-printing a potentially confusing empty
+		// database name in error messages (we want `foo` not `"".foo`).
+		DBNameOriginallyOmitted: true,
+	}
+
+	src, err := p.getPlanForDesc(ctx, desc, &tn, hints, scanVisibility, tref.Columns)
+	if err != nil {
+		return src, err
+	}
+
+	return renameSource(src, tref.As, true)
+}
+
+// renameSource applies an AS clause to a data source.
+func renameSource(
+	src planDataSource, as parser.AliasClause, includeHidden bool,
+) (planDataSource, error) {
+	var tableAlias parser.TableName
+	if as.Alias != "" {
+		// If an alias was specified, use that.
+		tableAlias.TableName = as.Alias
+		src.info.sourceAliases = sourceAliases{{
+			name:        tableAlias,
+			columnRange: fillColumnRange(0, len(src.info.sourceColumns)-1),
+		}}
+	}
+	colAlias := as.Cols
+
+	if len(colAlias) > 0 {
+		// Make a copy of the slice since we are about to modify the contents.
+		src.info.sourceColumns = append(sqlbase.ResultColumns(nil), src.info.sourceColumns...)
+
+		// The column aliases can only refer to explicit columns.
+		for colIdx, aliasIdx := 0, 0; aliasIdx < len(colAlias); colIdx++ {
+			if colIdx >= len(src.info.sourceColumns) {
+				var srcName string
+				if tableAlias.DatabaseName != "" {
+					srcName = parser.ErrString(&tableAlias)
+				} else {
+					srcName = parser.ErrString(tableAlias.TableName)
+				}
+
+				return planDataSource{}, errors.Errorf(
+					"source %q has %d columns available but %d columns specified",
+					srcName, aliasIdx, len(colAlias))
+			}
+			if !includeHidden && src.info.sourceColumns[colIdx].Hidden {
+				continue
+			}
+			src.info.sourceColumns[colIdx].Name = string(colAlias[aliasIdx])
+			aliasIdx++
+		}
+	}
+	return src, nil
+}
+
 // getTableScanOrViewPlan builds a planDataSource from a single data source
 // clause (either a table or a view) in a SelectClause, expanding views out
 // into subqueries.
 func (p *planner) getTableScanOrViewPlan(
-	tn *parser.TableName, hints *parser.IndexHints, scanVisibility scanVisibility,
+	ctx context.Context,
+	tn *parser.TableName,
+	hints *parser.IndexHints,
+	scanVisibility scanVisibility,
 ) (planDataSource, error) {
-	descFunc := p.getTableLease
-	if p.avoidCachedDescriptors {
-		// AS OF SYSTEM TIME queries need to fetch the table descriptor at the
-		// specified time, and never lease anything. The proto transaction already
-		// has its timestamps set correctly so mustGetTableDesc will fetch with the
-		// correct timestamp.
-		descFunc = p.mustGetTableOrViewDesc
+	if tn.PrefixOriginallySpecified {
+		// Prefixes are currently only supported for virtual tables.
+		return planDataSource{}, parser.NewInvalidNameErrorf(
+			"invalid table name: %q", parser.ErrString(tn))
 	}
-	desc, err := descFunc(tn)
+
+	desc, err := p.getTableDesc(ctx, tn)
 	if err != nil {
 		return planDataSource{}, err
 	}
 
+	return p.getPlanForDesc(ctx, desc, tn, hints, scanVisibility, nil)
+}
+
+func (p *planner) getTableDesc(
+	ctx context.Context, tn *parser.TableName,
+) (*sqlbase.TableDescriptor, error) {
+	if p.avoidCachedDescriptors {
+		// AS OF SYSTEM TIME queries need to fetch the table descriptor at the
+		// specified time, and never lease anything. The proto transaction already
+		// has its timestamps set correctly so getTableOrViewDesc will fetch with
+		// the correct timestamp.
+		return MustGetTableOrViewDesc(
+			ctx, p.txn, p.getVirtualTabler(), tn, false /*allowAdding*/)
+	}
+	return p.session.tables.getTableVersion(ctx, p.txn, p.getVirtualTabler(), tn)
+}
+
+func (p *planner) getPlanForDesc(
+	ctx context.Context,
+	desc *sqlbase.TableDescriptor,
+	tn *parser.TableName,
+	hints *parser.IndexHints,
+	scanVisibility scanVisibility,
+	wantedColumns []parser.ColumnID,
+) (planDataSource, error) {
 	if desc.IsView() {
-		return p.getViewPlan(tn, desc)
+		if wantedColumns != nil {
+			return planDataSource{},
+				errors.Errorf("cannot specify an explicit column list when accessing a view by reference")
+		}
+		return p.getViewPlan(ctx, tn, desc)
 	} else if !desc.IsTable() {
-		return planDataSource{},
-			errors.Errorf("unexpected table descriptor of type %s for %q", desc.TypeName(), tn)
+		return planDataSource{}, errors.Errorf(
+			"unexpected table descriptor of type %s for %q", desc.TypeName(), parser.ErrString(tn))
 	}
 
 	// This name designates a real table.
 	scan := p.Scan()
-	if err := scan.initTable(p, desc, hints, scanVisibility); err != nil {
+	if err := scan.initTable(p, desc, hints, scanVisibility, wantedColumns); err != nil {
 		return planDataSource{}, err
 	}
 
 	return planDataSource{
-		info: newSourceInfoForSingleTable(*tn, scan.Columns()),
+		info: newSourceInfoForSingleTable(*tn, planColumns(scan)),
 		plan: scan,
 	}, nil
 }
@@ -453,11 +582,9 @@ func (p *planner) getTableScanOrViewPlan(
 // getViewPlan builds a planDataSource for the view specified by the
 // table name and descriptor, expanding out its subquery plan.
 func (p *planner) getViewPlan(
-	tn *parser.TableName, desc *sqlbase.TableDescriptor,
+	ctx context.Context, tn *parser.TableName, desc *sqlbase.TableDescriptor,
 ) (planDataSource, error) {
-	// Parse the query as Traditional syntax because we know the query was
-	// saved in the descriptor by printing it with parser.Format.
-	stmt, err := parser.ParseOneTraditional(desc.ViewQuery)
+	stmt, err := parser.ParseOne(desc.ViewQuery)
 	if err != nil {
 		return planDataSource{}, errors.Wrapf(err, "failed to parse underlying query from view %q", tn)
 	}
@@ -473,50 +600,63 @@ func (p *planner) getViewPlan(
 	// SELECT privileges on the view, which is intended to allow for exposing
 	// some subset of a restricted table's data to less privileged users.
 	if !p.skipSelectPrivilegeChecks {
-		if err := p.checkPrivilege(desc, privilege.SELECT); err != nil {
+		if err := p.CheckPrivilege(desc, privilege.SELECT); err != nil {
 			return planDataSource{}, err
 		}
 		p.skipSelectPrivilegeChecks = true
 		defer func() { p.skipSelectPrivilegeChecks = false }()
 	}
 
+	// Register the dependency to the planner, if requested.
+	if p.planDeps != nil {
+		usedColumns := make([]sqlbase.ColumnID, len(desc.Columns))
+		for i := range desc.Columns {
+			usedColumns[i] = desc.Columns[i].ID
+		}
+		deps := p.planDeps[desc.ID]
+		deps.desc = desc
+		deps.deps = append(deps.deps, sqlbase.TableDescriptor_Reference{ColumnIDs: usedColumns})
+		p.planDeps[desc.ID] = deps
+
+		// We are only interested in the dependency to this view descriptor. Any
+		// further dependency by the view's query should not be tracked in this planner.
+		defer func(prev planDependencies) { p.planDeps = prev }(p.planDeps)
+		p.planDeps = nil
+	}
+
 	// TODO(a-robinson): Support ORDER BY and LIMIT in views. Is it as simple as
 	// just passing the entire select here or will inserting an ORDER BY in the
 	// middle of a query plan break things?
-	plan, err := p.getSubqueryPlan(sel.Select, makeResultColumns(desc.Columns))
-	if err != nil {
-		return plan, err
-	}
-	plan.info.viewDesc = desc
-	return plan, nil
+	return p.getSubqueryPlan(ctx, *tn, sel.Select, sqlbase.ResultColumnsFromColDescs(desc.Columns))
 }
 
 // getSubqueryPlan builds a planDataSource for a select statement, including
 // for simple VALUES statements.
 func (p *planner) getSubqueryPlan(
-	sel parser.SelectStatement, cols ResultColumns,
+	ctx context.Context, tn parser.TableName, sel parser.SelectStatement, cols sqlbase.ResultColumns,
 ) (planDataSource, error) {
-	plan, err := p.newPlan(sel, nil, false)
+	plan, err := p.newPlan(ctx, sel, nil)
 	if err != nil {
 		return planDataSource{}, err
 	}
 	if len(cols) == 0 {
-		cols = plan.Columns()
+		cols = planColumns(plan)
 	}
 	return planDataSource{
-		info: newSourceInfoForSingleTable(anonymousTable, cols),
+		info: newSourceInfoForSingleTable(tn, cols),
 		plan: plan,
 	}, nil
 }
 
-func (p *planner) getGeneratorPlan(t *parser.FuncExpr) (planDataSource, error) {
-	plan, name, err := p.makeGenerator(t)
+func (p *planner) getGeneratorPlan(
+	ctx context.Context, t *parser.FuncExpr,
+) (planDataSource, error) {
+	plan, err := p.makeGenerator(ctx, t)
 	if err != nil {
 		return planDataSource{}, err
 	}
-	tn := parser.TableName{TableName: parser.Name(name)}
 	return planDataSource{
-		info: newSourceInfoForSingleTable(tn, plan.Columns()),
+		info: newSourceInfoForSingleTable(anonymousTable, planColumns(plan)),
 		plan: plan,
 	}, nil
 }
@@ -525,21 +665,22 @@ func (p *planner) getGeneratorPlan(t *parser.FuncExpr) (planDataSource, error) {
 // expressions that correspond to the expansion of a star.
 func (src *dataSourceInfo) expandStar(
 	v parser.VarName, ivarHelper parser.IndexedVarHelper,
-) (columns ResultColumns, exprs []parser.TypedExpr, err error) {
+) (columns sqlbase.ResultColumns, exprs []parser.TypedExpr, err error) {
 	if len(src.sourceColumns) == 0 {
-		return nil, nil, fmt.Errorf("cannot use %q without a FROM clause", v)
+		return nil, nil, pgerror.NewErrorf(pgerror.CodeInvalidNameError,
+			"cannot use %q without a FROM clause", parser.ErrString(v))
 	}
 
 	colSel := func(idx int) {
 		col := src.sourceColumns[idx]
-		if !col.hidden {
+		if !col.Hidden {
 			ivar := ivarHelper.IndexedVar(idx)
-			columns = append(columns, ResultColumn{Name: col.Name, Typ: ivar.ResolvedType()})
+			columns = append(columns, sqlbase.ResultColumn{Name: col.Name, Typ: ivar.ResolvedType()})
 			exprs = append(exprs, ivar)
 		}
 	}
 
-	tableName := parser.TableName{}
+	tableName := parser.TableName{DBNameOriginallyOmitted: true}
 	if a, ok := v.(*parser.AllColumnsSelector); ok {
 		tableName = a.TableName
 	}
@@ -548,16 +689,14 @@ func (src *dataSourceInfo) expandStar(
 			colSel(i)
 		}
 	} else {
-		norm := tableName.NormalizedTableName()
-
-		qualifiedTn, err := src.checkDatabaseName(norm)
+		qualifiedTn, err := src.checkDatabaseName(tableName)
 		if err != nil {
 			return nil, nil, err
 		}
 
 		colRange, ok := src.sourceAliases.columnRange(qualifiedTn)
 		if !ok {
-			return nil, nil, fmt.Errorf("table %q not found", tableName.String())
+			return nil, nil, sqlbase.NewUndefinedRelationError(&tableName)
 		}
 		for _, i := range colRange {
 			colSel(i)
@@ -569,6 +708,22 @@ func (src *dataSourceInfo) expandStar(
 
 type multiSourceInfo []*dataSourceInfo
 
+func newUnknownSourceError(tn *parser.TableName) error {
+	return pgerror.NewErrorf(pgerror.CodeUndefinedTableError,
+		"source name %q not found in FROM clause", parser.ErrString(tn))
+}
+
+func newAmbiguousSourceError(t parser.Name, dbContext parser.Name) error {
+	if dbContext == "" {
+		return pgerror.NewErrorf(pgerror.CodeAmbiguousAliasError,
+			"ambiguous source name: %q", parser.ErrString(t))
+
+	}
+	return pgerror.NewErrorf(pgerror.CodeAmbiguousAliasError,
+		"ambiguous source name: %q (within database %q)",
+		parser.ErrString(t), parser.ErrString(dbContext))
+}
+
 // checkDatabaseName checks whether the given TableName is unambiguous
 // for the set of sources and if it is, qualifies the missing database name.
 func (sources multiSourceInfo) checkDatabaseName(tn parser.TableName) (parser.TableName, error) {
@@ -579,7 +734,7 @@ func (sources multiSourceInfo) checkDatabaseName(tn parser.TableName) (parser.Ta
 			for _, alias := range src.sourceAliases {
 				if alias.name.TableName == tn.TableName {
 					if found {
-						return parser.TableName{}, fmt.Errorf("ambiguous source name: %q", tn.TableName)
+						return parser.TableName{}, newAmbiguousSourceError(tn.TableName, "")
 					}
 					tn.DatabaseName = alias.name.DatabaseName
 					found = true
@@ -587,7 +742,7 @@ func (sources multiSourceInfo) checkDatabaseName(tn parser.TableName) (parser.Ta
 			}
 		}
 		if !found {
-			return parser.TableName{}, fmt.Errorf("source name %q not found in FROM clause", tn.TableName)
+			return parser.TableName{}, newUnknownSourceError(&tn)
 		}
 		return tn, nil
 	}
@@ -597,14 +752,13 @@ func (sources multiSourceInfo) checkDatabaseName(tn parser.TableName) (parser.Ta
 	for _, src := range sources {
 		if _, ok := src.sourceAliases.srcIdx(tn); ok {
 			if found {
-				return parser.TableName{}, fmt.Errorf("ambiguous source name: %q (within database %q)",
-					tn.TableName, tn.DatabaseName)
+				return parser.TableName{}, newAmbiguousSourceError(tn.TableName, tn.DatabaseName)
 			}
 			found = true
 		}
 	}
 	if !found {
-		return parser.TableName{}, fmt.Errorf("table %q not selected in FROM clause", &tn)
+		return parser.TableName{}, newUnknownSourceError(&tn)
 	}
 	return tn, nil
 }
@@ -618,21 +772,21 @@ func (src *dataSourceInfo) checkDatabaseName(tn parser.TableName) (parser.TableN
 		for _, alias := range src.sourceAliases {
 			if alias.name.TableName == tn.TableName {
 				if found {
-					return parser.TableName{}, fmt.Errorf("ambiguous source name: %q", tn.TableName)
+					return parser.TableName{}, newAmbiguousSourceError(tn.TableName, "")
 				}
 				found = true
 				tn.DatabaseName = alias.name.DatabaseName
 			}
 		}
 		if !found {
-			return parser.TableName{}, fmt.Errorf("source name %q not found in FROM clause", tn.TableName)
+			return parser.TableName{}, newUnknownSourceError(&tn)
 		}
 		return tn, nil
 	}
 
 	// Database given.
 	if _, found := src.sourceAliases.srcIdx(tn); !found {
-		return parser.TableName{}, fmt.Errorf("table %q not selected in FROM clause", &tn)
+		return parser.TableName{}, newUnknownSourceError(&tn)
 	}
 	return tn, nil
 }
@@ -642,17 +796,17 @@ func (src *dataSourceInfo) checkDatabaseName(tn parser.TableName) (parser.TableN
 // array and the column index for the column array of that
 // source. Returns invalid indices and an error if the source is not
 // found or the name is ambiguous.
-func (sources multiSourceInfo) findColumn(c *parser.ColumnItem) (srcIdx int, colIdx int, err error) {
+func (sources multiSourceInfo) findColumn(
+	c *parser.ColumnItem,
+) (srcIdx int, colIdx int, err error) {
 	if len(c.Selector) > 0 {
-		return invalidSrcIdx, invalidColIdx, util.UnimplementedWithIssueErrorf(8318, "compound types not supported yet: %q", c)
+		return invalidSrcIdx, invalidColIdx, pgerror.UnimplementedWithIssueErrorf(8318, "compound types not supported yet: %q", c)
 	}
 
-	colName := c.ColumnName.Normalize()
+	colName := string(c.ColumnName)
 	var tableName parser.TableName
 	if c.TableName.Table() != "" {
-		tableName = c.TableName.NormalizedTableName()
-
-		tn, err := sources.checkDatabaseName(tableName)
+		tn, err := sources.checkDatabaseName(c.TableName)
 		if err != nil {
 			return invalidSrcIdx, invalidColIdx, err
 		}
@@ -665,9 +819,10 @@ func (sources multiSourceInfo) findColumn(c *parser.ColumnItem) (srcIdx int, col
 
 	findColHelper := func(src *dataSourceInfo, iSrc, srcIdx, colIdx int, idx int) (int, int, error) {
 		col := src.sourceColumns[idx]
-		if parser.ReNormalizeName(col.Name) == colName {
+		if col.Name == colName {
 			if colIdx != invalidColIdx {
-				return invalidSrcIdx, invalidColIdx, fmt.Errorf("column reference %q is ambiguous", c)
+				return invalidSrcIdx, invalidColIdx, pgerror.NewErrorf(pgerror.CodeAmbiguousColumnError,
+					"column reference %q is ambiguous", parser.ErrString(c))
 			}
 			srcIdx = iSrc
 			colIdx = idx
@@ -705,7 +860,9 @@ func (sources multiSourceInfo) findColumn(c *parser.ColumnItem) (srcIdx int, col
 	}
 
 	if colIdx == invalidColIdx {
-		return invalidSrcIdx, invalidColIdx, fmt.Errorf("column name %q not found", c)
+		return invalidSrcIdx, invalidColIdx,
+			pgerror.NewErrorf(pgerror.CodeUndefinedColumnError,
+				"column name %q not found", parser.ErrString(c))
 	}
 
 	return srcIdx, colIdx, nil
@@ -725,7 +882,7 @@ func (src *dataSourceInfo) findTableAlias(colIdx int) (parser.TableName, bool) {
 }
 
 func (src *dataSourceInfo) FormatVar(buf *bytes.Buffer, f parser.FmtFlags, colIdx int) {
-	if f == parser.FmtQualify {
+	if f.ShowTableAliases {
 		tableAlias, found := src.findTableAlias(colIdx)
 		if found {
 			if tableAlias.TableName != "" {
@@ -740,5 +897,5 @@ func (src *dataSourceInfo) FormatVar(buf *bytes.Buffer, f parser.FmtFlags, colId
 			buf.WriteString("_.")
 		}
 	}
-	buf.WriteString(src.sourceColumns[colIdx].Name)
+	parser.Name(src.sourceColumns[colIdx].Name).Format(buf, f)
 }

@@ -11,14 +11,11 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Ben Darnell
 
 package pgwire
 
 import (
 	"crypto/tls"
-	"fmt"
 	"io"
 	"net"
 	"time"
@@ -29,7 +26,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/mon"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
-	"github.com/cockroachdb/cockroach/pkg/util"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/util/envutil"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/metric"
@@ -49,9 +46,15 @@ const (
 
 // Fully-qualified names for metrics.
 var (
-	MetaConns    = metric.Metadata{Name: "sql.conns"}
-	MetaBytesIn  = metric.Metadata{Name: "sql.bytesin"}
-	MetaBytesOut = metric.Metadata{Name: "sql.bytesout"}
+	MetaConns = metric.Metadata{
+		Name: "sql.conns",
+		Help: "Number of active sql connections"}
+	MetaBytesIn = metric.Metadata{
+		Name: "sql.bytesin",
+		Help: "Number of sql bytes received"}
+	MetaBytesOut = metric.Metadata{
+		Name: "sql.bytesout",
+		Help: "Number of sql bytes sent"}
 )
 
 const (
@@ -59,7 +62,14 @@ const (
 	versionSSL = 80877103
 )
 
-const drainMaxWait = 10 * time.Second
+const (
+	// drainMaxWait is the amount of time a draining server gives to sessions
+	// with ongoing transactions to finish work before cancellation.
+	drainMaxWait = 10 * time.Second
+	// cancelMaxWait is the amount of time a draining server gives to sessions
+	// to react to cancellation and return before a forceful shutdown.
+	cancelMaxWait = 1 * time.Second
+)
 
 // baseSQLMemoryBudget is the amount of memory pre-allocated in each connection.
 var baseSQLMemoryBudget = envutil.EnvOrDefaultInt64("COCKROACH_BASE_SQL_MEMORY_BUDGET",
@@ -74,6 +84,10 @@ var (
 	sslUnsupported = []byte{'N'}
 )
 
+// cancelChanMap keeps track of channels that are closed after the associated
+// cancellation function has been called and the cancellation has taken place.
+type cancelChanMap map[chan struct{}]context.CancelFunc
+
 // Server implements the server side of the PostgreSQL wire protocol.
 type Server struct {
 	AmbientCtx log.AmbientContext
@@ -84,11 +98,16 @@ type Server struct {
 
 	mu struct {
 		syncutil.Mutex
-		draining bool
+		// connCancelMap entries represent connections started when the server
+		// was not draining. Each value is a function that can be called to
+		// cancel the associated connection. The corresponding key is a channel
+		// that is closed when the connection is done.
+		connCancelMap cancelChanMap
+		draining      bool
 	}
 
-	sqlMemoryPool mon.MemoryMonitor
-	connMonitor   mon.MemoryMonitor
+	sqlMemoryPool mon.BytesMonitor
+	connMonitor   mon.BytesMonitor
 }
 
 // ServerMetrics is the set of metrics for the pgwire server.
@@ -102,13 +121,15 @@ type ServerMetrics struct {
 	internalMemMetrics *sql.MemoryMetrics
 }
 
-func makeServerMetrics(internalMemMetrics *sql.MemoryMetrics) ServerMetrics {
+func makeServerMetrics(
+	internalMemMetrics *sql.MemoryMetrics, histogramWindow time.Duration,
+) ServerMetrics {
 	return ServerMetrics{
 		Conns:              metric.NewCounter(MetaConns),
 		BytesInCount:       metric.NewCounter(MetaBytesIn),
 		BytesOutCount:      metric.NewCounter(MetaBytesOut),
-		ConnMemMetrics:     sql.MakeMemMetrics("conns"),
-		SQLMemMetrics:      sql.MakeMemMetrics("client"),
+		ConnMemMetrics:     sql.MakeMemMetrics("conns", histogramWindow),
+		SQLMemMetrics:      sql.MakeMemMetrics("client", histogramWindow),
 		internalMemMetrics: internalMemMetrics,
 	}
 }
@@ -129,25 +150,32 @@ func MakeServer(
 	cfg *base.Config,
 	executor *sql.Executor,
 	internalMemMetrics *sql.MemoryMetrics,
-	maxSQLMem int64,
+	parentMemoryMonitor *mon.BytesMonitor,
+	histogramWindow time.Duration,
 ) *Server {
 	server := &Server{
 		AmbientCtx: ambientCtx,
 		cfg:        cfg,
 		executor:   executor,
-		metrics:    makeServerMetrics(internalMemMetrics),
+		metrics:    makeServerMetrics(internalMemMetrics, histogramWindow),
 	}
 	server.sqlMemoryPool = mon.MakeMonitor("sql",
+		mon.MemoryResource,
 		server.metrics.SQLMemMetrics.CurBytesCount,
 		server.metrics.SQLMemMetrics.MaxBytesHist,
 		0, noteworthySQLMemoryUsageBytes)
-	server.sqlMemoryPool.Start(context.Background(), nil, mon.MakeStandaloneBudget(maxSQLMem))
+	server.sqlMemoryPool.Start(context.Background(), parentMemoryMonitor, mon.BoundAccount{})
 
 	server.connMonitor = mon.MakeMonitor("conn",
+		mon.MemoryResource,
 		server.metrics.ConnMemMetrics.CurBytesCount,
 		server.metrics.ConnMemMetrics.MaxBytesHist,
 		int64(connReservationBatchSize)*baseSQLMemoryBudget, noteworthyConnMemoryUsageBytes)
 	server.connMonitor.Start(context.Background(), &server.sqlMemoryPool, mon.BoundAccount{})
+
+	server.mu.Lock()
+	server.mu.connCancelMap = make(cancelChanMap)
+	server.mu.Unlock()
 
 	return server
 }
@@ -181,37 +209,123 @@ func (s *Server) Metrics() *ServerMetrics {
 
 // SetDraining (when called with 'true') prevents new connections from being
 // served and waits a reasonable amount of time for open connections to
-// terminate. If an error is returned, the server remains in draining state,
-// though open connections may continue to exist.
+// terminate before canceling them.
+// An error will be returned when connections that have been cancelled have not
+// responded to this cancellation and closed themselves in time. The server
+// will remain in draining state, though open connections may continue to
+// exist.
 // When called with 'false', switches back to the normal mode of operation in
 // which connections are accepted.
+// The RFC on drain modes has more information regarding the specifics of
+// what will happen to connections in different states:
+// https://github.com/cockroachdb/cockroach/blob/master/docs/RFCS/drain_modes.md
 func (s *Server) SetDraining(drain bool) error {
-	s.mu.Lock()
-	s.mu.draining = drain
-	s.mu.Unlock()
-	if !drain {
+	return s.setDrainingImpl(drain, drainMaxWait, cancelMaxWait)
+}
+
+func (s *Server) setDrainingImpl(
+	drain bool, drainWait time.Duration, cancelWait time.Duration,
+) error {
+	// This anonymous function returns a copy of s.mu.connCancelMap if there are
+	// any active connections to cancel. We will only attempt to cancel
+	// connections that were active at the moment the draining switch happened.
+	// It is enough to do this because:
+	// 1) If no new connections are added to the original map all connections
+	// will be cancelled.
+	// 2) If new connections are added to the original map, it follows that they
+	// were added when s.mu.draining = false, thus not requiring cancellation.
+	// These connections are not our responsibility and will be handled when the
+	// server starts draining again.
+	connCancelMap := func() cancelChanMap {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		if s.mu.draining == drain {
+			return nil
+		}
+		s.mu.draining = drain
+		if !drain {
+			return nil
+		}
+
+		connCancelMap := make(cancelChanMap)
+		for done, cancel := range s.mu.connCancelMap {
+			connCancelMap[done] = cancel
+		}
+		return connCancelMap
+	}()
+	if len(connCancelMap) == 0 {
 		return nil
 	}
-	return util.RetryForDuration(drainMaxWait, func() error {
-		if c := s.metrics.Conns.Count(); c != 0 {
-			// TODO(tschottdorf): Do more plumbing to actively disrupt
-			// connections; see #6283. There isn't much of a point until
-			// we know what load-balanced clients like to see (#6295).
-			return fmt.Errorf("timed out waiting for %d open connections to drain", c)
+
+	// Spin off a goroutine that waits for all connections to signal that they
+	// are done and reports it on allConnsDone. The main goroutine signals this
+	// goroutine to stop work through quitWaitingForConns.
+	allConnsDone := make(chan struct{})
+	quitWaitingForConns := make(chan struct{})
+	defer close(quitWaitingForConns)
+	go func() {
+		defer close(allConnsDone)
+		for done := range connCancelMap {
+			select {
+			case <-done:
+			case <-quitWaitingForConns:
+				return
+			}
 		}
+	}()
+
+	// Wait for all connections to finish up to drainWait.
+	select {
+	case <-time.After(drainWait):
+	case <-allConnsDone:
+	}
+
+	// Cancel the contexts of all sessions if the server is still in draining
+	// mode.
+	if stop := func() bool {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		if !s.mu.draining {
+			return true
+		}
+		for _, cancel := range connCancelMap {
+			// There is a possibility that different calls to SetDraining have
+			// overlapping connCancelMaps, but context.CancelFunc calls are
+			// idempotent.
+			cancel()
+		}
+		return false
+	}(); stop {
 		return nil
-	})
+	}
+
+	select {
+	case <-time.After(cancelWait):
+		return errors.Errorf("some sessions did not respond to cancellation within %s", cancelWait)
+	case <-allConnsDone:
+	}
+	return nil
 }
 
 // ServeConn serves a single connection, driving the handshake process
 // and delegating to the appropriate connection type.
 func (s *Server) ServeConn(ctx context.Context, conn net.Conn) error {
-	var draining bool
-	{
-		s.mu.Lock()
-		draining = s.mu.draining
-		s.mu.Unlock()
+	s.mu.Lock()
+	draining := s.mu.draining
+	if !draining {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithCancel(ctx)
+		done := make(chan struct{})
+		s.mu.connCancelMap[done] = cancel
+		defer func() {
+			cancel()
+			close(done)
+			s.mu.Lock()
+			delete(s.mu.connCancelMap, done)
+			s.mu.Unlock()
+		}()
 	}
+	s.mu.Unlock()
 
 	// If the Server is draining, we will use the connection only to send an
 	// error, so we don't count it in the stats. This makes sense since
@@ -270,10 +384,10 @@ func (s *Server) ServeConn(ctx context.Context, conn net.Conn) error {
 		// We make a connection before anything. If there is an error
 		// parsing the connection arguments, the connection will only be
 		// used to send a report of that error.
-		v3conn := makeV3Conn(ctx, conn, &s.metrics, &s.sqlMemoryPool, s.executor)
+		v3conn := makeV3Conn(conn, &s.metrics, &s.sqlMemoryPool, s.executor)
 		defer v3conn.finish(ctx)
 
-		if v3conn.sessionArgs, err = parseOptions(buf.msg); err != nil {
+		if v3conn.sessionArgs, err = parseOptions(ctx, buf.msg); err != nil {
 			return v3conn.sendInternalError(err.Error())
 		}
 
@@ -281,9 +395,7 @@ func (s *Server) ServeConn(ctx context.Context, conn net.Conn) error {
 			return v3conn.sendInternalError(ErrSSLRequired)
 		}
 		if draining {
-			// TODO(tschottdorf): Likely not handled gracefully by clients.
-			// See #6295.
-			return v3conn.sendInternalError(ErrDraining)
+			return v3conn.sendError(newAdminShutdownErr(errors.New(ErrDraining)))
 		}
 
 		v3conn.sessionArgs.User = parser.Name(v3conn.sessionArgs.User).Normalize()
@@ -300,13 +412,19 @@ func (s *Server) ServeConn(ctx context.Context, conn net.Conn) error {
 		// authentication has completed successfully, so as to prevent a DoS
 		// attack: many open-but-unauthenticated connections that exhaust
 		// the memory available to connections already open.
-		acc := s.connMonitor.MakeBoundAccount(ctx)
-		if err := acc.Grow(baseSQLMemoryBudget); err != nil {
+		acc := s.connMonitor.MakeBoundAccount()
+		if err := acc.Grow(ctx, baseSQLMemoryBudget); err != nil {
 			return errors.Errorf("unable to pre-allocate %d bytes for this connection: %v",
 				baseSQLMemoryBudget, err)
 		}
 
-		return v3conn.serve(ctx, acc)
+		err := v3conn.serve(ctx, s.IsDraining, acc)
+		// If the error that closed the connection is related to an
+		// administrative shutdown, relay that information to the client.
+		if pgErr, ok := pgerror.GetPGCause(err); ok && pgErr.Code == pgerror.CodeAdminShutdownError {
+			return v3conn.sendError(err)
+		}
+		return err
 	}
 
 	return errors.Errorf("unknown protocol version %d", version)

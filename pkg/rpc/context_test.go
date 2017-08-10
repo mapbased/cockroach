@@ -11,80 +11,104 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Spencer Kimball (spencer.kimball@gmail.com)
 
 package rpc
 
 import (
+	"math"
 	"net"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/pkg/errors"
+	"golang.org/x/net/context"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials"
+	"google.golang.org/grpc/keepalive"
 
+	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/util"
+	"github.com/cockroachdb/cockroach/pkg/util/grpcutil"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/netutil"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
+	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 )
 
-func newTestServer(t *testing.T, ctx *Context, manual bool) (*grpc.Server, net.Listener) {
+func newTestServer(t testing.TB, ctx *Context, compression bool) *grpc.Server {
 	tlsConfig, err := ctx.GetServerTLSConfig()
 	if err != nil {
 		t.Fatal(err)
 	}
-	s := grpc.NewServer(grpc.Creds(credentials.NewTLS(tlsConfig)))
-
-	ln, err := netutil.ListenAndServeGRPC(ctx.Stopper, s, util.TestAddr)
-	if err != nil {
-		t.Fatal(err)
+	opts := []grpc.ServerOption{
+		grpc.Creds(credentials.NewTLS(tlsConfig)),
+		grpc.RPCDecompressor(snappyDecompressor{}),
 	}
-
-	return s, ln
+	if compression {
+		opts = append(opts, grpc.RPCCompressor(snappyCompressor{}))
+	}
+	return grpc.NewServer(opts...)
 }
 
 func TestHeartbeatCB(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
-	stopper := stop.NewStopper()
-	defer stopper.Stop()
+	for _, compression := range []bool{false, true} {
+		t.Run("", func(t *testing.T) {
+			stopper := stop.NewStopper()
+			defer stopper.Stop(context.TODO())
 
-	clock := hlc.NewClock(time.Unix(0, 20).UnixNano, time.Nanosecond)
-	serverCtx := newNodeTestContext(clock, stopper)
-	s, ln := newTestServer(t, serverCtx, true)
-	remoteAddr := ln.Addr().String()
+			clock := hlc.NewClock(time.Unix(0, 20).UnixNano, time.Nanosecond)
+			serverCtx := NewContext(log.AmbientContext{Tracer: tracing.NewTracer()}, testutils.NewNodeTestBaseContext(), clock, stopper)
+			serverCtx.rpcCompression = compression
+			s := newTestServer(t, serverCtx, true)
+			RegisterHeartbeatServer(s, &HeartbeatService{
+				clock:              clock,
+				remoteClockMonitor: serverCtx.RemoteClocks,
+			})
 
-	RegisterHeartbeatServer(s, &HeartbeatService{
-		clock:              clock,
-		remoteClockMonitor: serverCtx.RemoteClocks,
-	})
+			ln, err := netutil.ListenAndServeGRPC(serverCtx.Stopper, s, util.TestAddr)
+			if err != nil {
+				t.Fatal(err)
+			}
+			remoteAddr := ln.Addr().String()
 
-	// Clocks don't matter in this test.
-	clientCtx := newNodeTestContext(clock, stopper)
+			// Clocks don't matter in this test.
+			clientCtx := NewContext(log.AmbientContext{Tracer: tracing.NewTracer()}, testutils.NewNodeTestBaseContext(), clock, stopper)
+			clientCtx.rpcCompression = compression
 
-	var once sync.Once
-	ch := make(chan struct{})
+			var once sync.Once
+			ch := make(chan struct{})
 
-	clientCtx.HeartbeatCB = func() {
-		once.Do(func() {
-			close(ch)
+			clientCtx.HeartbeatCB = func() {
+				once.Do(func() {
+					close(ch)
+				})
+			}
+
+			if _, err := clientCtx.GRPCDial(remoteAddr); err != nil {
+				t.Fatal(err)
+			}
+
+			<-ch
 		})
 	}
+}
 
-	_, err := clientCtx.GRPCDial(remoteAddr)
-	if err != nil {
-		t.Fatal(err)
-	}
+type internalServer struct{}
 
-	<-ch
+func (*internalServer) Batch(
+	context.Context, *roachpb.BatchRequest,
+) (*roachpb.BatchResponse, error) {
+	return nil, nil
 }
 
 // TestHeartbeatHealth verifies that the health status changes after
@@ -93,99 +117,116 @@ func TestHeartbeatHealth(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
 	stopper := stop.NewStopper()
-	defer stopper.Stop()
+	defer stopper.Stop(context.TODO())
 
 	// Can't be zero because that'd be an empty offset.
 	clock := hlc.NewClock(time.Unix(0, 1).UnixNano, time.Nanosecond)
 
-	serverCtx := newNodeTestContext(clock, stopper)
-	s, ln := newTestServer(t, serverCtx, true)
-	remoteAddr := ln.Addr().String()
+	serverCtx := NewContext(log.AmbientContext{Tracer: tracing.NewTracer()}, testutils.NewNodeTestBaseContext(), clock, stopper)
+	s := newTestServer(t, serverCtx, true)
 
 	heartbeat := &ManualHeartbeatService{
-		ready:              make(chan struct{}),
+		ready:              make(chan error),
 		stopper:            stopper,
 		clock:              clock,
 		remoteClockMonitor: serverCtx.RemoteClocks,
 	}
 	RegisterHeartbeatServer(s, heartbeat)
 
-	clientCtx := newNodeTestContext(clock, stopper)
-	// Make the intervals and timeouts shorter to speed up the tests.
-	clientCtx.HeartbeatInterval = 1 * time.Millisecond
-	clientCtx.HeartbeatTimeout = 1 * time.Millisecond
+	ln, err := netutil.ListenAndServeGRPC(serverCtx.Stopper, s, util.TestAddr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	remoteAddr := ln.Addr().String()
+
+	clientCtx := NewContext(log.AmbientContext{Tracer: tracing.NewTracer()}, testutils.NewNodeTestBaseContext(), clock, stopper)
+	clientCtx.Addr = "localserver"
+	// Make the interval shorter to speed up the test.
+	clientCtx.heartbeatInterval = 1 * time.Millisecond
 	if _, err := clientCtx.GRPCDial(remoteAddr); err != nil {
 		t.Fatal(err)
 	}
 
-	// This code is inherently racy so when we need to verify heartbeats we
-	// want them to always succeed.
-	sendHeartbeats := func() func() {
-		done := make(chan struct{})
-		go func() {
-			for {
-				select {
-				case <-done:
-					return
-				case heartbeat.ready <- struct{}{}:
-				}
+	errFailedHeartbeat := errors.New("failed heartbeat")
+
+	var hbSuccess atomic.Value
+	hbSuccess.Store(true)
+
+	go func() {
+		for {
+			var err error
+			if !hbSuccess.Load().(bool) {
+				err = errFailedHeartbeat
 			}
-		}()
-		return func() {
-			done <- struct{}{}
+
+			select {
+			case <-stopper.ShouldStop():
+				return
+			case heartbeat.ready <- err:
+			}
 		}
-	}
-
-	// Should be unhealthy in the absence of heartbeats.
-	if clientCtx.IsConnHealthy(remoteAddr) {
-		t.Fatalf("expected %s to be unhealthy", remoteAddr)
-	}
-
-	func() {
-		defer sendHeartbeats()()
-
-		// Should become healthy in the presence of heartbeats.
-		testutils.SucceedsSoon(t, func() error {
-			if !clientCtx.IsConnHealthy(remoteAddr) {
-				return errors.Errorf("expected %s to be healthy", remoteAddr)
-			}
-			return nil
-		})
 	}()
 
-	// Should become unhealthy again in the absence of heartbeats.
+	// Wait for the connection.
 	testutils.SucceedsSoon(t, func() error {
-		if clientCtx.IsConnHealthy(remoteAddr) {
-			return errors.Errorf("expected %s to be unhealthy", remoteAddr)
+		err := clientCtx.ConnHealth(remoteAddr)
+		if err != nil && err != ErrNotHeartbeated {
+			t.Fatal(err)
+		}
+		return err
+	})
+
+	// Should be unhealthy in the presence of failing heartbeats.
+	hbSuccess.Store(false)
+	testutils.SucceedsSoon(t, func() error {
+		if err := clientCtx.ConnHealth(remoteAddr); !testutils.IsError(err, errFailedHeartbeat.Error()) {
+			return errors.Errorf("unexpected error: %v", err)
 		}
 		return nil
 	})
 
-	func() {
-		defer sendHeartbeats()()
+	// Should become healthy in the presence of successful heartbeats.
+	hbSuccess.Store(true)
+	testutils.SucceedsSoon(t, func() error {
+		return clientCtx.ConnHealth(remoteAddr)
+	})
 
-		// Should become healthy again in the presence of heartbeats.
-		testutils.SucceedsSoon(t, func() error {
-			if !clientCtx.IsConnHealthy(remoteAddr) {
-				return errors.Errorf("expected %s to be healthy", remoteAddr)
-			}
-			return nil
-		})
-	}()
+	// Should become unhealthy again in the presence of failing heartbeats.
+	hbSuccess.Store(false)
+	testutils.SucceedsSoon(t, func() error {
+		if err := clientCtx.ConnHealth(remoteAddr); !testutils.IsError(err, errFailedHeartbeat.Error()) {
+			return errors.Errorf("unexpected error: %v", err)
+		}
+		return nil
+	})
 
-	if clientCtx.IsConnHealthy("non-existent connection") {
-		t.Errorf("non-existent connection is reported as healthy")
+	// Should become healthy in the presence of successful heartbeats.
+	hbSuccess.Store(true)
+	testutils.SucceedsSoon(t, func() error {
+		return clientCtx.ConnHealth(remoteAddr)
+	})
+
+	if err := clientCtx.ConnHealth("non-existent connection"); err != ErrNotConnected {
+		t.Errorf("unexpected error: %v", err)
+	}
+
+	if err := clientCtx.ConnHealth(clientCtx.Addr); err != ErrNotConnected {
+		t.Errorf("unexpected error: %v", err)
+	}
+
+	clientCtx.SetLocalInternalServer(&internalServer{})
+
+	if err := clientCtx.ConnHealth(clientCtx.Addr); err != nil {
+		t.Error(err)
 	}
 }
 
 type interceptingListener struct {
 	net.Listener
-	connectChan chan struct{}
-	connCB      func(net.Conn)
+	connCB func(net.Conn)
 }
 
 func (ln *interceptingListener) Accept() (net.Conn, error) {
-	<-ln.connectChan
 	conn, err := ln.Listener.Accept()
 	if err == nil {
 		ln.connCB(conn)
@@ -198,19 +239,29 @@ func (ln *interceptingListener) Accept() (net.Conn, error) {
 func TestHeartbeatHealthTransport(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
+	if runtime.GOOS == "windows" {
+		t.Skip("TODO(tamird): remove in Go 1.9; https://github.com/golang/go/commit/03d1aa6")
+	}
+
 	stopper := stop.NewStopper()
-	defer stopper.Stop()
+	defer stopper.Stop(context.TODO())
 
 	// Can't be zero because that'd be an empty offset.
 	clock := hlc.NewClock(time.Unix(0, 1).UnixNano, time.Nanosecond)
 
-	serverCtx := newNodeTestContext(clock, stopper)
+	serverCtx := NewContext(log.AmbientContext{Tracer: tracing.NewTracer()}, testutils.NewNodeTestBaseContext(), clock, stopper)
 	// newTestServer with a custom listener.
 	tlsConfig, err := serverCtx.GetServerTLSConfig()
 	if err != nil {
 		t.Fatal(err)
 	}
-	s := grpc.NewServer(grpc.Creds(credentials.NewTLS(tlsConfig)))
+	s := grpc.NewServer(
+		grpc.RPCDecompressor(snappyDecompressor{}), grpc.Creds(credentials.NewTLS(tlsConfig)))
+	RegisterHeartbeatServer(s, &HeartbeatService{
+		clock:              clock,
+		remoteClockMonitor: serverCtx.RemoteClocks,
+	})
+
 	ln, err := net.Listen("tcp", util.TestAddr.String())
 	if err != nil {
 		t.Fatal(err)
@@ -219,98 +270,91 @@ func TestHeartbeatHealthTransport(t *testing.T) {
 		syncutil.Mutex
 		conns []net.Conn
 	}{}
-	connectChan := make(chan struct{})
-	defer close(connectChan)
-	ln = &interceptingListener{Listener: ln, connectChan: connectChan, connCB: func(conn net.Conn) {
+	ln = &interceptingListener{Listener: ln, connCB: func(conn net.Conn) {
 		mu.Lock()
 		mu.conns = append(mu.conns, conn)
 		mu.Unlock()
 	}}
-	stopper.RunWorker(func() {
+	stopper.RunWorker(context.TODO(), func(context.Context) {
 		<-stopper.ShouldQuiesce()
 		netutil.FatalIfUnexpected(ln.Close())
 		<-stopper.ShouldStop()
 		s.Stop()
 	})
 
-	stopper.RunWorker(func() {
+	stopper.RunWorker(context.TODO(), func(context.Context) {
 		netutil.FatalIfUnexpected(s.Serve(ln))
 	})
 
 	remoteAddr := ln.Addr().String()
 
-	RegisterHeartbeatServer(s, &HeartbeatService{
-		clock:              clock,
-		remoteClockMonitor: serverCtx.RemoteClocks,
-	})
-
-	clientCtx := newNodeTestContext(clock, stopper)
-	// Make the intervals shorter to speed up the tests.
-	clientCtx.HeartbeatInterval = 1 * time.Millisecond
+	clientCtx := NewContext(log.AmbientContext{Tracer: tracing.NewTracer()}, testutils.NewNodeTestBaseContext(), clock, stopper)
+	// Make the interval shorter to speed up the test.
+	clientCtx.heartbeatInterval = 1 * time.Millisecond
 	if _, err := clientCtx.GRPCDial(remoteAddr); err != nil {
 		t.Fatal(err)
 	}
-	// Allow the connection to go through.
-	connectChan <- struct{}{}
-
 	// Everything is normal; should become healthy.
 	testutils.SucceedsSoon(t, func() error {
-		if !clientCtx.IsConnHealthy(remoteAddr) {
-			return errors.Errorf("expected %s to be healthy", remoteAddr)
-		}
-		return nil
+		return clientCtx.ConnHealth(remoteAddr)
 	})
 
-	closeConns := func() {
+	closeConns := func() error {
 		mu.Lock()
-		for _, conn := range mu.conns {
-			if err := conn.Close(); err != nil {
-				t.Fatal(err)
+		defer mu.Unlock()
+
+		for i := len(mu.conns) - 1; i >= 0; i-- {
+			if err := mu.conns[i].Close(); err != nil {
+				return err
 			}
+			mu.conns = mu.conns[:i]
 		}
-		mu.conns = mu.conns[:0]
-		mu.Unlock()
+		return nil
 	}
 
-	// Close all the connections.
-	closeConns()
-
-	// Should become unhealthy now that the connection was closed.
 	testutils.SucceedsSoon(t, func() error {
-		if clientCtx.IsConnHealthy(remoteAddr) {
-			return errors.Errorf("expected %s to be unhealthy", remoteAddr)
+		// Close all the connections until we see a failure.
+		if err := closeConns(); err != nil {
+			t.Fatal(err)
+		}
+
+		if err := clientCtx.ConnHealth(remoteAddr); grpc.Code(err) != codes.Unavailable {
+			return errors.Errorf("unexpected error: %v", err)
 		}
 		return nil
 	})
 
 	// Should become healthy again after GRPC reconnects.
-	connectChan <- struct{}{}
 	testutils.SucceedsSoon(t, func() error {
-		if !clientCtx.IsConnHealthy(remoteAddr) {
-			return errors.Errorf("expected %s to be healthy", remoteAddr)
-		}
-		return nil
+		return clientCtx.ConnHealth(remoteAddr)
 	})
 
 	// Close the listener and all the connections.
+	//
+	// NB: Closing the connections is done in the retry loop below because
+	// sometimes the call to `ln.Close` interleaves with a connection attempt in
+	// such a way that a connection manages to slip through.
 	if err := ln.Close(); err != nil {
 		t.Fatal(err)
 	}
-	closeConns()
 
 	// Should become unhealthy again now that the connection was closed.
 	testutils.SucceedsSoon(t, func() error {
-		if clientCtx.IsConnHealthy(remoteAddr) {
-			return errors.Errorf("expected %s to be unhealthy", remoteAddr)
+		if err := closeConns(); err != nil {
+			t.Fatal(err)
+		}
+
+		if err := clientCtx.ConnHealth(remoteAddr); grpc.Code(err) != codes.Unavailable {
+			return errors.Errorf("unexpected error: %v", err)
 		}
 		return nil
 	})
 
 	// Should stay unhealthy despite reconnection attempts.
 	errUnhealthy := errors.New("connection is still unhealthy")
-	if err := util.RetryForDuration(100*clientCtx.HeartbeatInterval, func() error {
-		if clientCtx.IsConnHealthy(remoteAddr) {
-			return errors.Errorf("expected %s to be unhealthy", remoteAddr)
+	if err := util.RetryForDuration(100*clientCtx.heartbeatInterval, func() error {
+		if err := clientCtx.ConnHealth(remoteAddr); grpc.Code(err) != codes.Unavailable {
+			return errors.Errorf("unexpected error: %v", err)
 		}
 		return errUnhealthy
 	}); err != errUnhealthy {
@@ -322,23 +366,29 @@ func TestOffsetMeasurement(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
 	stopper := stop.NewStopper()
-	defer stopper.Stop()
+	defer stopper.Stop(context.TODO())
 
 	serverTime := time.Unix(0, 20)
 	serverClock := hlc.NewClock(serverTime.UnixNano, time.Nanosecond)
-	serverCtx := newNodeTestContext(serverClock, stopper)
-	s, ln := newTestServer(t, serverCtx, true)
-	remoteAddr := ln.Addr().String()
-
+	serverCtx := NewContext(log.AmbientContext{Tracer: tracing.NewTracer()}, testutils.NewNodeTestBaseContext(), serverClock, stopper)
+	s := newTestServer(t, serverCtx, true)
 	RegisterHeartbeatServer(s, &HeartbeatService{
 		clock:              serverClock,
 		remoteClockMonitor: serverCtx.RemoteClocks,
 	})
 
+	ln, err := netutil.ListenAndServeGRPC(serverCtx.Stopper, s, util.TestAddr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	remoteAddr := ln.Addr().String()
+
 	// Create a client clock that is behind the server clock.
 	clientAdvancing := AdvancingClock{time: time.Unix(0, 10)}
 	clientClock := hlc.NewClock(clientAdvancing.UnixNano, time.Nanosecond)
-	clientCtx := newNodeTestContext(clientClock, stopper)
+	clientCtx := NewContext(log.AmbientContext{Tracer: tracing.NewTracer()}, testutils.NewNodeTestBaseContext(), clientClock, stopper)
+	// Make the interval shorter to speed up the test.
+	clientCtx.heartbeatInterval = 1 * time.Millisecond
 	clientCtx.RemoteClocks.offsetTTL = 5 * clientAdvancing.getAdvancementInterval()
 	if _, err := clientCtx.GRPCDial(remoteAddr); err != nil {
 		t.Fatal(err)
@@ -377,32 +427,36 @@ func TestFailedOffsetMeasurement(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
 	stopper := stop.NewStopper()
-	defer stopper.Stop()
+	defer stopper.Stop(context.TODO())
 
 	// Can't be zero because that'd be an empty offset.
 	clock := hlc.NewClock(time.Unix(0, 1).UnixNano, time.Nanosecond)
 
-	serverCtx := newNodeTestContext(clock, stopper)
-	s, ln := newTestServer(t, serverCtx, true)
-	remoteAddr := ln.Addr().String()
-
+	serverCtx := NewContext(log.AmbientContext{Tracer: tracing.NewTracer()}, testutils.NewNodeTestBaseContext(), clock, stopper)
+	s := newTestServer(t, serverCtx, true)
 	heartbeat := &ManualHeartbeatService{
 		clock:              clock,
 		remoteClockMonitor: serverCtx.RemoteClocks,
-		ready:              make(chan struct{}),
+		ready:              make(chan error),
 		stopper:            stopper,
 	}
 	RegisterHeartbeatServer(s, heartbeat)
 
+	ln, err := netutil.ListenAndServeGRPC(serverCtx.Stopper, s, util.TestAddr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	remoteAddr := ln.Addr().String()
+
 	// Create a client that never receives a heartbeat after the first.
-	clientCtx := newNodeTestContext(clock, stopper)
-	// Increase the timeout so that failure arises from exceeding the maximum
+	clientCtx := NewContext(log.AmbientContext{Tracer: tracing.NewTracer()}, testutils.NewNodeTestBaseContext(), clock, stopper)
+	// Remove the timeout so that failure arises from exceeding the maximum
 	// clock reading delay, not the timeout.
-	clientCtx.HeartbeatTimeout = 20 * clientCtx.HeartbeatInterval
+	clientCtx.heartbeatTimeout = 0
 	if _, err := clientCtx.GRPCDial(remoteAddr); err != nil {
 		t.Fatal(err)
 	}
-	heartbeat.ready <- struct{}{} // Allow one heartbeat for initialization.
+	heartbeat.ready <- nil // Allow one heartbeat for initialization.
 
 	testutils.SucceedsSoon(t, func() error {
 		clientCtx.RemoteClocks.mu.Lock()
@@ -455,7 +509,7 @@ func TestRemoteOffsetUnhealthy(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
 	stopper := stop.NewStopper()
-	defer stopper.Stop()
+	defer stopper.Stop(context.TODO())
 
 	const maxOffset = 100 * time.Millisecond
 
@@ -478,14 +532,18 @@ func TestRemoteOffsetUnhealthy(t *testing.T) {
 	for i := range nodeCtxs {
 		clock := hlc.NewClock(start.Add(nodeCtxs[i].offset).UnixNano, maxOffset)
 		nodeCtxs[i].errChan = make(chan error, 1)
-		nodeCtxs[i].ctx = newNodeTestContext(clock, stopper)
-		nodeCtxs[i].ctx.HeartbeatInterval = maxOffset
+		nodeCtxs[i].ctx = NewContext(log.AmbientContext{Tracer: tracing.NewTracer()}, testutils.NewNodeTestBaseContext(), clock, stopper)
+		nodeCtxs[i].ctx.heartbeatInterval = maxOffset
 
-		s, ln := newTestServer(t, nodeCtxs[i].ctx, true)
+		s := newTestServer(t, nodeCtxs[i].ctx, true)
 		RegisterHeartbeatServer(s, &HeartbeatService{
 			clock:              clock,
 			remoteClockMonitor: nodeCtxs[i].ctx.RemoteClocks,
 		})
+		ln, err := netutil.ListenAndServeGRPC(nodeCtxs[i].ctx.Stopper, s, util.TestAddr)
+		if err != nil {
+			t.Fatal(err)
+		}
 		nodeCtxs[i].ctx.Addr = ln.Addr().String()
 	}
 
@@ -516,17 +574,160 @@ func TestRemoteOffsetUnhealthy(t *testing.T) {
 
 	for i, nodeCtx := range nodeCtxs {
 		if nodeOffset := nodeCtx.offset; nodeOffset > maxOffset {
-			if err := nodeCtx.ctx.RemoteClocks.VerifyClockOffset(); testutils.IsError(err, errOffsetGreaterThanMaxOffset) {
+			if err := nodeCtx.ctx.RemoteClocks.VerifyClockOffset(nodeCtx.ctx.masterCtx); testutils.IsError(err, errOffsetGreaterThanMaxOffset) {
 				t.Logf("max offset: %s - node %d with excessive clock offset of %s returned expected error: %s", maxOffset, i, nodeOffset, err)
 			} else {
 				t.Errorf("max offset: %s - node %d with excessive clock offset of %s returned unexpected error: %v", maxOffset, i, nodeOffset, err)
 			}
 		} else {
-			if err := nodeCtx.ctx.RemoteClocks.VerifyClockOffset(); err != nil {
+			if err := nodeCtx.ctx.RemoteClocks.VerifyClockOffset(nodeCtx.ctx.masterCtx); err != nil {
 				t.Errorf("max offset: %s - node %d with acceptable clock offset of %s returned unexpected error: %s", maxOffset, i, nodeOffset, err)
 			} else {
 				t.Logf("max offset: %s - node %d with acceptable clock offset of %s did not return an error, as expected", maxOffset, i, nodeOffset)
 			}
 		}
 	}
+}
+
+// This is a smoketest for gRPC Keepalives: rpc.Context asks gRPC to perform
+// periodic pings on the transport to check that it's still alive. If the ping
+// doesn't get a pong within a timeout, the transport is supposed to be closed -
+// that's what we're testing here.
+func TestGRPCKeepaliveFailureFailsInflightRPCs(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	stopper := stop.NewStopper()
+	defer stopper.Stop(context.TODO())
+
+	clock := hlc.NewClock(time.Unix(0, 20).UnixNano, time.Nanosecond)
+	serverCtx := NewContext(
+		log.AmbientContext{Tracer: tracing.NewTracer()},
+		testutils.NewNodeTestBaseContext(),
+		clock,
+		stopper,
+	)
+	s := newTestServer(t, serverCtx, true)
+	RegisterHeartbeatServer(s, &HeartbeatService{
+		clock:              clock,
+		remoteClockMonitor: serverCtx.RemoteClocks,
+	})
+
+	ln, err := netutil.ListenAndServeGRPC(serverCtx.Stopper, s, util.TestAddr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	remoteAddr := ln.Addr().String()
+
+	clientCtx := NewContext(
+		log.AmbientContext{Tracer: tracing.NewTracer()}, testutils.NewNodeTestBaseContext(), clock, stopper)
+	// Disable automatic heartbeats. We'll send them by hand.
+	clientCtx.heartbeatInterval = math.MaxInt64
+
+	var firstConn int32 = 1
+
+	// We're going to open RPC transport connections using a dialer that returns
+	// PartitionableConns. We'll partition the first opened connection.
+	dialerCh := make(chan *testutils.PartitionableConn, 1)
+	conn, err := clientCtx.GRPCDial(remoteAddr,
+		grpc.WithDialer(
+			func(addr string, timeout time.Duration) (net.Conn, error) {
+				if !atomic.CompareAndSwapInt32(&firstConn, 1, 0) {
+					// If we allow gRPC to open a 2nd transport connection, then our RPCs
+					// might succeed if they're sent on that one. In the spirit of a
+					// partition, we'll return errors for the attempt to open a new
+					// connection (albeit for a TCP connection the error would come after
+					// a socket connect timeout).
+					return nil, errors.Errorf("No more connections for you. We're partitioned.")
+				}
+
+				conn, err := net.DialTimeout("tcp", addr, timeout)
+				if err != nil {
+					return nil, err
+				}
+				transportConn := testutils.NewPartitionableConn(conn)
+				dialerCh <- transportConn
+				return transportConn, nil
+			}),
+		// Override the keepalive settings that the rpc.Context uses to more
+		// aggressive ones, so that the test doesn't take long.
+		grpc.WithKeepaliveParams(
+			keepalive.ClientParameters{
+				// The aggressively low timeout we set here makes the connection very
+				// flaky for any RPC use, particularly when running under stress with -p
+				// 100. This test can't expect any RPCs to succeed reliably.
+				Time:                time.Millisecond,
+				Timeout:             5 * time.Millisecond,
+				PermitWithoutStream: false,
+			}),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = conn.Close() }()
+
+	// Perform an RPC so that a connection gets opened. In theory this RPC should
+	// succeed (and it does when running without too much stress), but we can't
+	// rely on that - it's possible that the RPC call could return earlier due to
+	// its transport connection being closed because of heartbeats timing out.
+	heartbeatClient := NewHeartbeatClient(conn)
+	request := PingRequest{}
+	if _, err := heartbeatClient.Ping(context.TODO(), &request); err != nil {
+		if !grpcutil.IsClosedConnection(err) {
+			t.Fatal(err)
+		}
+		// In the rare eventuality that we got the expected error, this test
+		// succeeded: even though we didn't partition the connection, the low gRPC
+		// keepalive timeout caused our RPC to fail (happens occasionally under
+		// stress -p 100). We're going to let the rest of the test code run, to make
+		// sure it's exercised.
+		//
+		// If the heartbeats didn't timeout (the normal case), we're going to
+		// simulate a network partition and then the heartbeats must timeout.
+		log.Infof(context.TODO(), "first RPC failed")
+	}
+
+	// Now partition client->server and attempt to perform an RPC. We expect it to
+	// fail once the grpc keepalive fails to get a response from the server.
+
+	transportConn := <-dialerCh
+	defer transportConn.Finish()
+
+	transportConn.PartitionC2S()
+
+	if _, err := heartbeatClient.Ping(context.TODO(), &request); !grpcutil.IsClosedConnection(err) {
+		t.Fatal(err)
+	}
+
+	// If the DialOptions we passed to gRPC didn't prevent it from opening new
+	// connections, then next RPCs would succeed since gRPC reconnects the
+	// transport (and that would succeed here since we've only partitioned one
+	// connection). We could further test that the status reported by
+	// Context.ConnHealth() for the remote node moves to UNAVAILABLE because of
+	// the (application-level) heartbeats performed by rpc.Context, but the
+	// behaviour of our heartbeats in the face of transport failures is
+	// sufficiently tested in TestHeartbeatHealthTransport.
+}
+
+func BenchmarkGRPCDial(b *testing.B) {
+	stopper := stop.NewStopper()
+	defer stopper.Stop(context.TODO())
+
+	clock := hlc.NewClock(hlc.UnixNano, 250*time.Millisecond)
+	ctx := NewContext(log.AmbientContext{Tracer: tracing.NewTracer()}, testutils.NewNodeTestBaseContext(), clock, stopper)
+
+	s := newTestServer(b, ctx, false)
+	ln, err := netutil.ListenAndServeGRPC(ctx.Stopper, s, util.TestAddr)
+	if err != nil {
+		b.Fatal(err)
+	}
+	remoteAddr := ln.Addr().String()
+
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			_, err := ctx.GRPCDial(remoteAddr)
+			if err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
 }

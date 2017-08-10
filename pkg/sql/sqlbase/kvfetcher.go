@@ -11,9 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Peter Mattis (peter@cockroachlabs.com)
-// Author: Radu Berinde (radu@cockroachlabs.com)
 
 package sqlbase
 
@@ -23,12 +20,13 @@ import (
 	"strings"
 
 	"github.com/pkg/errors"
+	"golang.org/x/net/context"
 
 	"github.com/cockroachdb/cockroach/pkg/internal/client"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 )
 
-// prettyKey pretty-prints the specified key, skipping over the first `skip`
+// PrettyKey pretty-prints the specified key, skipping over the first `skip`
 // fields. The pretty printed key looks like:
 //
 //   /Table/<tableID>/<indexID>/...
@@ -37,7 +35,7 @@ import (
 // this assumes that the fields themselves do not contain '/', but that is
 // currently true for the fields we care about stripping (the table and index
 // ID).
-func prettyKey(key roachpb.Key, skip int) string {
+func PrettyKey(key roachpb.Key, skip int) string {
 	p := key.String()
 	for i := 0; i <= skip; i++ {
 		n := strings.IndexByte(p[1:], '/')
@@ -52,7 +50,7 @@ func prettyKey(key roachpb.Key, skip int) string {
 // PrettySpan returns a human-readable representation of a span.
 func PrettySpan(span roachpb.Span, skip int) string {
 	var buf bytes.Buffer
-	fmt.Fprintf(&buf, "%s-%s", prettyKey(span.Key, skip), prettyKey(span.EndKey, skip))
+	fmt.Fprintf(&buf, "%s-%s", PrettyKey(span.Key, skip), PrettyKey(span.EndKey, skip))
 	return buf.String()
 }
 
@@ -81,24 +79,40 @@ func SetKVBatchSize(val int64) func() {
 	return func() { kvBatchSize = oldVal }
 }
 
-// kvFetcher handles retrieval of key/values.
-type kvFetcher struct {
+// txnKVFetcher handles retrieval of key/values.
+type txnKVFetcher struct {
 	// "Constant" fields, provided by the caller.
 	txn             *client.Txn
 	spans           roachpb.Spans
-	reverse         bool
-	useBatchLimit   bool
 	firstBatchLimit int64
+	useBatchLimit   bool
+	reverse         bool
+	// returnRangeInfo, if set, causes the kvFetcher to populate rangeInfos.
+	// See also rowFetcher.returnRangeInfo.
+	returnRangeInfo bool
 
-	batchIdx     int
-	fetchEnd     bool
-	kvs          []client.KeyValue
-	kvIndex      int
-	totalFetched int64
+	fetchEnd  bool
+	batchIdx  int
+	responses []roachpb.ResponseUnion
+	kvs       []roachpb.KeyValue
+
+	// As the kvFetcher fetches batches of kvs, it accumulates information on the
+	// replicas where the batches came from. This info can be retrieved through
+	// getRangeInfo(), to be used for updating caches.
+	// rangeInfos are deduped, so they're not ordered in any particular way and
+	// they don't map to kvFetcher.spans in any particular way.
+	rangeInfos []roachpb.RangeInfo
+}
+
+func (f *txnKVFetcher) getRangesInfo() []roachpb.RangeInfo {
+	if !f.returnRangeInfo {
+		panic("GetRangeInfo() called on kvFetcher that wasn't configured with returnRangeInfo")
+	}
+	return f.rangeInfos
 }
 
 // getBatchSize returns the max size of the next batch.
-func (f *kvFetcher) getBatchSize() int64 {
+func (f *txnKVFetcher) getBatchSize() int64 {
 	if !f.useBatchLimit {
 		return 0
 	}
@@ -147,10 +161,15 @@ func (f *kvFetcher) getBatchSize() int64 {
 //
 // Batch limits can only be used if the spans are ordered.
 func makeKVFetcher(
-	txn *client.Txn, spans roachpb.Spans, reverse bool, useBatchLimit bool, firstBatchLimit int64,
-) (kvFetcher, error) {
+	txn *client.Txn,
+	spans roachpb.Spans,
+	reverse bool,
+	useBatchLimit bool,
+	firstBatchLimit int64,
+	returnRangeInfo bool,
+) (txnKVFetcher, error) {
 	if firstBatchLimit < 0 || (!useBatchLimit && firstBatchLimit != 0) {
-		return kvFetcher{}, errors.Errorf("invalid batch limit %d (useBatchLimit: %t)",
+		return txnKVFetcher{}, errors.Errorf("invalid batch limit %d (useBatchLimit: %t)",
 			firstBatchLimit, useBatchLimit)
 	}
 
@@ -158,7 +177,7 @@ func makeKVFetcher(
 		// Verify the spans are ordered if a batch limit is used.
 		for i := 1; i < len(spans); i++ {
 			if spans[i].Key.Compare(spans[i-1].EndKey) < 0 {
-				return kvFetcher{}, errors.Errorf("unordered spans (%s %s)", spans[i-1], spans[i])
+				return txnKVFetcher{}, errors.Errorf("unordered spans (%s %s)", spans[i-1], spans[i])
 			}
 		}
 	}
@@ -174,72 +193,83 @@ func makeKVFetcher(
 		}
 	}
 
-	return kvFetcher{
+	return txnKVFetcher{
 		txn:             txn,
 		spans:           copySpans,
 		reverse:         reverse,
 		useBatchLimit:   useBatchLimit,
 		firstBatchLimit: firstBatchLimit,
+		returnRangeInfo: returnRangeInfo,
 	}, nil
 }
 
 // fetch retrieves spans from the kv
-func (f *kvFetcher) fetch() error {
-	batchSize := f.getBatchSize()
-
-	b := &client.Batch{}
-	b.Header.MaxSpanRequestKeys = batchSize
-
-	for _, span := range f.spans {
-		if f.reverse {
-			b.ReverseScan(span.Key, span.EndKey)
-		} else {
-			b.Scan(span.Key, span.EndKey)
+func (f *txnKVFetcher) fetch(ctx context.Context) error {
+	var ba roachpb.BatchRequest
+	ba.Header.MaxSpanRequestKeys = f.getBatchSize()
+	ba.Header.ReturnRangeInfo = f.returnRangeInfo
+	ba.Requests = make([]roachpb.RequestUnion, len(f.spans))
+	if f.reverse {
+		scans := make([]roachpb.ReverseScanRequest, len(f.spans))
+		for i := range f.spans {
+			scans[i].Span = f.spans[i]
+			ba.Requests[i].MustSetInner(&scans[i])
+		}
+	} else {
+		scans := make([]roachpb.ScanRequest, len(f.spans))
+		for i := range f.spans {
+			scans[i].Span = f.spans[i]
+			ba.Requests[i].MustSetInner(&scans[i])
 		}
 	}
-	// Reset spans and add resume-spans later.
+
+	// Reset spans in preparation for adding resume-spans below.
 	f.spans = f.spans[:0]
 
-	if err := f.txn.Run(b); err != nil {
-		return err
+	br, err := f.txn.Send(ctx, ba)
+	if err != nil {
+		return err.GoError()
 	}
-
-	if f.kvs == nil {
-		numResults := 0
-		for _, result := range b.Results {
-			numResults += len(result.Rows)
-		}
-		f.kvs = make([]client.KeyValue, 0, numResults)
-	} else {
-		f.kvs = f.kvs[:0]
-	}
+	f.responses = br.Responses
 
 	// Set end to true until disproved.
 	f.fetchEnd = true
 	var sawResumeSpan bool
-	for _, result := range b.Results {
-		if result.ResumeSpan.Key != nil {
+	for _, resp := range f.responses {
+		reply := resp.GetInner()
+
+		var numKVs int
+		switch t := reply.(type) {
+		case *roachpb.ScanResponse:
+			numKVs = len(t.Rows)
+		case *roachpb.ReverseScanResponse:
+			numKVs = len(t.Rows)
+		}
+
+		if numKVs > 0 && sawResumeSpan {
+			return errors.Errorf(
+				"span with results after resume span; new spans: %s",
+				PrettySpans(f.spans, 0))
+		}
+
+		header := reply.Header()
+		if resumeSpan := header.ResumeSpan; resumeSpan != nil {
 			// A span needs to be resumed.
 			f.fetchEnd = false
-			f.spans = append(f.spans, result.ResumeSpan)
-		}
-		if len(result.Rows) > 0 {
-			if sawResumeSpan {
-				return errors.Errorf(
-					"span with results after resume span; new spans: %s",
-					PrettySpans(f.spans, 0))
-			}
-			f.kvs = append(f.kvs, result.Rows...)
-		}
-		if result.ResumeSpan.Key != nil {
+			f.spans = append(f.spans, *resumeSpan)
 			// Verify we don't receive results for any remaining spans.
 			sawResumeSpan = true
+		}
+
+		// Fill up the RangeInfos, in case we got any.
+		if f.returnRangeInfo {
+			for _, ri := range header.RangeInfos {
+				f.rangeInfos = roachpb.InsertRangeInfo(f.rangeInfos, ri)
+			}
 		}
 	}
 
 	f.batchIdx++
-	f.totalFetched += int64(len(f.kvs))
-	f.kvIndex = 0
 
 	// TODO(radu): We should fetch the next chunk in the background instead of waiting for the next
 	// call to fetch(). We can use a pool of workers to issue the KV ops which will also limit the
@@ -247,21 +277,36 @@ func (f *kvFetcher) fetch() error {
 	return nil
 }
 
-// nextKV returns the next key/value (initiating fetches as necessary). When there are no more keys,
-// returns false and an empty key/value.
-func (f *kvFetcher) nextKV() (bool, client.KeyValue, error) {
-	if f.kvIndex == len(f.kvs) {
+// nextKV returns the next key/value (initiating fetches as necessary). When
+// there are no more keys, returns false and an empty key/value.
+func (f *txnKVFetcher) nextKV(ctx context.Context) (bool, client.KeyValue, error) {
+	var kv client.KeyValue
+	for {
+		for len(f.kvs) == 0 && len(f.responses) > 0 {
+			reply := f.responses[0].GetInner()
+			f.responses = f.responses[1:]
+
+			switch t := reply.(type) {
+			case *roachpb.ScanResponse:
+				f.kvs = t.Rows
+			case *roachpb.ReverseScanResponse:
+				f.kvs = t.Rows
+			}
+		}
+
+		if len(f.kvs) > 0 {
+			break
+		}
 		if f.fetchEnd {
-			return false, client.KeyValue{}, nil
+			return false, kv, nil
 		}
-		err := f.fetch()
-		if err != nil {
-			return false, client.KeyValue{}, err
-		}
-		if len(f.kvs) == 0 {
-			return false, client.KeyValue{}, nil
+		if err := f.fetch(ctx); err != nil {
+			return false, kv, err
 		}
 	}
-	f.kvIndex++
-	return true, f.kvs[f.kvIndex-1], nil
+
+	kv.Key = f.kvs[0].Key
+	kv.Value = &f.kvs[0].Value
+	f.kvs = f.kvs[1:]
+	return true, kv, nil
 }

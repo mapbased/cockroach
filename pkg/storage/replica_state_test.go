@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Tobias Schottdorf (tobias.schottdorf@gmail.com)
 
 package storage
 
@@ -25,7 +23,6 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/storage/engine"
-	"github.com/cockroachdb/cockroach/pkg/storage/storagebase"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
@@ -34,7 +31,7 @@ import (
 func TestSynthesizeHardState(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	stopper := stop.NewStopper()
-	defer stopper.Stop()
+	defer stopper.Stop(context.TODO())
 	eng := engine.NewInMem(roachpb.Attributes{}, 1<<20)
 	stopper.AddCloser(eng)
 
@@ -60,24 +57,22 @@ func TestSynthesizeHardState(t *testing.T) {
 		func() {
 			batch := eng.NewBatch()
 			defer batch.Close()
-			testState := storagebase.ReplicaState{
-				Desc:             testRangeDescriptor(),
-				TruncatedState:   &roachpb.RaftTruncatedState{Term: test.TruncTerm},
-				RaftAppliedIndex: test.RaftAppliedIndex,
-			}
+			rsl := makeReplicaStateLoader(1)
 
 			if test.OldHS != nil {
-				if err := setHardState(context.Background(), batch, testState.Desc.RangeID, *test.OldHS); err != nil {
+				if err := rsl.setHardState(context.Background(), batch, *test.OldHS); err != nil {
 					t.Fatal(err)
 				}
 			}
 
-			oldHS, err := loadHardState(context.Background(), batch, testState.Desc.RangeID)
+			oldHS, err := rsl.loadHardState(context.Background(), batch)
 			if err != nil {
 				t.Fatal(err)
 			}
 
-			err = synthesizeHardState(context.Background(), batch, testState, oldHS)
+			err = rsl.synthesizeHardState(
+				context.Background(), batch, oldHS, roachpb.RaftTruncatedState{Term: test.TruncTerm}, test.RaftAppliedIndex,
+			)
 			if !testutils.IsError(err, test.Err) {
 				t.Fatalf("%d: expected %q got %v", i, test.Err, err)
 			} else if err != nil {
@@ -85,7 +80,7 @@ func TestSynthesizeHardState(t *testing.T) {
 				return
 			}
 
-			hs, err := loadHardState(context.Background(), batch, testState.Desc.RangeID)
+			hs, err := rsl.loadHardState(context.Background(), batch)
 			if err != nil {
 				t.Fatal(err)
 			}

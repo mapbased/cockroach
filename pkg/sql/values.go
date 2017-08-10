@@ -11,53 +11,51 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Peter Mattis (peter@cockroachlabs.com)
 
 package sql
 
 import (
 	"container/heap"
 	"fmt"
-	"sort"
 	"strconv"
+
+	"golang.org/x/net/context"
 
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
-	"github.com/cockroachdb/cockroach/pkg/util"
-	"github.com/cockroachdb/cockroach/pkg/util/encoding"
 )
 
 type valuesNode struct {
 	n        *parser.ValuesClause
 	p        *planner
-	columns  ResultColumns
+	columns  sqlbase.ResultColumns
 	ordering sqlbase.ColumnOrdering
 	tuples   [][]parser.TypedExpr
-	rows     *RowContainer
+	rows     *sqlbase.RowContainer
 
 	// rowsPopped is used for heaps, it indicates the number of rows that were
-	// "popped". These rows are still part of the underlying RowContainer, in the
+	// "popped". These rows are still part of the underlying sqlbase.RowContainer, in the
 	// range [rows.Len()-n.rowsPopped, rows.Len).
 	rowsPopped int
 
 	desiredTypes []parser.Type // This can be removed when we only type check once.
 
-	nextRow       int           // The index of the next row.
-	invertSorting bool          // Inverts the sorting predicate.
-	tmpValues     parser.DTuple // Used to store temporary values.
-	err           error         // Used to propagate errors during heap operations.
+	nextRow       int  // The index of the next row.
+	invertSorting bool // Inverts the sorting predicate.
 }
 
-func (p *planner) newContainerValuesNode(columns ResultColumns, capacity int) *valuesNode {
+func (p *planner) newContainerValuesNode(columns sqlbase.ResultColumns, capacity int) *valuesNode {
 	return &valuesNode{
+		p:       p,
 		columns: columns,
-		rows:    NewRowContainer(p.session.TxnState.makeBoundAccount(), columns, capacity),
+		rows: sqlbase.NewRowContainer(
+			p.session.TxnState.makeBoundAccount(), sqlbase.ColTypeInfoFromResCols(columns), capacity,
+		),
 	}
 }
 
 func (p *planner) ValuesClause(
-	n *parser.ValuesClause, desiredTypes []parser.Type,
+	ctx context.Context, n *parser.ValuesClause, desiredTypes []parser.Type,
 ) (planNode, error) {
 	v := &valuesNode{
 		p:            p,
@@ -73,7 +71,7 @@ func (p *planner) ValuesClause(
 	v.tuples = make([][]parser.TypedExpr, 0, len(n.Tuples))
 	tupleBuf := make([]parser.TypedExpr, len(n.Tuples)*numCols)
 
-	v.columns = make(ResultColumns, 0, numCols)
+	v.columns = make(sqlbase.ResultColumns, 0, numCols)
 
 	for num, tuple := range n.Tuples {
 		if a, e := len(tuple.Exprs), numCols; a != e {
@@ -95,17 +93,17 @@ func (p *planner) ValuesClause(
 			if len(desiredTypes) > i {
 				desired = desiredTypes[i]
 			}
-			typedExpr, err := p.analyzeExpr(expr, nil, parser.IndexedVarHelper{}, desired, false, "")
+			typedExpr, err := p.analyzeExpr(ctx, expr, nil, parser.IndexedVarHelper{}, desired, false, "")
 			if err != nil {
 				return nil, err
 			}
 
 			typ := typedExpr.ResolvedType()
 			if num == 0 {
-				v.columns = append(v.columns, ResultColumn{Name: "column" + strconv.Itoa(i+1), Typ: typ})
+				v.columns = append(v.columns, sqlbase.ResultColumn{Name: "column" + strconv.Itoa(i+1), Typ: typ})
 			} else if v.columns[i].Typ == parser.TypeNull {
 				v.columns[i].Typ = typ
-			} else if typ != parser.TypeNull && !typ.Equal(v.columns[i].Typ) {
+			} else if typ != parser.TypeNull && !typ.Equivalent(v.columns[i].Typ) {
 				return nil, fmt.Errorf("VALUES list type mismatch, %s for %s", typ, v.columns[i].Typ)
 			}
 
@@ -117,26 +115,7 @@ func (p *planner) ValuesClause(
 	return v, nil
 }
 
-func (n *valuesNode) expandPlan() error {
-	if n.n == nil {
-		return nil
-	}
-
-	// This node is coming from a SQL query (as opposed to sortNode and
-	// others that create a valuesNode internally for storing results
-	// from other planNodes), so it may contain subqueries.
-	for _, tupleRow := range n.tuples {
-		for _, typedExpr := range tupleRow {
-			if err := n.p.expandSubqueryPlans(typedExpr); err != nil {
-				return err
-			}
-		}
-	}
-
-	return nil
-}
-
-func (n *valuesNode) Start() error {
+func (n *valuesNode) Start(params runParams) error {
 	if n.n == nil {
 		return nil
 	}
@@ -145,22 +124,26 @@ func (n *valuesNode) Start() error {
 	// others that create a valuesNode internally for storing results
 	// from other planNodes), so its expressions need evaluting.
 	// This may run subqueries.
-	n.rows = NewRowContainer(n.p.session.TxnState.makeBoundAccount(), n.columns, len(n.n.Tuples))
+	n.rows = sqlbase.NewRowContainer(
+		n.p.session.TxnState.makeBoundAccount(),
+		sqlbase.ColTypeInfoFromResCols(n.columns),
+		len(n.n.Tuples),
+	)
 
 	row := make([]parser.Datum, len(n.columns))
 	for _, tupleRow := range n.tuples {
 		for i, typedExpr := range tupleRow {
-			if err := n.p.startSubqueryPlans(typedExpr); err != nil {
-				return err
-			}
-
-			var err error
-			row[i], err = typedExpr.Eval(&n.p.evalCtx)
-			if err != nil {
-				return err
+			if n.columns[i].Omitted {
+				row[i] = parser.DNull
+			} else {
+				var err error
+				row[i], err = typedExpr.Eval(&n.p.evalCtx)
+				if err != nil {
+					return err
+				}
 			}
 		}
-		if _, err := n.rows.AddRow(row); err != nil {
+		if _, err := n.rows.AddRow(params.ctx, row); err != nil {
 			return err
 		}
 	}
@@ -168,31 +151,11 @@ func (n *valuesNode) Start() error {
 	return nil
 }
 
-func (n *valuesNode) Columns() ResultColumns {
-	return n.columns
-}
-
-func (n *valuesNode) Ordering() orderingInfo {
-	return orderingInfo{}
-}
-
-func (n *valuesNode) Values() parser.DTuple {
+func (n *valuesNode) Values() parser.Datums {
 	return n.rows.At(n.nextRow - 1)
 }
 
-func (*valuesNode) MarkDebug(_ explainMode) {}
-
-func (n *valuesNode) DebugValues() debugValues {
-	val := n.rows.At(n.nextRow - 1)
-	return debugValues{
-		rowIdx: n.nextRow - 1,
-		key:    fmt.Sprintf("%d", n.nextRow-1),
-		value:  val.String(),
-		output: debugValueRow,
-	}
-}
-
-func (n *valuesNode) Next() (bool, error) {
+func (n *valuesNode) Next(runParams) (bool, error) {
 	if n.nextRow >= n.rows.Len() {
 		return false, nil
 	}
@@ -200,9 +163,9 @@ func (n *valuesNode) Next() (bool, error) {
 	return true, nil
 }
 
-func (n *valuesNode) Close() {
+func (n *valuesNode) Close(ctx context.Context) {
 	if n.rows != nil {
-		n.rows.Close()
+		n.rows.Close(ctx)
 		n.rows = nil
 	}
 }
@@ -219,29 +182,10 @@ func (n *valuesNode) Less(i, j int) bool {
 	return n.invertSorting != n.ValuesLess(ra, rb)
 }
 
-// ValuesLess returns the comparison result between the two provided DTuples
+// ValuesLess returns the comparison result between the two provided Datums slices
 // in the context of the valuesNode ordering.
-func (n *valuesNode) ValuesLess(ra, rb parser.DTuple) bool {
-	for _, c := range n.ordering {
-		var da, db parser.Datum
-		if c.Direction == encoding.Ascending {
-			da = ra[c.ColIdx]
-			db = rb[c.ColIdx]
-		} else {
-			da = rb[c.ColIdx]
-			db = ra[c.ColIdx]
-		}
-		// TODO(pmattis): This is assuming that the datum types are compatible. I'm
-		// not sure this always holds as `CASE` expressions can return different
-		// types for a column for different rows. Investigate how other RDBMs
-		// handle this.
-		if c := da.Compare(db); c < 0 {
-			return true
-		} else if c > 0 {
-			return false
-		}
-	}
-	return true
+func (n *valuesNode) ValuesLess(ra, rb parser.Datums) bool {
+	return sqlbase.CompareDatums(n.ordering, &n.p.evalCtx, ra, rb) < 0
 }
 
 func (n *valuesNode) Swap(i, j int) {
@@ -252,16 +196,14 @@ var _ heap.Interface = (*valuesNode)(nil)
 
 // Push implements the heap.Interface interface.
 func (n *valuesNode) Push(x interface{}) {
-	_, n.err = n.rows.AddRow(n.tmpValues)
 }
 
-// PushValues pushes the given DTuple value into the heap representation
+// PushValues pushes the given Datums value into the heap representation
 // of the valuesNode.
-func (n *valuesNode) PushValues(values parser.DTuple) error {
-	// Avoid passing slice through interface{} to avoid allocation.
-	n.tmpValues = values
+func (n *valuesNode) PushValues(ctx context.Context, values parser.Datums) error {
+	_, err := n.rows.AddRow(ctx, values)
 	heap.Push(n, nil)
-	return n.err
+	return err
 }
 
 // Pop implements the heap.Interface interface.
@@ -270,15 +212,15 @@ func (n *valuesNode) Pop() interface{} {
 		panic("no more rows to pop")
 	}
 	n.rowsPopped++
-	// Returning a DTuple as an interface{} involves an allocation. Luckily, the
+	// Returning a Datums as an interface{} involves an allocation. Luckily, the
 	// value of Pop is only used for the return value of heap.Pop, which we can
 	// avoid using.
 	return nil
 }
 
-// PopValues pops the top DTuple value off the heap representation
+// PopValues pops the top Datums value off the heap representation
 // of the valuesNode.
-func (n *valuesNode) PopValues() parser.DTuple {
+func (n *valuesNode) PopValues() parser.Datums {
 	heap.Pop(n)
 	// Return the last popped row.
 	return n.rows.At(n.rows.Len() - n.rowsPopped)
@@ -291,9 +233,9 @@ func (n *valuesNode) ResetLen() {
 }
 
 // SortAll sorts all values in the valuesNode.rows slice.
-func (n *valuesNode) SortAll() {
+func (n *valuesNode) SortAll(cancelChecker CancelChecker) {
 	n.invertSorting = false
-	sort.Sort(n)
+	doSort(n, cancelChecker)
 }
 
 // InitMaxHeap initializes the valuesNode.rows slice as a max-heap.
@@ -307,39 +249,3 @@ func (n *valuesNode) InitMinHeap() {
 	n.invertSorting = false
 	heap.Init(n)
 }
-
-func (n *valuesNode) ExplainPlan(_ bool) (name, description string, children []planNode) {
-	name = "values"
-	suffix := "not yet populated"
-	if n.rows != nil {
-		suffix = fmt.Sprintf("%d row%s",
-			n.rows.Len(), util.Pluralize(int64(n.rows.Len())))
-	} else if n.tuples != nil {
-		suffix = fmt.Sprintf("%d row%s",
-			len(n.tuples), util.Pluralize(int64(len(n.tuples))))
-	}
-	description = fmt.Sprintf("%d column%s, %s",
-		len(n.columns), util.Pluralize(int64(len(n.columns))), suffix)
-
-	var subplans []planNode
-	for _, tuple := range n.tuples {
-		for _, expr := range tuple {
-			subplans = n.p.collectSubqueryPlans(expr, subplans)
-		}
-	}
-
-	return name, description, subplans
-}
-
-func (n *valuesNode) ExplainTypes(regTypes func(string, string)) {
-	if n.n != nil {
-		for i, tuple := range n.tuples {
-			for j, expr := range tuple {
-				regTypes(fmt.Sprintf("row %d, expr %d", i, j), parser.AsStringWithFlags(expr, parser.FmtShowTypes))
-			}
-		}
-	}
-}
-
-func (*valuesNode) SetLimitHint(_ int64, _ bool) {}
-func (*valuesNode) setNeededColumns(_ []bool)    {}

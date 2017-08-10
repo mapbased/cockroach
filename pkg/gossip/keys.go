@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Spencer Kimball (spencer.kimball@gmail.com)
 
 package gossip
 
@@ -91,15 +89,14 @@ func MakePrefixPattern(prefix string) string {
 	return regexp.QuoteMeta(prefix+separator) + ".*"
 }
 
-// MakeOrPattern returns a regular expression pattern that matches
-// any of the provided components.
-func MakeOrPattern(components ...string) string {
-	return strings.Join(components, "|")
-}
-
 // MakeNodeIDKey returns the gossip key for node ID info.
 func MakeNodeIDKey(nodeID roachpb.NodeID) string {
 	return MakeKey(KeyNodeIDPrefix, nodeID.String())
+}
+
+// IsNodeIDKey returns true iff the provided key is a valid node ID key.
+func IsNodeIDKey(key string) bool {
+	return strings.HasPrefix(key, KeyNodeIDPrefix+separator)
 }
 
 // NodeIDFromKey attempts to extract a NodeID from the provided key.

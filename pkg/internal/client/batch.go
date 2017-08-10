@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Peter Mattis (peter@cockroachlabs.com)
 
 package client
 
@@ -245,9 +243,12 @@ func (b *Batch) fillResults() error {
 			case *roachpb.AdminMergeRequest:
 			case *roachpb.AdminSplitRequest:
 			case *roachpb.AdminTransferLeaseRequest:
+			case *roachpb.AdminChangeReplicasRequest:
 			case *roachpb.HeartbeatTxnRequest:
 			case *roachpb.GCRequest:
+			case *roachpb.LeaseInfoRequest:
 			case *roachpb.PushTxnRequest:
+			case *roachpb.QueryTxnRequest:
 			case *roachpb.RangeLookupRequest:
 			case *roachpb.ResolveIntentRequest:
 			case *roachpb.ResolveIntentRangeRequest:
@@ -255,11 +256,18 @@ func (b *Batch) fillResults() error {
 			case *roachpb.TruncateLogRequest:
 			case *roachpb.RequestLeaseRequest:
 			case *roachpb.CheckConsistencyRequest:
-			case *roachpb.ChangeFrozenRequest:
+			case *roachpb.WriteBatchRequest:
+			case *roachpb.ImportRequest:
+			case *roachpb.AdminScatterRequest:
+			case *roachpb.AddSSTableRequest:
 			}
 			// Fill up the resume span.
 			if result.Err == nil && reply != nil && reply.Header().ResumeSpan != nil {
 				result.ResumeSpan = *reply.Header().ResumeSpan
+			}
+			// Fill up the RangeInfos, in case we got any.
+			if result.Err == nil && reply != nil {
+				result.RangeInfos = reply.Header().RangeInfos
 			}
 		}
 		offset += result.calls
@@ -409,13 +417,15 @@ func (b *Batch) CPut(key, value, expValue interface{}) {
 	b.initResult(1, 1, notRaw, nil)
 }
 
-// InitPut sets the first value for a key to value. An error is reported if a
-// value already exists for the key and it's not equal to the value passed in.
+// InitPut sets the first value for a key to value. An ConditionFailedError is
+// reported if a value already exists for the key and it's not equal to the
+// value passed in. If failOnTombstones is set to true, tombstones will return
+// a ConditionFailedError just like a mismatched value.
 //
 // key can be either a byte slice or a string. value can be any key type, a
 // proto.Message or any Go primitive type (bool, int, etc). It is illegal to
 // set value to nil.
-func (b *Batch) InitPut(key, value interface{}) {
+func (b *Batch) InitPut(key, value interface{}, failOnTombstones bool) {
 	k, err := marshalKey(key)
 	if err != nil {
 		b.initResult(0, 1, notRaw, err)
@@ -426,7 +436,7 @@ func (b *Batch) InitPut(key, value interface{}) {
 		b.initResult(0, 1, notRaw, err)
 		return
 	}
-	b.appendReqs(roachpb.NewInitPut(k, v))
+	b.appendReqs(roachpb.NewInitPut(k, v, failOnTombstones))
 	b.initResult(1, 1, notRaw, nil)
 }
 
@@ -567,18 +577,23 @@ func (b *Batch) adminMerge(key interface{}) {
 
 // adminSplit is only exported on DB. It is here for symmetry with the
 // other operations.
-func (b *Batch) adminSplit(splitKey interface{}) {
-	k, err := marshalKey(splitKey)
+func (b *Batch) adminSplit(spanKeyIn, splitKeyIn interface{}) {
+	spanKey, err := marshalKey(spanKeyIn)
+	if err != nil {
+		b.initResult(0, 0, notRaw, err)
+		return
+	}
+	splitKey, err := marshalKey(splitKeyIn)
 	if err != nil {
 		b.initResult(0, 0, notRaw, err)
 		return
 	}
 	req := &roachpb.AdminSplitRequest{
 		Span: roachpb.Span{
-			Key: k,
+			Key: spanKey,
 		},
 	}
-	req.SplitKey = k
+	req.SplitKey = splitKey
 	b.appendReqs(req)
 	b.initResult(1, 0, notRaw, nil)
 }
@@ -596,6 +611,70 @@ func (b *Batch) adminTransferLease(key interface{}, target roachpb.StoreID) {
 			Key: k,
 		},
 		Target: target,
+	}
+	b.appendReqs(req)
+	b.initResult(1, 0, notRaw, nil)
+}
+
+// adminChangeReplicas is only exported on DB. It is here for symmetry with the
+// other operations.
+func (b *Batch) adminChangeReplicas(
+	key interface{}, changeType roachpb.ReplicaChangeType, targets []roachpb.ReplicationTarget,
+) {
+	k, err := marshalKey(key)
+	if err != nil {
+		b.initResult(0, 0, notRaw, err)
+		return
+	}
+	req := &roachpb.AdminChangeReplicasRequest{
+		Span: roachpb.Span{
+			Key: k,
+		},
+		ChangeType: changeType,
+		Targets:    targets,
+	}
+	b.appendReqs(req)
+	b.initResult(1, 0, notRaw, nil)
+}
+
+// writeBatch is only exported on DB.
+func (b *Batch) writeBatch(s, e interface{}, data []byte) {
+	begin, err := marshalKey(s)
+	if err != nil {
+		b.initResult(0, 0, notRaw, err)
+		return
+	}
+	end, err := marshalKey(e)
+	if err != nil {
+		b.initResult(0, 0, notRaw, err)
+		return
+	}
+	span := roachpb.Span{Key: begin, EndKey: end}
+	req := &roachpb.WriteBatchRequest{
+		Span:     span,
+		DataSpan: span,
+		Data:     data,
+	}
+	b.appendReqs(req)
+	b.initResult(1, 0, notRaw, nil)
+}
+
+// addSSTable is only exported on DB.
+func (b *Batch) addSSTable(s, e interface{}, data []byte) {
+	begin, err := marshalKey(s)
+	if err != nil {
+		b.initResult(0, 0, notRaw, err)
+		return
+	}
+	end, err := marshalKey(e)
+	if err != nil {
+		b.initResult(0, 0, notRaw, err)
+		return
+	}
+	span := roachpb.Span{Key: begin, EndKey: end}
+	req := &roachpb.AddSSTableRequest{
+		Span: span,
+		Data: data,
 	}
 	b.appendReqs(req)
 	b.initResult(1, 0, notRaw, nil)

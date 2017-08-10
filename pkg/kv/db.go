@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Spencer Kimball (spencer.kimball@gmail.com)
 
 package kv
 
@@ -47,6 +45,8 @@ var allExternalMethods = [...]roachpb.Request{
 	roachpb.AdminTransferLease: &roachpb.AdminTransferLeaseRequest{},
 	roachpb.CheckConsistency:   &roachpb.CheckConsistencyRequest{},
 	roachpb.RangeLookup:        &roachpb.RangeLookupRequest{},
+	roachpb.WriteBatch:         &roachpb.WriteBatchRequest{},
+	roachpb.Export:             &roachpb.ExportRequest{},
 }
 
 // A DBServer provides an HTTP server endpoint serving the key-value API.
@@ -108,12 +108,13 @@ func (s *DBServer) Batch(
 		return br, err
 	}
 
-	err = s.stopper.RunTask(func() {
+	taskCtx := context.TODO()
+	err = s.stopper.RunTask(taskCtx, "kv.DBServer: batch", func(taskCtx context.Context) {
 		var pErr *roachpb.Error
 		// TODO(wiz): This is required to be a different context from the one
 		// provided by grpc since it has to last for the entire transaction and not
 		// just this one RPC call. See comment for (*TxnCoordSender).hearbeatLoop.
-		br, pErr = s.sender.Send(context.TODO(), *args)
+		br, pErr = s.sender.Send(taskCtx, *args)
 		if pErr != nil {
 			br = &roachpb.BatchResponse{}
 		}

@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Spencer Kimball (spencer.kimball@gmail.com)
 
 package engine
 
@@ -22,7 +20,6 @@ import (
 	"io/ioutil"
 	"math/rand"
 	"os"
-	"path/filepath"
 	"sort"
 	"strconv"
 	"testing"
@@ -30,7 +27,9 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
+	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
@@ -66,28 +65,37 @@ func TestBatchIterReadOwnWrite(t *testing.T) {
 	after := b.NewIterator(true /* prefix */)
 	defer after.Close()
 
-	if after.Seek(k); !after.Valid() {
-		t.Fatal("write missing on batch iter created after write")
+	after.Seek(k)
+	if ok, err := after.Valid(); !ok {
+		t.Fatalf("write missing on batch iter created after write, err=%v", err)
 	}
-	if before.Seek(k); !before.Valid() {
-		t.Fatal("write missing on batch iter created before write")
+	before.Seek(k)
+	if ok, err := before.Valid(); !ok {
+		t.Fatalf("write missing on batch iter created before write, err=%v", err)
 	}
-	if nonBatchBefore.Seek(k); nonBatchBefore.Valid() {
+	nonBatchBefore.Seek(k)
+	if ok, err := nonBatchBefore.Valid(); err != nil {
+		t.Fatal(err)
+	} else if ok {
 		t.Fatal("uncommitted write seen by non-batch iter")
 	}
 
-	if err := b.Commit(); err != nil {
+	if err := b.Commit(false /* !sync */); err != nil {
 		t.Fatal(err)
 	}
 
 	nonBatchAfter := db.NewIterator(false)
 	defer nonBatchAfter.Close()
 
-	if nonBatchBefore.Seek(k); nonBatchBefore.Valid() {
+	nonBatchBefore.Seek(k)
+	if ok, err := nonBatchBefore.Valid(); err != nil {
+		t.Fatal(err)
+	} else if ok {
 		t.Fatal("committed write seen by non-batch iter created before commit")
 	}
-	if nonBatchAfter.Seek(k); !nonBatchAfter.Valid() {
-		t.Fatal("committed write missing by non-batch iter created after commit")
+	nonBatchAfter.Seek(k)
+	if ok, err := nonBatchAfter.Valid(); !ok {
+		t.Fatalf("committed write missing by non-batch iter created after commit, err=%v", err)
 	}
 
 	// `Commit` frees the batch, so iterators backed by it should panic.
@@ -101,8 +109,8 @@ func TestBatchIterReadOwnWrite(t *testing.T) {
 		t.Fatalf(`Seek on batch-backed iter after batched closed should panic.
 			iter.engine: %T, iter.engine.Closed: %v, batch.Closed %v`,
 			after.(*rocksDBIterator).engine,
-			after.(*rocksDBIterator).engine.closed(),
-			b.closed(),
+			after.(*rocksDBIterator).engine.Closed(),
+			b.Closed(),
 		)
 	}()
 }
@@ -129,10 +137,14 @@ func TestBatchPrefixIter(t *testing.T) {
 	iter := b.NewIterator(true /* prefix */)
 	defer iter.Close()
 
-	if iter.Seek(mvccKey("b")); !iter.Valid() {
-		t.Fatalf("expected to find \"b\"")
+	iter.Seek(mvccKey("b"))
+	if ok, err := iter.Valid(); !ok {
+		t.Fatalf("expected to find \"b\", err=%v", err)
 	}
-	if iter.Seek(mvccKey("a")); iter.Valid() {
+	iter.Seek(mvccKey("a"))
+	if ok, err := iter.Valid(); err != nil {
+		t.Fatal(err)
+	} else if ok {
 		t.Fatalf("expected to not find anything, found %s -> %q", iter.Key(), iter.Value())
 	}
 }
@@ -166,6 +178,34 @@ func benchmarkIterOnBatch(b *testing.B, writes int) {
 	for i := 0; i < b.N; i++ {
 		key := makeKey(r.Intn(writes))
 		iter := batch.NewIterator(true)
+		iter.Seek(key)
+		iter.Close()
+	}
+}
+
+func benchmarkIterOnReadWriter(
+	b *testing.B, writes int, f func(Engine) ReadWriter, closeReadWriter bool,
+) {
+	engine := createTestEngine()
+	defer engine.Close()
+
+	for i := 0; i < writes; i++ {
+		if err := engine.Put(makeKey(i), []byte(strconv.Itoa(i))); err != nil {
+			b.Fatal(err)
+		}
+	}
+
+	readWriter := f(engine)
+	if closeReadWriter {
+		defer readWriter.Close()
+	}
+
+	r := rand.New(rand.NewSource(5))
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		key := makeKey(r.Intn(writes))
+		iter := readWriter.NewIterator(true)
 		iter.Seek(key)
 		iter.Close()
 	}
@@ -220,11 +260,11 @@ func openRocksDBWithVersion(t *testing.T, hasVersionFile bool, ver Version) erro
 	}
 
 	rocksdb, err := NewRocksDB(
-		roachpb.Attributes{},
-		dir,
+		RocksDBConfig{
+			RocksDBSettings: cluster.MakeClusterSettings().RocksDBSettings,
+			Dir:             dir,
+		},
 		RocksDBCache{},
-		0,
-		DefaultMaxOpenFiles,
 	)
 	if err == nil {
 		rocksdb.Close()
@@ -332,11 +372,11 @@ func TestReadAmplification(t *testing.T) {
 func TestConcurrentBatch(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
-	if testutils.Stress() {
+	if testutils.NightlyStress() || util.RaceEnabled {
 		t.Skip()
 	}
 
-	dir, err := ioutil.TempDir("", "TestConcurrentBatch")
+	dir, err := ioutil.TempDir("", t.Name())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -346,8 +386,13 @@ func TestConcurrentBatch(t *testing.T) {
 		}
 	}()
 
-	db, err := NewRocksDB(roachpb.Attributes{}, dir, RocksDBCache{},
-		0, DefaultMaxOpenFiles)
+	db, err := NewRocksDB(
+		RocksDBConfig{
+			RocksDBSettings: cluster.MakeClusterSettings().RocksDBSettings,
+			Dir:             dir,
+		},
+		RocksDBCache{},
+	)
 	if err != nil {
 		t.Fatalf("could not create new rocksdb db instance at %s: %v", dir, err)
 	}
@@ -375,7 +420,7 @@ func TestConcurrentBatch(t *testing.T) {
 	// Concurrently write all the batches.
 	for _, batch := range batches {
 		go func(batch Batch) {
-			errChan <- batch.Commit()
+			errChan <- batch.Commit(false /* !sync */)
 		}(batch)
 	}
 
@@ -426,24 +471,21 @@ func BenchmarkRocksDBSstFileWriter(b *testing.B) {
 	}
 
 	b.ResetTimer()
-	sst := MakeRocksDBSstFileWriter()
-	if err := sst.Open(filepath.Join(dir, "sst")); err != nil {
+	sst, err := MakeRocksDBSstFileWriter()
+	if err != nil {
 		b.Fatal(sst)
 	}
-	defer func() {
-		if err := sst.Close(); err != nil {
-			b.Fatal(err)
-		}
-	}()
+	defer sst.Close()
 	for i := 1; i <= b.N; i++ {
 		if i%maxEntries == 0 {
-			if err := sst.Close(); err != nil {
+			if _, err := sst.Finish(); err != nil {
 				b.Fatal(err)
 			}
-			sst = MakeRocksDBSstFileWriter()
-			if err := sst.Open(filepath.Join(dir, "sst")); err != nil {
+			sst, err = MakeRocksDBSstFileWriter()
+			if err != nil {
 				b.Fatal(sst)
 			}
+			defer sst.Close()
 		}
 
 		b.StopTimer()
@@ -468,7 +510,7 @@ func BenchmarkRocksDBSstFileReader(b *testing.B) {
 		}
 	}()
 
-	sstPath := filepath.Join(dir, "sst")
+	var sstContents []byte
 	{
 		const maxEntries = 100000
 		const keyLen = 10
@@ -481,10 +523,11 @@ func BenchmarkRocksDBSstFileReader(b *testing.B) {
 			Value: make([]byte, valLen),
 		}
 
-		sst := MakeRocksDBSstFileWriter()
-		if err := sst.Open(sstPath); err != nil {
+		sst, err := MakeRocksDBSstFileWriter()
+		if err != nil {
 			b.Fatal(sst)
 		}
+		defer sst.Close()
 		var entries = b.N
 		if entries > maxEntries {
 			entries = maxEntries
@@ -496,20 +539,19 @@ func BenchmarkRocksDBSstFileReader(b *testing.B) {
 				b.Fatal(err)
 			}
 		}
-		if err := sst.Close(); err != nil {
+		sstContents, err = sst.Finish()
+		if err != nil {
 			b.Fatal(err)
 		}
 	}
 
 	b.ResetTimer()
-	sst, err := MakeRocksDBSstFileReader()
-	if err != nil {
-		b.Fatal(err)
-	}
-	if err := sst.AddFile(sstPath); err != nil {
-		b.Fatal(err)
-	}
+	sst := MakeRocksDBSstFileReader()
 	defer sst.Close()
+
+	if err := sst.IngestExternalFile(sstContents); err != nil {
+		b.Fatal(err)
+	}
 	count := 0
 	iterateFn := func(kv MVCCKeyValue) (bool, error) {
 		count++
@@ -530,10 +572,16 @@ func BenchmarkRocksDBSstFileReader(b *testing.B) {
 
 func TestRocksDBTimeBound(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	dir, dirCleanup := testutils.TempDir(t, 0)
+	dir, dirCleanup := testutils.TempDir(t)
 	defer dirCleanup()
 
-	rocksdb, err := NewRocksDB(roachpb.Attributes{}, dir, RocksDBCache{}, 0, DefaultMaxOpenFiles)
+	rocksdb, err := NewRocksDB(
+		RocksDBConfig{
+			RocksDBSettings: cluster.MakeClusterSettings().RocksDBSettings,
+			Dir:             dir,
+		},
+		RocksDBCache{},
+	)
 	if err != nil {
 		t.Fatalf("could not create new rocksdb db instance at %s: %v", dir, err)
 	}
@@ -567,10 +615,10 @@ func TestRocksDBTimeBound(t *testing.T) {
 		t.Fatalf("expected 1 sstable got %d", len(ssts.Sst))
 	}
 	sst := ssts.Sst[0]
-	if sst.TsMin == nil || !sst.TsMin.Equal(minTimestamp) {
+	if sst.TsMin == nil || *sst.TsMin != minTimestamp {
 		t.Fatalf("got min %v expected %v", sst.TsMin, minTimestamp)
 	}
-	if sst.TsMax == nil || !sst.TsMax.Equal(maxTimestamp) {
+	if sst.TsMax == nil || *sst.TsMax != maxTimestamp {
 		t.Fatalf("got max %v expected %v", sst.TsMax, maxTimestamp)
 	}
 }

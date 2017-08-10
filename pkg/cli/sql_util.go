@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Marc berhault (marc@cockroachlabs.com)
 
 package cli
 
@@ -24,45 +22,237 @@ import (
 	"net/url"
 	"strings"
 	"text/tabwriter"
+	"time"
 	"unicode"
 	"unicode/utf8"
 
+	"github.com/lib/pq"
+	"github.com/pkg/errors"
 	"golang.org/x/net/context"
 
-	"github.com/olekukonko/tablewriter"
-
+	"github.com/cockroachdb/cockroach/pkg/build"
 	"github.com/cockroachdb/cockroach/pkg/security"
-	"github.com/cockroachdb/cockroach/pkg/util"
+	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
-	"github.com/cockroachdb/pq"
+	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 )
 
 type sqlConnI interface {
 	driver.Conn
 	driver.Execer
 	driver.Queryer
-	Next() (driver.Rows, error)
 }
 
 type sqlConn struct {
 	url          string
 	conn         sqlConnI
 	reconnecting bool
+
+	// dbName is the last known current database, to be reconfigured in
+	// case of automatic reconnects.
+	dbName string
+
+	serverVersion string // build.Info.Tag (short version, like 1.0.3)
+	serverBuild   string // build.Info.Short (version, platform, etc summary)
+
+	// clusterID and serverBuildInfo are the last known corresponding
+	// values from the server, used to report any changes upon
+	// (re)connects.
+	clusterID           string
+	clusterOrganization string
 }
 
 func (c *sqlConn) ensureConn() error {
 	if c.conn == nil {
 		if c.reconnecting && isInteractive {
-			fmt.Fprintf(osStderr, "connection lost; opening new connection and resetting session parameters...\n")
+			fmt.Fprintf(stderr, "connection lost; opening new connection: all session settings will be lost\n")
 		}
 		conn, err := pq.Open(c.url)
 		if err != nil {
 			return err
 		}
-		c.reconnecting = false
+		if c.reconnecting && c.dbName != "" {
+			// Attempt to reset the current database.
+			if _, err := conn.(sqlConnI).Exec(
+				`SET DATABASE = `+parser.Name(c.dbName).String(), nil,
+			); err != nil {
+				fmt.Fprintf(stderr, "unable to restore current database: %v\n", err)
+			}
+		}
 		c.conn = conn.(sqlConnI)
+		if err := c.checkServerMetadata(); err != nil {
+			c.Close()
+			return err
+		}
+		c.reconnecting = false
 	}
 	return nil
+}
+
+// checkServerMetadata reports the server version and cluster ID
+// upon the initial connection or if either has changed since
+// the last connection, based on the last known values in the sqlConn
+// struct.
+func (c *sqlConn) checkServerMetadata() error {
+	if !isInteractive {
+		// Version reporting is just noise in non-interactive sessions.
+		return nil
+	}
+
+	newServerVersion := ""
+	newClusterID := ""
+
+	// Retrieve the node ID and server build info.
+	rows, err := c.Query("SELECT * FROM crdb_internal.node_build_info", nil)
+	if err == driver.ErrBadConn {
+		return err
+	}
+	if err != nil {
+		fmt.Fprintln(stderr, "unable to retrieve the server's version")
+	} else {
+		defer func() { _ = rows.Close() }()
+
+		// Read the node_build_info table as an array of strings.
+		rowVals, err := getAllRowStrings(rows, true /* showMoreChars */)
+		if err != nil || len(rowVals) == 0 || len(rowVals[0]) != 3 {
+			fmt.Fprintln(stderr, "error while retrieving the server's version")
+			// It is not an error that the server version cannot be retrieved.
+			return nil
+		}
+
+		// Extract the version fields from the query results.
+		for _, row := range rowVals {
+			switch row[1] {
+			case "ClusterID":
+				newClusterID = row[2]
+			case "Version":
+				newServerVersion = row[2]
+			case "Build":
+				c.serverBuild = row[2]
+			case "Organization":
+				c.clusterOrganization = row[2]
+			}
+
+		}
+	}
+
+	// Report the server version only if it the revision has been
+	// fetched successfully, and the revision has changed since the last
+	// connection.
+	if newServerVersion != c.serverVersion {
+		c.serverVersion = newServerVersion
+
+		isSame := ""
+		// We compare just the version (`build.Info.Tag`), whereas we *display* the
+		// the full build summary (version, platform, etc) string
+		// (`build.Info.Short()`). This is because we don't care if they're
+		// different platforms/build tools/timestamps. The important bit exposed by
+		// a version mismatch is the wire protocol and SQL dialect.
+		if client := build.GetInfo(); c.serverVersion != client.Tag {
+			fmt.Println("# Client version:", client.Short())
+		} else {
+			isSame = " (same version as client)"
+		}
+		fmt.Printf("# Server version: %s%s\n", c.serverBuild, isSame)
+	}
+
+	// Report the cluster ID only if it it could be fetched
+	// successfully, and it has changed since the last connection.
+	if old := c.clusterID; newClusterID != c.clusterID {
+		c.clusterID = newClusterID
+		if old != "" {
+			return errors.Errorf("the cluster ID has changed!\nPrevious ID: %s\nNew ID: %s",
+				old, newClusterID)
+		}
+		c.clusterID = newClusterID
+		fmt.Println("# Cluster ID:", c.clusterID)
+		if c.clusterOrganization != "" {
+			fmt.Println("# Organization:", c.clusterOrganization)
+		}
+	}
+
+	return nil
+}
+
+// getServerValue retrieves the first driverValue returned by the
+// given sql query. If the query fails or does not return a single
+// column, `false` is returned in the second result.
+func (c *sqlConn) getServerValue(what, sql string) (driver.Value, bool) {
+	var dbVals [1]driver.Value
+
+	rows, err := c.Query(sql, nil)
+	if err != nil {
+		fmt.Fprintf(stderr, "error retrieving the %s: %v\n", what, err)
+		return nil, false
+	}
+	defer func() { _ = rows.Close() }()
+
+	if len(rows.Columns()) == 0 {
+		fmt.Fprintf(stderr, "cannot get the %s\n", what)
+		return nil, false
+	}
+
+	err = rows.Next(dbVals[:])
+	if err != nil {
+		fmt.Fprintf(stderr, "invalid %s: %v\n", what, err)
+		return nil, false
+	}
+
+	return dbVals[0], true
+}
+
+// ExecTxn runs fn inside a transaction and retries it as needed.
+// On non-retryable failures, the transaction is aborted and rolled
+// back; on success, the transaction is committed.
+//
+// NOTE: the supplied closure should not have external side
+// effects beyond changes to the database.
+//
+// NB: this code is cribbed from cockroach-go/crdb and has been copied
+// because this code, pre-dating go1.8, deals with multiple result sets
+// direct with the driver. See #14964.
+func (c *sqlConn) ExecTxn(fn func(*sqlConn) error) (err error) {
+	// Start a transaction.
+	if err = c.Exec(`BEGIN`, nil); err != nil {
+		return err
+	}
+	defer func() {
+		if err == nil {
+			// Ignore commit errors. The tx has already been committed by RELEASE.
+			_ = c.Exec(`COMMIT`, nil)
+		} else {
+			// We always need to execute a Rollback() so sql.DB releases the
+			// connection.
+			_ = c.Exec(`ROLLBACK`, nil)
+		}
+	}()
+	// Specify that we intend to retry this txn in case of CockroachDB retryable
+	// errors.
+	if err = c.Exec(`SAVEPOINT cockroach_restart`, nil); err != nil {
+		return err
+	}
+
+	for {
+		err = fn(c)
+		if err == nil {
+			// RELEASE acts like COMMIT in CockroachDB. We use it since it gives us an
+			// opportunity to react to retryable errors, whereas tx.Commit() doesn't.
+			if err = c.Exec(`RELEASE SAVEPOINT cockroach_restart`, nil); err == nil {
+				return nil
+			}
+		}
+		// We got an error; let's see if it's a retryable one and, if so, restart. We look
+		// for either the standard PG errcode SerializationFailureError:40001 or the Cockroach extension
+		// errcode RetriableError:CR000. The Cockroach extension has been removed server-side, but support
+		// for it has been left here for now to maintain backwards compatibility.
+		pqErr, ok := err.(*pq.Error)
+		if retryable := ok && (pqErr.Code == "CR000" || pqErr.Code == "40001"); !retryable {
+			return err
+		}
+		if err = c.Exec(`ROLLBACK TO SAVEPOINT cockroach_restart`, nil); err != nil {
+			return err
+		}
+	}
 }
 
 func (c *sqlConn) Exec(query string, args []driver.Value) error {
@@ -70,6 +260,10 @@ func (c *sqlConn) Exec(query string, args []driver.Value) error {
 		return err
 	}
 	_, err := c.conn.Exec(query, args)
+	if err == driver.ErrBadConn {
+		c.reconnecting = true
+		c.Close()
+	}
 	return err
 }
 
@@ -78,21 +272,6 @@ func (c *sqlConn) Query(query string, args []driver.Value) (*sqlRows, error) {
 		return nil, err
 	}
 	rows, err := c.conn.Query(query, args)
-	if err == driver.ErrBadConn {
-		c.reconnecting = true
-		c.Close()
-	}
-	if err != nil {
-		return nil, err
-	}
-	return &sqlRows{rows: rows.(sqlRowsI), conn: c}, nil
-}
-
-func (c *sqlConn) Next() (*sqlRows, error) {
-	if c.conn == nil {
-		return nil, driver.ErrBadConn
-	}
-	rows, err := c.conn.Next()
 	if err == driver.ErrBadConn {
 		c.reconnecting = true
 		c.Close()
@@ -128,6 +307,11 @@ type sqlRowsI interface {
 	driver.Rows
 	Result() driver.Result
 	Tag() string
+
+	// Go 1.8 multiple result set interfaces.
+	// TODO(mjibson): clean this up after 1.8 is released.
+	HasNextResultSet() bool
+	NextResultSet() error
 }
 
 type sqlRows struct {
@@ -150,6 +334,7 @@ func (r *sqlRows) Tag() string {
 func (r *sqlRows) Close() error {
 	err := r.rows.Close()
 	if err == driver.ErrBadConn {
+		r.conn.reconnecting = true
 		r.conn.Close()
 	}
 	return err
@@ -173,6 +358,14 @@ func (r *sqlRows) Next(values []driver.Value) error {
 	return err
 }
 
+// NextResultSet prepares the next result set for reading.
+func (r *sqlRows) NextResultSet() (bool, error) {
+	if !r.rows.HasNextResultSet() {
+		return false, nil
+	}
+	return true, r.rows.NextResultSet()
+}
+
 func makeSQLConn(url string) *sqlConn {
 	return &sqlConn{
 		url: url,
@@ -180,44 +373,44 @@ func makeSQLConn(url string) *sqlConn {
 }
 
 // getPasswordAndMakeSQLClient prompts for a password if running in secure mode
-// and no certificates have been supplied. security.RootUser won't be prompted
-// for a password as the only authentication method available for this user is
-// certificate authentication.
+// and no certificates have been supplied.
+// Attempting to use security.RootUser without valid certificates will return an error.
 func getPasswordAndMakeSQLClient() (*sqlConn, error) {
-	if len(connURL) != 0 {
-		return makeSQLConn(connURL), nil
+	if len(sqlConnURL) != 0 {
+		return makeSQLConn(sqlConnURL), nil
 	}
 	var user *url.Userinfo
-	if !baseCfg.Insecure && connUser != security.RootUser && baseCfg.SSLCert == "" && baseCfg.SSLCertKey == "" {
+	if !baseCfg.Insecure && !baseCfg.ClientHasValidCerts(sqlConnUser) {
+		if sqlConnUser == security.RootUser {
+			return nil, errors.Errorf("connections with user %s must use a client certificate", security.RootUser)
+		}
+
 		pwd, err := security.PromptForPassword()
 		if err != nil {
 			return nil, err
 		}
-		user = url.UserPassword(connUser, pwd)
+
+		user = url.UserPassword(sqlConnUser, pwd)
 	} else {
-		user = url.User(connUser)
+		user = url.User(sqlConnUser)
 	}
 	return makeSQLClient(user)
 }
 
 func makeSQLClient(user *url.Userinfo) (*sqlConn, error) {
-	sqlURL := connURL
-	if len(connURL) == 0 {
+	sqlURL := sqlConnURL
+	if len(sqlConnURL) == 0 {
 		u, err := sqlCtx.PGURL(user)
 		if err != nil {
 			return nil, err
 		}
-		u.Path = connDBName
+		u.Path = sqlConnDBName
 		sqlURL = u.String()
 	}
 	return makeSQLConn(sqlURL), nil
 }
 
 type queryFunc func(conn *sqlConn) (*sqlRows, error)
-
-func nextResult(conn *sqlConn) (*sqlRows, error) {
-	return conn.Next()
-}
 
 func makeQuery(query string, parameters ...driver.Value) queryFunc {
 	return func(conn *sqlConn) (*sqlRows, error) {
@@ -240,29 +433,76 @@ func makeQuery(query string, parameters ...driver.Value) queryFunc {
 
 // runQuery takes a 'query' with optional 'parameters'.
 // It runs the sql query and returns a list of columns names and a list of rows.
-func runQuery(conn *sqlConn, fn queryFunc, pretty bool) ([]string, [][]string, string, error) {
+func runQuery(
+	conn *sqlConn, fn queryFunc, showMoreChars bool,
+) ([]string, [][]string, string, error) {
 	rows, err := fn(conn)
 	if err != nil {
 		return nil, nil, "", err
 	}
 
 	defer func() { _ = rows.Close() }()
-	return sqlRowsToStrings(rows, pretty)
+	return sqlRowsToStrings(rows, showMoreChars)
 }
 
 // runQueryAndFormatResults takes a 'query' with optional 'parameters'.
 // It runs the sql query and writes output to 'w'.
-func runQueryAndFormatResults(conn *sqlConn, w io.Writer, fn queryFunc, pretty bool) error {
+func runQueryAndFormatResults(conn *sqlConn, w io.Writer, fn queryFunc) error {
+	startTime := timeutil.Now()
+	rows, err := fn(conn)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		_ = rows.Close()
+	}()
 	for {
-		cols, allRows, result, err := runQuery(conn, fn, pretty)
-		if err != nil {
-			if err == pq.ErrNoMoreResults {
-				return nil
+		cols := getColumnStrings(rows)
+		if len(cols) == 0 {
+			// When no columns are returned, we want to render a summary of the
+			// number of rows that were returned or affected. To do this this, the
+			// driver needs to "consume" all the rows so that the RowsAffected()
+			// method returns the correct number of rows (it only reports the number
+			// of rows that the driver consumes).
+			if err := consumeAllRows(rows); err != nil {
+				return err
 			}
+		}
+		formattedTag := getFormattedTag(rows.Tag(), rows.Result())
+		if err := printQueryOutput(w, cols, newRowIter(rows, true), formattedTag); err != nil {
 			return err
 		}
-		printQueryOutput(w, cols, allRows, result, pretty)
-		fn = nextResult
+		if cliCtx.showTimes {
+			// Present the time since the last result, or since the
+			// beginning of execution. Currently the execution engine makes
+			// all the work upfront so most of the time is accounted for by
+			// the 1st result; this is subject to change once CockroachDB
+			// evolves to stream results as statements are executed.
+			newNow := timeutil.Now()
+			fmt.Fprintf(w, "\nTime: %s\n\n", newNow.Sub(startTime))
+			startTime = newNow
+		}
+
+		if more, err := rows.NextResultSet(); err != nil {
+			return err
+		} else if !more {
+			return nil
+		}
+	}
+}
+
+// consumeAllRows consumes all of the rows from the network. Used this method
+// when the driver needs to consume all the rows, but you don't care about the
+// rows themselves.
+func consumeAllRows(rows *sqlRows) error {
+	for {
+		err := rows.Next(nil)
+		if err == io.EOF {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
 	}
 }
 
@@ -272,47 +512,76 @@ func runQueryAndFormatResults(conn *sqlConn, w io.Writer, fn queryFunc, pretty b
 // It returns the header row followed by all data rows.
 // If both the header row and list of rows are empty, it means no row
 // information was returned (eg: statement was not a query).
-// If pretty is true, then more characters are not escaped.
-func sqlRowsToStrings(rows *sqlRows, pretty bool) ([]string, [][]string, string, error) {
+// If showMoreChars is true, then more characters are not escaped.
+func sqlRowsToStrings(rows *sqlRows, showMoreChars bool) ([]string, [][]string, string, error) {
+	cols := getColumnStrings(rows)
+	allRows, err := getAllRowStrings(rows, showMoreChars)
+	if err != nil {
+		return nil, nil, "", err
+	}
+	tag := getFormattedTag(rows.Tag(), rows.Result())
+
+	return cols, allRows, tag, nil
+}
+
+func getColumnStrings(rows *sqlRows) []string {
 	srcCols := rows.Columns()
 	cols := make([]string, len(srcCols))
 	for i, c := range srcCols {
-		cols[i] = formatVal(c, pretty, false)
+		cols[i] = formatVal(c, true, false)
+	}
+	return cols
+}
+
+func getAllRowStrings(rows *sqlRows, showMoreChars bool) ([][]string, error) {
+	var allRows [][]string
+
+	for {
+		rowStrings, err := getNextRowStrings(rows, showMoreChars)
+		if err != nil {
+			return nil, err
+		}
+		if rowStrings == nil {
+			break
+		}
+		allRows = append(allRows, rowStrings)
 	}
 
-	var allRows [][]string
+	return allRows, nil
+}
+
+func getNextRowStrings(rows *sqlRows, showMoreChars bool) ([]string, error) {
+	cols := rows.Columns()
 	var vals []driver.Value
 	if len(cols) > 0 {
 		vals = make([]driver.Value, len(cols))
 	}
 
-	for {
-		err := rows.Next(vals)
-		if err == io.EOF {
-			break
-		}
-		if err != nil {
-			return nil, nil, "", err
-		}
-		rowStrings := make([]string, len(cols))
-		for i, v := range vals {
-			rowStrings[i] = formatVal(v, pretty, pretty)
-		}
-		allRows = append(allRows, rowStrings)
+	err := rows.Next(vals)
+	if err == io.EOF {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
 	}
 
-	result := rows.Result()
-	tag := rows.Tag()
+	rowStrings := make([]string, len(cols))
+	for i, v := range vals {
+		rowStrings[i] = formatVal(v, showMoreChars, showMoreChars)
+	}
+	return rowStrings, nil
+}
+
+func getFormattedTag(tag string, result driver.Result) string {
 	switch tag {
 	case "":
 		tag = "OK"
-	case "DELETE", "INSERT", "UPDATE":
+	case "SELECT", "DELETE", "INSERT", "UPDATE":
 		if n, err := result.RowsAffected(); err == nil {
 			tag = fmt.Sprintf("%s %d", tag, n)
 		}
 	}
-
-	return cols, allRows, tag, nil
+	return tag
 }
 
 // expandTabsAndNewLines ensures that multi-line row strings that may
@@ -328,48 +597,6 @@ func expandTabsAndNewLines(s string) string {
 	fmt.Fprint(w, strings.Replace(s, "\n", "␤\n", -1))
 	_ = w.Flush()
 	return buf.String()
-}
-
-// printQueryOutput takes a list of column names and a list of row contents
-// writes a pretty table to 'w', or "OK" if empty.
-func printQueryOutput(w io.Writer, cols []string, allRows [][]string, tag string, pretty bool) {
-	if len(cols) == 0 {
-		// This operation did not return rows, just show the tag.
-		fmt.Fprintln(w, tag)
-		return
-	}
-
-	if pretty {
-		// Initialize tablewriter and set column names as the header row.
-		table := tablewriter.NewWriter(w)
-		table.SetAutoFormatHeaders(false)
-		table.SetAutoWrapText(false)
-		table.SetHeader(cols)
-		for _, row := range allRows {
-			for i, r := range row {
-				row[i] = expandTabsAndNewLines(r)
-			}
-			table.Append(row)
-		}
-		table.Render()
-		nRows := len(allRows)
-		fmt.Fprintf(w, "(%d row%s)\n", nRows, util.Pluralize(int64(nRows)))
-	} else {
-		if len(cols) == 0 {
-			// No result selected, inform the user.
-			fmt.Fprintln(w, tag)
-		} else {
-			// Some results selected, inform the user about how much data to expect.
-			fmt.Fprintf(w, "%d row%s\n", len(allRows),
-				util.Pluralize(int64(len(allRows))))
-
-			// Then print the results themselves.
-			fmt.Fprintln(w, strings.Join(cols, "\t"))
-			for _, row := range allRows {
-				fmt.Fprintln(w, strings.Join(row, "\t"))
-			}
-		}
-	}
 }
 
 func isNotPrintableASCII(r rune) bool { return r < 0x20 || r > 0x7e || r == '"' || r == '\\' }
@@ -413,6 +640,10 @@ func formatVal(val driver.Value, showPrintableUnicode bool, showNewLinesAndTabs 
 			}
 		}
 		return fmt.Sprintf("%+q", t)
+
+	case time.Time:
+		return t.Format(parser.TimestampOutputFormat)
 	}
+
 	return fmt.Sprint(val)
 }

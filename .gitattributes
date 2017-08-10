@@ -1,6 +1,9 @@
 *.pb.* -diff
-pkg/sql/parser/sql.go -diff
-pkg/ui/app/js/protos.js -diff
+*.ir.* -diff
 pkg/ui/embedded.go -diff
+pkg/sql/parser/sql.go -diff
+pkg/sql/ir/parser/irgen/irgen.go -diff
+pkg/ui/src/js/protos.* -diff
 pkg/ui/generated/* -diff
-glide.lock -merge
+pkg/ui/yarn.lock -merge
+Gopkg.toml -merge

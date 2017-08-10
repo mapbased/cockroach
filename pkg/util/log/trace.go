@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Tobias Schottdorf (tobias.schottdorf@gmail.com)
 
 package log
 
@@ -20,6 +18,7 @@ import (
 	"fmt"
 
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
+	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	opentracing "github.com/opentracing/opentracing-go"
 	otlog "github.com/opentracing/opentracing-go/log"
 	"golang.org/x/net/context"
@@ -66,6 +65,8 @@ func WithEventLog(ctx context.Context, family, title string) context.Context {
 	return withEventLogInternal(ctx, trace.NewEventLog(family, title))
 }
 
+var _ = WithEventLog
+
 // WithNoEventLog creates a context which no longer has an embedded event log.
 func WithNoEventLog(ctx context.Context) context.Context {
 	return withEventLogInternal(ctx, nil)
@@ -86,14 +87,12 @@ func FinishEventLog(ctx context.Context) {
 	}
 }
 
-var noopTracer opentracing.NoopTracer
-
 // getSpanOrEventLog returns the current Span. If there is no Span, it returns
-// the current ctxEventLog. If neither (or the Span is NoopTracer), returns
+// the current ctxEventLog. If neither (or the Span is "black hole"), returns
 // false.
 func getSpanOrEventLog(ctx context.Context) (opentracing.Span, *ctxEventLog, bool) {
 	if sp := opentracing.SpanFromContext(ctx); sp != nil {
-		if sp.Tracer() == noopTracer {
+		if tracing.IsBlackHoleSpan(sp) {
 			return nil, nil, false
 		}
 		return sp, nil, true
@@ -130,13 +129,13 @@ func eventInternal(ctx context.Context, isErr, withTags bool, format string, arg
 			// TODO(radu): pass tags directly to sp.LogKV when LightStep supports
 			// that.
 			sp.LogFields(otlog.String("event", msg))
-			if isErr {
-				// TODO(radu): figure out a way to signal that this is an error. We
-				// could use a different "error" key (provided it shows up in
-				// LightStep). Things like NetTraceIntegrator would need to be modified
-				// to understand the difference. We could also set a special Tag or
-				// Baggage on the span. See #8827 for more discussion.
-			}
+			// if isErr {
+			// 	// TODO(radu): figure out a way to signal that this is an error. We
+			// 	// could use a different "error" key (provided it shows up in
+			// 	// LightStep). Things like NetTraceIntegrator would need to be modified
+			// 	// to understand the difference. We could also set a special Tag or
+			// 	// Baggage on the span. See #8827 for more discussion.
+			// }
 		} else {
 			el.Lock()
 			if el.eventLog != nil {
@@ -155,7 +154,7 @@ func eventInternal(ctx context.Context, isErr, withTags bool, format string, arg
 // message to it. If no Trace is found, it looks for an EventLog in the context
 // and logs the message to it. If neither is found, does nothing.
 func Event(ctx context.Context, msg string) {
-	eventInternal(ctx, false /*isErr*/, true /*withTags*/, "%s", msg)
+	eventInternal(ctx, false /*isErr*/, true /*withTags*/, msg)
 }
 
 // Eventf looks for an opentracing.Trace in the context and formats and logs
@@ -169,7 +168,7 @@ func Eventf(ctx context.Context, format string, args ...interface{}) {
 // message to it. If no Trace is found, it looks for an EventLog in the context
 // and logs the message to it (as an error). If neither is found, does nothing.
 func ErrEvent(ctx context.Context, msg string) {
-	eventInternal(ctx, true /*isErr*/, true /*withTags*/, "%s", msg)
+	eventInternal(ctx, true /*isErr*/, true /*withTags*/, msg)
 }
 
 // ErrEventf looks for an opentracing.Trace in the context and formats and logs
@@ -188,7 +187,7 @@ func VEvent(ctx context.Context, level level, msg string) {
 		// Log to INFO (which also logs an event).
 		logDepth(ctx, 1, Severity_INFO, "", []interface{}{msg})
 	} else {
-		eventInternal(ctx, false /*isErr*/, true /*withTags*/, "%s", msg)
+		eventInternal(ctx, false /*isErr*/, true /*withTags*/, msg)
 	}
 }
 
@@ -202,4 +201,22 @@ func VEventf(ctx context.Context, level level, format string, args ...interface{
 	} else {
 		eventInternal(ctx, false /*isErr*/, true /*withTags*/, format, args...)
 	}
+}
+
+// VEventfDepth performs the same as VEventf but checks the verbosity level
+// at the given depth in the call stack.
+func VEventfDepth(ctx context.Context, depth int, level level, format string, args ...interface{}) {
+	if VDepth(level, 1+depth) {
+		// Log to INFO (which also logs an event).
+		logDepth(ctx, 1+depth, Severity_INFO, format, args)
+	} else {
+		eventInternal(ctx, false /*isErr*/, true /*withTags*/, format, args...)
+	}
+}
+
+// HasSpanOrEvent returns true if the context has a span or event that should
+// be logged to.
+func HasSpanOrEvent(ctx context.Context) bool {
+	_, _, ok := getSpanOrEventLog(ctx)
+	return ok
 }

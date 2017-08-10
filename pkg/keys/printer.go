@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Veteran Lu (23907238@qq.com)
 
 package keys
 
@@ -289,9 +287,9 @@ func localRangeIDKeyParse(input string) (remainder string, key roachpb.Key) {
 			break
 		}
 	}
-	maker := MakeRangeIDUnreplicatedKey
+	maker := makeRangeIDUnreplicatedKey
 	if replicated {
-		maker = MakeRangeIDReplicatedKey
+		maker = makeRangeIDReplicatedKey
 	}
 	if suffix != nil {
 		if input != "" {
@@ -429,6 +427,9 @@ func print(key roachpb.Key) string {
 }
 
 func decodeKeyPrint(key roachpb.Key) string {
+	if key.Equal(SystemConfigSpan.Key) {
+		return "/SystemConfigSpan/Start"
+	}
 	return encoding.PrettyPrintValue(key, "/")
 }
 
@@ -439,35 +440,63 @@ func decodeTimeseriesKey(key roachpb.Key) string {
 // prettyPrintInternal parse key with prefix in keyDict,
 // if the key don't march any prefix in keyDict, return its byte value with quotation and false,
 // or else return its human readable value and true.
-func prettyPrintInternal(key roachpb.Key) (string, bool) {
-	var buf bytes.Buffer
-	for _, k := range keyDict {
-		if key.Compare(k.start) >= 0 && (k.end == nil || key.Compare(k.end) <= 0) {
-			buf.WriteString(k.name)
-			if k.end != nil && k.end.Compare(key) == 0 {
-				buf.WriteString("/Max")
-				return buf.String(), true
-			}
-
-			hasPrefix := false
-			for _, e := range k.entries {
-				if bytes.HasPrefix(key, e.prefix) {
-					hasPrefix = true
-					key = key[len(e.prefix):]
-					fmt.Fprintf(&buf, "%s%s", e.name, e.ppFunc(key))
-					break
-				}
-			}
-			if !hasPrefix {
-				key = key[len(k.start):]
-				fmt.Fprintf(&buf, "/%q", []byte(key))
-			}
-
-			return buf.String(), true
+func prettyPrintInternal(key roachpb.Key, quoteRawKeys bool) string {
+	for _, k := range constKeyDict {
+		if key.Equal(k.value) {
+			return k.name
 		}
 	}
 
-	return fmt.Sprintf("%q", []byte(key)), false
+	helper := func(key roachpb.Key) (string, bool) {
+		var buf bytes.Buffer
+		for _, k := range keyDict {
+			if key.Compare(k.start) >= 0 && (k.end == nil || key.Compare(k.end) <= 0) {
+				buf.WriteString(k.name)
+				if k.end != nil && k.end.Compare(key) == 0 {
+					buf.WriteString("/Max")
+					return buf.String(), true
+				}
+
+				hasPrefix := false
+				for _, e := range k.entries {
+					if bytes.HasPrefix(key, e.prefix) {
+						hasPrefix = true
+						key = key[len(e.prefix):]
+						fmt.Fprintf(&buf, "%s%s", e.name, e.ppFunc(key))
+						break
+					}
+				}
+				if !hasPrefix {
+					key = key[len(k.start):]
+					if quoteRawKeys {
+						fmt.Fprintf(&buf, "/%q", []byte(key))
+					} else {
+						fmt.Fprintf(&buf, "/%s", []byte(key))
+					}
+				}
+
+				return buf.String(), true
+			}
+		}
+
+		if quoteRawKeys {
+			return fmt.Sprintf("%q", []byte(key)), false
+		}
+		return fmt.Sprintf("%s", []byte(key)), false
+	}
+
+	for _, k := range keyOfKeyDict {
+		if bytes.HasPrefix(key, k.prefix) {
+			key = key[len(k.prefix):]
+			str, formatted := helper(key)
+			if formatted {
+				return k.name + str
+			}
+			return k.name + "/" + str
+		}
+	}
+	str, _ := helper(key)
+	return str
 }
 
 // PrettyPrint prints the key in a human readable format:
@@ -505,24 +534,7 @@ func prettyPrintInternal(key roachpb.Key) (string, bool) {
 // /Min                                              ""
 // /Max                                              "\xff\xff"
 func PrettyPrint(key roachpb.Key) string {
-	for _, k := range constKeyDict {
-		if key.Equal(k.value) {
-			return k.name
-		}
-	}
-
-	for _, k := range keyOfKeyDict {
-		if bytes.HasPrefix(key, k.prefix) {
-			key = key[len(k.prefix):]
-			str, formatted := prettyPrintInternal(key)
-			if formatted {
-				return k.name + str
-			}
-			return k.name + "/" + str
-		}
-	}
-	str, _ := prettyPrintInternal(key)
-	return str
+	return prettyPrintInternal(key, true)
 }
 
 var errIllegalInput = errors.New("illegal input")
@@ -597,6 +609,7 @@ outer:
 
 func init() {
 	roachpb.PrettyPrintKey = PrettyPrint
+	roachpb.PrettyPrintRange = PrettyPrintRange
 }
 
 // MassagePrettyPrintedSpanForTest does some transformations on pretty-printed spans and keys:
@@ -627,22 +640,6 @@ func MassagePrettyPrintedSpanForTest(span string, dirs []encoding.Direction) str
 				// We're switching from the start constraints to the end constraints,
 				// or starting another span.
 				colIdx = -1
-			case '<':
-				// This is an error message, like <util/encoding/encoding.go:256: ....>.
-				end := strings.Index(span[i:], ">")
-				if end == -1 {
-					panic("parse error")
-				}
-				errMsg := span[i+1 : i+end+1]
-				lineIdx := strings.Index(errMsg, ":")
-				if lineIdx != -1 {
-					var lineEnd int
-					for lineEnd = lineIdx + 1; errMsg[lineEnd] >= '0' && errMsg[lineEnd] <= '9'; lineEnd++ {
-					}
-					errMsg = errMsg[:lineIdx] + errMsg[lineIdx+(lineEnd-lineIdx):]
-				}
-				r += errMsg
-				i += end
 			}
 		}
 	}
@@ -654,13 +651,13 @@ func MassagePrettyPrintedSpanForTest(span string, dirs []encoding.Direction) str
 //    commonPrefix{remainingStart-remainingEnd}
 // It prints at most maxChars, truncating components as needed. See
 // TestPrettyPrintRange for some examples.
-func PrettyPrintRange(b *bytes.Buffer, start, end roachpb.Key, maxChars int) {
-	const ellipsis = '\u2026'
+func PrettyPrintRange(start, end roachpb.Key, maxChars int) string {
+	var b bytes.Buffer
 	if maxChars < 8 {
 		maxChars = 8
 	}
-	prettyStart := PrettyPrint(start)
-	prettyEnd := PrettyPrint(end)
+	prettyStart := prettyPrintInternal(start, false)
+	prettyEnd := prettyPrintInternal(end, false)
 	i := 0
 	// Find the common prefix.
 	for ; i < len(prettyStart) && i < len(prettyEnd) && prettyStart[i] == prettyEnd[i]; i++ {
@@ -672,8 +669,8 @@ func PrettyPrintRange(b *bytes.Buffer, start, end roachpb.Key, maxChars int) {
 			i = maxChars - 1
 		}
 		b.WriteString(prettyStart[:i])
-		b.WriteRune(ellipsis)
-		return
+		b.WriteRune('…')
+		return b.String()
 	}
 	b.WriteString(prettyStart[:i])
 	remaining := (maxChars - i - 3) / 2
@@ -683,13 +680,15 @@ func PrettyPrintRange(b *bytes.Buffer, start, end roachpb.Key, maxChars int) {
 			b.WriteString(what)
 		} else {
 			b.WriteString(what[:maxChars-1])
-			b.WriteRune(ellipsis)
+			b.WriteRune('…')
 		}
 	}
 
 	b.WriteByte('{')
-	printTrunc(b, prettyStart[i:], remaining)
+	printTrunc(&b, prettyStart[i:], remaining)
 	b.WriteByte('-')
-	printTrunc(b, prettyEnd[i:], remaining)
+	printTrunc(&b, prettyEnd[i:], remaining)
 	b.WriteByte('}')
+
+	return b.String()
 }

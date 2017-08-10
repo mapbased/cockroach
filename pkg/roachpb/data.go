@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Spencer Kimball (spencer.kimball@gmail.com)
 
 package roachpb
 
@@ -31,16 +29,19 @@ import (
 	"time"
 	"unicode"
 
-	"github.com/biogo/store/interval"
 	"github.com/gogo/protobuf/proto"
 	"github.com/pkg/errors"
-	"gopkg.in/inf.v0"
+	"golang.org/x/net/context"
 
+	"github.com/cockroachdb/apd"
 	"github.com/cockroachdb/cockroach/pkg/storage/engine/enginepb"
 	"github.com/cockroachdb/cockroach/pkg/util/duration"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
+	"github.com/cockroachdb/cockroach/pkg/util/interval"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
+	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 )
 
@@ -54,9 +55,15 @@ var (
 	// KeyMax is a maximum key value which sorts after all other keys.
 	KeyMax = Key(RKeyMax)
 
-	// PrettyPrintKey is a function to print key with human readable format
-	// it's implement at package git.com/cockroachdb/cockroach/keys to avoid package circle import
+	// PrettyPrintKey prints a key in human readable format. It's
+	// implemented in package git.com/cockroachdb/cockroach/keys to avoid
+	// package circle import.
 	PrettyPrintKey func(key Key) string
+
+	// PrettyPrintRange prints a key range in human readable format. It's
+	// implemented in package git.com/cockroachdb/cockroach/keys to avoid
+	// package circle import.
+	PrettyPrintRange func(start, end Key, maxChars int) string
 )
 
 // RKey denotes a Key whose local addressing has been accounted for.
@@ -168,9 +175,9 @@ func (k Key) Equal(l Key) bool {
 	return bytes.Equal(k, l)
 }
 
-// Compare implements the interval.Comparable interface for tree nodes.
-func (k Key) Compare(b interval.Comparable) int {
-	return bytes.Compare(k, b.(Key))
+// Compare compares the two Keys.
+func (k Key) Compare(b Key) int {
+	return bytes.Compare(k, b)
 }
 
 // String returns a string-formatted version of the key.
@@ -262,6 +269,11 @@ func (v *Value) ShallowClone() *Value {
 	}
 	t := *v
 	return &t
+}
+
+// IsPresent returns true if the value is present (existent and not a tombstone).
+func (v *Value) IsPresent() bool {
+	return v != nil && len(v.RawBytes) != 0
 }
 
 // MakeValueFromString returns a value with bytes and tag set.
@@ -411,7 +423,7 @@ func (v *Value) SetDuration(t duration.Duration) error {
 
 // SetDecimal encodes the specified decimal value into the bytes field of
 // the receiver using Gob encoding, sets the tag and clears the checksum.
-func (v *Value) SetDecimal(dec *inf.Dec) error {
+func (v *Value) SetDecimal(dec *apd.Decimal) error {
 	decSize := encoding.UpperBoundNonsortingDecimalSize(dec)
 	v.RawBytes = make([]byte, headerSize, headerSize+decSize)
 	v.RawBytes = encoding.EncodeNonsortingDecimal(v.RawBytes, dec)
@@ -525,9 +537,9 @@ func (v Value) GetDuration() (duration.Duration, error) {
 
 // GetDecimal decodes a decimal value from the bytes of the receiver. If the
 // tag is not DECIMAL an error will be returned.
-func (v Value) GetDecimal() (*inf.Dec, error) {
+func (v Value) GetDecimal() (apd.Decimal, error) {
 	if tag := v.GetTag(); tag != ValueType_DECIMAL {
-		return nil, fmt.Errorf("value type is not %s: %s", ValueType_DECIMAL, tag)
+		return apd.Decimal{}, fmt.Errorf("value type is not %s: %s", ValueType_DECIMAL, tag)
 	}
 	return encoding.DecodeNonsortingDecimal(v.dataBytes(), nil)
 }
@@ -635,7 +647,7 @@ func (v Value) PrettyPrint() string {
 		t, err = v.GetTime()
 		buf.WriteString(t.UTC().Format(time.RFC3339Nano))
 	case ValueType_DECIMAL:
-		var d *inf.Dec
+		var d apd.Decimal
 		d, err = v.GetDecimal()
 		buf.WriteString(d.String())
 	case ValueType_DURATION:
@@ -651,6 +663,13 @@ func (v Value) PrettyPrint() string {
 	}
 	return buf.String()
 }
+
+const (
+	// MinTxnPriority is the minimum allowed txn priority.
+	MinTxnPriority = 0
+	// MaxTxnPriority is the maximum allowed txn priority.
+	MaxTxnPriority = math.MaxInt32
+)
 
 // NewTransaction creates a new transaction. The transaction key is
 // composed using the specified baseKey (for locality with data
@@ -668,6 +687,15 @@ func NewTransaction(
 	maxOffset int64,
 ) *Transaction {
 	u := uuid.MakeV4()
+	var maxTS hlc.Timestamp
+	if maxOffset == timeutil.ClocklessMaxOffset {
+		// For clockless reads, use the largest possible maxTS. This means we'll
+		// always restart if we see something in our future (but we do so at
+		// most once thanks to ObservedTimestamps).
+		maxTS.WallTime = math.MaxInt64
+	} else {
+		maxTS = now.Add(maxOffset, 0)
+	}
 
 	return &Transaction{
 		TxnMeta: enginepb.TxnMeta{
@@ -679,35 +707,30 @@ func NewTransaction(
 			Sequence:  1,
 		},
 		Name:          name,
+		LastHeartbeat: now,
 		OrigTimestamp: now,
-		MaxTimestamp:  now.Add(maxOffset, 0),
+		MaxTimestamp:  maxTS,
 	}
 }
 
 // LastActive returns the last timestamp at which client activity definitely
 // occurred, i.e. the maximum of OrigTimestamp and LastHeartbeat.
 func (t Transaction) LastActive() hlc.Timestamp {
-	candidate := t.OrigTimestamp
-	if t.LastHeartbeat != nil && candidate.Less(*t.LastHeartbeat) {
-		candidate = *t.LastHeartbeat
+	ts := t.LastHeartbeat
+	if ts.Less(t.OrigTimestamp) {
+		ts = t.OrigTimestamp
 	}
-	return candidate
+	return ts
 }
 
 // Clone creates a copy of the given transaction. The copy is "mostly" deep,
 // but does share pieces of memory with the original such as Key, ID and the
 // keys with the intent spans.
 func (t Transaction) Clone() Transaction {
-	if t.LastHeartbeat != nil {
-		h := *t.LastHeartbeat
-		t.LastHeartbeat = &h
-	}
 	mt := t.ObservedTimestamps
 	if mt != nil {
-		t.ObservedTimestamps = make(map[NodeID]hlc.Timestamp)
-		for k, v := range mt {
-			t.ObservedTimestamps[k] = v
-		}
+		t.ObservedTimestamps = make([]ObservedTimestamp, len(mt))
+		copy(t.ObservedTimestamps, mt)
 	}
 	// Note that we're not cloning the span keys under the assumption that the
 	// keys themselves are not mutable.
@@ -715,29 +738,22 @@ func (t Transaction) Clone() Transaction {
 	return t
 }
 
-// Equal tests two transactions for equality. They are equal if they are
-// either simultaneously nil or their IDs match.
-func (t *Transaction) Equal(s *Transaction) bool {
-	if t == nil && s == nil {
-		return true
-	}
-	if (t == nil && s != nil) || (t != nil && s == nil) {
-		return false
-	}
-	return TxnIDEqual(t.ID, s.ID)
-}
-
 // IsInitialized returns true if the transaction has been initialized.
 func (t *Transaction) IsInitialized() bool {
 	return t.ID != nil
 }
 
-// MakePriority generates a random priority value, biased by the
-// specified userPriority. If userPriority=100, the random priority
-// will be 100x more likely to be greater than if userPriority=1. If
-// userPriority = 0.1, the random priority will be 1/10th as likely to
-// be greater than if userPriority=1. Balance is achieved when
-// userPriority=1, in which case the priority chosen is unbiased.
+// MakePriority generates a random priority value, biased by the specified
+// userPriority. If userPriority=100, the random priority will be 100x more
+// likely to be greater than if userPriority=1. If userPriority = 0.1, the
+// random priority will be 1/10th as likely to be greater than if
+// userPriority=NormalUserPriority ( = 1). Balance is achieved when
+// userPriority=NormalUserPriority, in which case the priority chosen is
+// unbiased.
+//
+// If userPriority is less than or equal to MinUserPriority, returns
+// MinTxnPriority; if greater than or equal to MaxUserPriority, returns
+// MaxTxnPriority. If userPriority is 0, returns NormalUserPriority.
 func MakePriority(userPriority UserPriority) int32 {
 	// A currently undocumented feature allows an explicit priority to
 	// be set by specifying priority < 1. The explicit priority is
@@ -749,11 +765,11 @@ func MakePriority(userPriority UserPriority) int32 {
 		}
 		return int32(-userPriority)
 	} else if userPriority == 0 {
-		userPriority = 1
-	} else if userPriority > MaxUserPriority {
-		userPriority = MaxUserPriority
-	} else if userPriority < MinUserPriority {
-		userPriority = MinUserPriority
+		userPriority = NormalUserPriority
+	} else if userPriority >= MaxUserPriority {
+		return MaxTxnPriority
+	} else if userPriority <= MinUserPriority {
+		return MinTxnPriority
 	}
 
 	// We generate random values which are biased according to priorities. If v1 is a value
@@ -804,8 +820,10 @@ func MakePriority(userPriority UserPriority) int32 {
 	// For userPriority=MaxUserPriority, the probability of overflow is 0.7%.
 	// For userPriority=(MaxUserPriority/2), the probability of overflow is 0.005%.
 	val = (val / (5 * MaxUserPriority)) * math.MaxInt32
-	if val >= math.MaxInt32 {
-		return math.MaxInt32
+	if val <= MinTxnPriority {
+		return MinTxnPriority + 1
+	} else if val >= MaxTxnPriority {
+		return MaxTxnPriority - 1
 	}
 	return int32(val)
 }
@@ -841,6 +859,7 @@ func (t *Transaction) Restart(
 	t.UpgradePriority(upgradePriority)
 	t.WriteTooOld = false
 	t.RetryOnPush = false
+	t.Sequence = 0
 }
 
 // Update ratchets priority, timestamp and original timestamp values (among
@@ -864,18 +883,13 @@ func (t *Transaction) Update(o *Transaction) {
 		t.Epoch = o.Epoch
 	}
 	t.Timestamp.Forward(o.Timestamp)
+	t.LastHeartbeat.Forward(o.LastHeartbeat)
 	t.OrigTimestamp.Forward(o.OrigTimestamp)
 	t.MaxTimestamp.Forward(o.MaxTimestamp)
-	if o.LastHeartbeat != nil {
-		if t.LastHeartbeat == nil {
-			t.LastHeartbeat = &hlc.Timestamp{}
-		}
-		t.LastHeartbeat.Forward(*o.LastHeartbeat)
-	}
 
 	// Absorb the collected clock uncertainty information.
-	for k, v := range o.ObservedTimestamps {
-		t.UpdateObservedTimestamp(k, v)
+	for _, v := range o.ObservedTimestamps {
+		t.UpdateObservedTimestamp(v.NodeID, v.Timestamp)
 	}
 	t.UpgradePriority(o.Priority)
 	// We can't assert against regression here since it can actually happen
@@ -898,9 +912,11 @@ func (t *Transaction) Update(o *Transaction) {
 }
 
 // UpgradePriority sets transaction priority to the maximum of current
-// priority and the specified minPriority.
+// priority and the specified minPriority. The exception is if the
+// current priority is set to the minimum, in which case the minimum
+// is preserved.
 func (t *Transaction) UpgradePriority(minPriority int32) {
-	if minPriority > t.Priority {
+	if minPriority > t.Priority && t.Priority != MinTxnPriority {
 		t.Priority = minPriority
 	}
 }
@@ -913,9 +929,13 @@ func (t Transaction) String() string {
 	if len(t.Name) > 0 {
 		fmt.Fprintf(&buf, "%q ", t.Name)
 	}
-	fmt.Fprintf(&buf, "id=%s key=%s rw=%t pri=%.8f iso=%s stat=%s epo=%d ts=%s orig=%s max=%s wto=%t rop=%t",
+	fmt.Fprintf(&buf, "id=%s key=%s rw=%t pri=%.8f iso=%s stat=%s epo=%d "+
+		"ts=%s orig=%s max=%s wto=%t rop=%t seq=%d",
 		t.Short(), Key(t.Key), t.Writing, floatPri, t.Isolation, t.Status, t.Epoch, t.Timestamp,
-		t.OrigTimestamp, t.MaxTimestamp, t.WriteTooOld, t.RetryOnPush)
+		t.OrigTimestamp, t.MaxTimestamp, t.WriteTooOld, t.RetryOnPush, t.Sequence)
+	if ni := len(t.Intents); t.Status != PENDING && ni > 0 {
+		fmt.Fprintf(&buf, " int=%d", ni)
+	}
 	return buf.String()
 }
 
@@ -929,12 +949,8 @@ func (t *Transaction) ResetObservedTimestamps() {
 // operations in the transaction. When multiple calls are made for a single
 // nodeID, the lowest timestamp prevails.
 func (t *Transaction) UpdateObservedTimestamp(nodeID NodeID, maxTS hlc.Timestamp) {
-	if t.ObservedTimestamps == nil {
-		t.ObservedTimestamps = make(map[NodeID]hlc.Timestamp)
-	}
-	if ts, ok := t.ObservedTimestamps[nodeID]; !ok || maxTS.Less(ts) {
-		t.ObservedTimestamps[nodeID] = maxTS
-	}
+	s := observedTimestampSlice(t.ObservedTimestamps)
+	t.ObservedTimestamps = s.update(nodeID, maxTS)
 }
 
 // GetObservedTimestamp returns the lowest HLC timestamp recorded from the
@@ -942,8 +958,90 @@ func (t *Transaction) UpdateObservedTimestamp(nodeID NodeID, maxTS hlc.Timestamp
 // no observation about the requested node was found. Otherwise, MaxTimestamp
 // can be lowered to the returned timestamp when reading from nodeID.
 func (t Transaction) GetObservedTimestamp(nodeID NodeID) (hlc.Timestamp, bool) {
-	ts, ok := t.ObservedTimestamps[nodeID]
-	return ts, ok
+	s := observedTimestampSlice(t.ObservedTimestamps)
+	return s.get(nodeID)
+}
+
+// PrepareTransactionForRetry returns a new Transaction to be used for retrying
+// the original Transaction. Depending on the error, this might return an
+// already-existing Transaction with an incremented epoch, or a completely new
+// Transaction.
+//
+// The caller should generally check that the error was
+// meant for this Transaction before calling this.
+//
+// pri is the priority that should be used when giving the restarted transaction
+// the chance to get a higher priority. Not used when the transaction is being
+// aborted.
+//
+// In case retryErr tells us that a new Transaction needs to be created,
+// isolation and name help initialize this new transaction.
+func PrepareTransactionForRetry(ctx context.Context, pErr *Error, pri UserPriority) Transaction {
+	if pErr.TransactionRestart == TransactionRestart_NONE {
+		log.Fatalf(ctx, "invalid retryable err (%T): %s", pErr.GetDetail(), pErr)
+	}
+	txn := pErr.GetTxn()
+	if txn == nil {
+		log.Fatalf(ctx, "missing txn for retryable error: %s", pErr)
+	}
+
+	aborted := false
+
+	// Figure out what updated Transaction the error should carry.
+	// TransactionAbortedError will not carry a Transaction, signaling to the
+	// recipient to start a brand new txn.
+	txnClone := txn.Clone()
+	txn = &txnClone
+	switch tErr := pErr.GetDetail().(type) {
+	case *TransactionAbortedError:
+		aborted = true
+		// TODO(andrei): Should we preserve the ObservedTimestamps across the
+		// restart?
+		txn = &Transaction{
+			TxnMeta: enginepb.TxnMeta{
+				Priority:  txn.Priority,
+				Timestamp: txn.Timestamp,
+				Isolation: txn.Isolation,
+			},
+			Name: txn.Name,
+		}
+	case *ReadWithinUncertaintyIntervalError:
+		// If the reader encountered a newer write within the uncertainty
+		// interval, we advance the txn's timestamp just past the last observed
+		// timestamp from the node.
+		ts, ok := txn.GetObservedTimestamp(pErr.OriginNode)
+		if !ok {
+			log.Fatalf(ctx,
+				"missing observed timestamp for node %d found on uncertainty restart. "+
+					"err: %s. txn: %s. Observed timestamps: %s",
+				pErr.OriginNode, pErr, txn, txn.ObservedTimestamps)
+		}
+		txn.Timestamp.Forward(ts)
+	case *TransactionPushError:
+		// Increase timestamp if applicable, ensuring that we're just ahead of
+		// the pushee.
+		txn.Timestamp.Forward(tErr.PusheeTxn.Timestamp)
+		txn.UpgradePriority(tErr.PusheeTxn.Priority - 1)
+	case *TransactionRetryError:
+		// Nothing to do. Transaction.Timestamp has already been forwarded to be
+		// ahead of any timestamp cache entries or newer versions which caused
+		// the restart.
+	case *WriteTooOldError:
+		// Increase the timestamp to the ts at which we've actually written.
+		txn.Timestamp.Forward(tErr.ActualTimestamp)
+	default:
+		log.Fatalf(ctx, "invalid retryable err (%T): %s", pErr.GetDetail(), pErr)
+	}
+	if !aborted {
+		txn.Restart(pri, txn.Priority, txn.Timestamp)
+	}
+	return *txn
+}
+
+var _ fmt.Stringer = &ChangeReplicasTrigger{}
+
+func (crt ChangeReplicasTrigger) String() string {
+	return fmt.Sprintf("%s(%s): updated=%s next=%d", crt.ChangeType, crt.Replica, crt.UpdatedReplicas, crt.NextReplicaID)
 }
 
 var _ fmt.Stringer = &Lease{}
@@ -992,7 +1090,7 @@ func (l Lease) Type() LeaseType {
 // Ignore proposed timestamps for lease verification; for epoch-
 // based leases, the start time of the lease is sufficient to
 // avoid using an older lease with same epoch.
-func (l Lease) Equivalent(ol Lease) error {
+func (l Lease) Equivalent(ol Lease) bool {
 	// Ignore proposed timestamp & deprecated start stasis.
 	l.ProposedTS, ol.ProposedTS = nil, nil
 	l.DeprecatedStartStasis = ol.DeprecatedStartStasis
@@ -1006,10 +1104,7 @@ func (l Lease) Equivalent(ol Lease) error {
 		l.Expiration.Less(ol.Expiration) {
 		l.Expiration = ol.Expiration
 	}
-	if l == ol {
-		return nil
-	}
-	return errors.Errorf("leases %+v and %+v are not equivalent", l, ol)
+	return l == ol
 }
 
 // AsIntents takes a slice of spans and returns it as a slice of intents for
@@ -1026,8 +1121,8 @@ func AsIntents(spans []Span, txn *Transaction) []Intent {
 	return ret
 }
 
-// Equal compares for equality.
-func (s Span) Equal(o Span) bool {
+// EqualValue compares for equality.
+func (s Span) EqualValue(o Span) bool {
 	return s.Key.Equal(o.Key) && s.EndKey.Equal(o.EndKey)
 }
 
@@ -1041,6 +1136,37 @@ func (s Span) Overlaps(o Span) bool {
 		return bytes.Compare(o.Key, s.Key) >= 0 && bytes.Compare(o.Key, s.EndKey) < 0
 	}
 	return bytes.Compare(s.EndKey, o.Key) > 0 && bytes.Compare(s.Key, o.EndKey) < 0
+}
+
+// Contains returns whether the receiver contains the given span.
+func (s Span) Contains(o Span) bool {
+	if len(s.EndKey) == 0 && len(o.EndKey) == 0 {
+		return s.Key.Equal(o.Key)
+	} else if len(s.EndKey) == 0 {
+		return false
+	} else if len(o.EndKey) == 0 {
+		return bytes.Compare(o.Key, s.Key) >= 0 && bytes.Compare(o.Key, s.EndKey) < 0
+	}
+	return bytes.Compare(s.Key, o.Key) <= 0 && bytes.Compare(s.EndKey, o.EndKey) >= 0
+}
+
+// AsRange returns the Span as an interval.Range.
+func (s Span) AsRange() interval.Range {
+	startKey := s.Key
+	endKey := s.EndKey
+	if len(endKey) == 0 {
+		endKey = s.Key.Next()
+		startKey = endKey[:len(startKey)]
+	}
+	return interval.Range{
+		Start: interval.Comparable(startKey),
+		End:   interval.Comparable(endKey),
+	}
+}
+
+func (s Span) String() string {
+	const maxChars = math.MaxInt32
+	return PrettyPrintRange(s.Key, s.EndKey, maxChars)
 }
 
 // Spans is a slice of spans.
@@ -1088,11 +1214,14 @@ func (rs RSpan) ContainsKeyRange(start, end RKey) bool {
 	return bytes.Compare(start, rs.Key) >= 0 && bytes.Compare(rs.EndKey, end) >= 0
 }
 
+func (rs RSpan) String() string {
+	const maxChars = math.MaxInt32
+	return PrettyPrintRange(Key(rs.Key), Key(rs.EndKey), maxChars)
+}
+
 // Intersect returns the intersection of the current span and the
 // descriptor's range. Returns an error if the span and the
 // descriptor's range do not overlap.
-// TODO(nvanbenschoten) Investigate why this returns an endKey when
-// rs.EndKey is nil. This gives the method unexpected behavior.
 func (rs RSpan) Intersect(desc *RangeDescriptor) (RSpan, error) {
 	if !rs.Key.Less(desc.EndKey) || !desc.StartKey.Less(rs.EndKey) {
 		return rs, errors.Errorf("span and descriptor's range do not overlap: %s vs %s", rs, desc)
@@ -1103,10 +1232,25 @@ func (rs RSpan) Intersect(desc *RangeDescriptor) (RSpan, error) {
 		key = desc.StartKey
 	}
 	endKey := rs.EndKey
-	if !desc.ContainsKeyRange(desc.StartKey, endKey) || endKey == nil {
+	if !desc.ContainsKeyRange(desc.StartKey, endKey) {
 		endKey = desc.EndKey
 	}
 	return RSpan{key, endKey}, nil
+}
+
+// asRawSpan returns the RSpan as a Span. This is to be used only in select
+// situations in which an RSpan is known to not contain a wrapped locally-
+// addressed Span. Do not export.
+func (rs RSpan) asRawSpan() Span {
+	return Span{
+		Key:    Key(rs.Key),
+		EndKey: Key(rs.EndKey),
+	}
+}
+
+// Overlaps returns whether the two spans overlap.
+func (rs RSpan) Overlaps(other RSpan) bool {
+	return rs.asRawSpan().Overlaps(other.asRawSpan())
 }
 
 // KeyValueByKey implements sorting of a slice of KeyValues by key.
@@ -1128,3 +1272,42 @@ func (kv KeyValueByKey) Swap(i, j int) {
 }
 
 var _ sort.Interface = KeyValueByKey{}
+
+// observedTimestampSlice maintains a sorted list of observed timestamps.
+type observedTimestampSlice []ObservedTimestamp
+
+func (s observedTimestampSlice) index(nodeID NodeID) int {
+	return sort.Search(len(s),
+		func(i int) bool {
+			return s[i].NodeID >= nodeID
+		},
+	)
+}
+
+// get the observed timestamp for the specified node, returning false if no
+// timestamp exists.
+func (s observedTimestampSlice) get(nodeID NodeID) (hlc.Timestamp, bool) {
+	i := s.index(nodeID)
+	if i < len(s) && s[i].NodeID == nodeID {
+		return s[i].Timestamp, true
+	}
+	return hlc.Timestamp{}, false
+}
+
+// update the timestamp for the specified node, or add a new entry in the
+// correct (sorted) location.
+func (s observedTimestampSlice) update(
+	nodeID NodeID, timestamp hlc.Timestamp,
+) observedTimestampSlice {
+	i := s.index(nodeID)
+	if i < len(s) && s[i].NodeID == nodeID {
+		if timestamp.Less(s[i].Timestamp) {
+			s[i].Timestamp = timestamp
+		}
+		return s
+	}
+	s = append(s, ObservedTimestamp{})
+	copy(s[i+1:], s[i:])
+	s[i] = ObservedTimestamp{NodeID: nodeID, Timestamp: timestamp}
+	return s
+}

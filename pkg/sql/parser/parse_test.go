@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Peter Mattis (peter@cockroachlabs.com)
 
 package parser
 
@@ -21,6 +19,7 @@ import (
 	"fmt"
 	"go/constant"
 	"reflect"
+	"strings"
 	"testing"
 	"unicode/utf8"
 
@@ -38,46 +37,51 @@ func TestParse(t *testing.T) {
 		{`VALUES ("")`},
 
 		{`BEGIN TRANSACTION`},
+		{`BEGIN TRANSACTION READ ONLY`},
+		{`BEGIN TRANSACTION READ WRITE`},
 		{`BEGIN TRANSACTION ISOLATION LEVEL SNAPSHOT`},
 		{`BEGIN TRANSACTION ISOLATION LEVEL SERIALIZABLE`},
 		{`BEGIN TRANSACTION PRIORITY LOW`},
 		{`BEGIN TRANSACTION PRIORITY NORMAL`},
 		{`BEGIN TRANSACTION PRIORITY HIGH`},
 		{`BEGIN TRANSACTION ISOLATION LEVEL SERIALIZABLE, PRIORITY HIGH`},
+		{`BEGIN TRANSACTION ISOLATION LEVEL SERIALIZABLE, PRIORITY HIGH, READ WRITE`},
 		{`COMMIT TRANSACTION`},
 		{`ROLLBACK TRANSACTION`},
 		{"SAVEPOINT foo"},
 
 		{`CREATE DATABASE a`},
-		{`CREATE DATABASE a TEMPLATE = template0`},
-		{`CREATE DATABASE a TEMPLATE = invalid`},
+		{`CREATE DATABASE a TEMPLATE = 'template0'`},
+		{`CREATE DATABASE a TEMPLATE = 'invalid'`},
 		{`CREATE DATABASE a ENCODING = 'UTF8'`},
 		{`CREATE DATABASE a ENCODING = 'INVALID'`},
 		{`CREATE DATABASE a LC_COLLATE = 'C.UTF-8'`},
 		{`CREATE DATABASE a LC_COLLATE = 'INVALID'`},
 		{`CREATE DATABASE a LC_CTYPE = 'C.UTF-8'`},
 		{`CREATE DATABASE a LC_CTYPE = 'INVALID'`},
-		{`CREATE DATABASE a TEMPLATE = template0 ENCODING = 'UTF8' LC_COLLATE = 'C.UTF-8' LC_CTYPE = 'INVALID'`},
+		{`CREATE DATABASE a TEMPLATE = 'template0' ENCODING = 'UTF8' LC_COLLATE = 'C.UTF-8' LC_CTYPE = 'INVALID'`},
 		{`CREATE DATABASE IF NOT EXISTS a`},
-		{`CREATE DATABASE IF NOT EXISTS a TEMPLATE = template0`},
-		{`CREATE DATABASE IF NOT EXISTS a TEMPLATE = invalid`},
+		{`CREATE DATABASE IF NOT EXISTS a TEMPLATE = 'template0'`},
+		{`CREATE DATABASE IF NOT EXISTS a TEMPLATE = 'invalid'`},
 		{`CREATE DATABASE IF NOT EXISTS a ENCODING = 'UTF8'`},
 		{`CREATE DATABASE IF NOT EXISTS a ENCODING = 'INVALID'`},
 		{`CREATE DATABASE IF NOT EXISTS a LC_COLLATE = 'C.UTF-8'`},
 		{`CREATE DATABASE IF NOT EXISTS a LC_COLLATE = 'INVALID'`},
 		{`CREATE DATABASE IF NOT EXISTS a LC_CTYPE = 'C.UTF-8'`},
 		{`CREATE DATABASE IF NOT EXISTS a LC_CTYPE = 'INVALID'`},
-		{`CREATE DATABASE IF NOT EXISTS a TEMPLATE = template0 ENCODING = 'UTF8' LC_COLLATE = 'C.UTF-8' LC_CTYPE = 'INVALID'`},
+		{`CREATE DATABASE IF NOT EXISTS a TEMPLATE = 'template0' ENCODING = 'UTF8' LC_COLLATE = 'C.UTF-8' LC_CTYPE = 'INVALID'`},
 
 		{`CREATE INDEX a ON b (c)`},
 		{`CREATE INDEX a ON b.c (d)`},
 		{`CREATE INDEX ON a (b)`},
 		{`CREATE INDEX ON a (b) STORING (c)`},
 		{`CREATE INDEX ON a (b) INTERLEAVE IN PARENT c (d)`},
+		{`CREATE INDEX ON a (b) INTERLEAVE IN PARENT c.d (e)`},
 		{`CREATE INDEX ON a (b ASC, c DESC)`},
 		{`CREATE UNIQUE INDEX a ON b (c)`},
 		{`CREATE UNIQUE INDEX a ON b (c) STORING (d)`},
 		{`CREATE UNIQUE INDEX a ON b (c) INTERLEAVE IN PARENT d (e, f)`},
+		{`CREATE UNIQUE INDEX a ON b (c) INTERLEAVE IN PARENT d.e (f, g)`},
 		{`CREATE UNIQUE INDEX a ON b.c (d)`},
 
 		{`CREATE TABLE a ()`},
@@ -93,6 +97,7 @@ func TestParse(t *testing.T) {
 		{`CREATE TABLE a (b SERIAL)`},
 		{`CREATE TABLE a (b SMALLSERIAL)`},
 		{`CREATE TABLE a (b BIGSERIAL)`},
+		{`CREATE TABLE a (b UUID)`},
 		{`CREATE TABLE a (b INT NULL)`},
 		{`CREATE TABLE a (b INT CONSTRAINT maybe NULL)`},
 		{`CREATE TABLE a (b INT NOT NULL)`},
@@ -150,6 +155,8 @@ func TestParse(t *testing.T) {
 		{`CREATE TABLE IF NOT EXISTS a AS SELECT * FROM b UNION SELECT * FROM c`},
 		{`CREATE TABLE a AS SELECT * FROM b UNION VALUES ('one', 1) ORDER BY c LIMIT 5`},
 		{`CREATE TABLE IF NOT EXISTS a AS SELECT * FROM b UNION VALUES ('one', 1) ORDER BY c LIMIT 5`},
+		{`CREATE TABLE a (b STRING COLLATE "DE")`},
+		{`CREATE TABLE a (b STRING[] COLLATE "DE")`},
 
 		{`CREATE VIEW a AS SELECT * FROM b`},
 		{`CREATE VIEW a AS SELECT b.* FROM b LIMIT 5`},
@@ -165,6 +172,9 @@ func TestParse(t *testing.T) {
 		{`DELETE FROM a WHERE a = b RETURNING a, b`},
 		{`DELETE FROM a WHERE a = b RETURNING 1, 2`},
 		{`DELETE FROM a WHERE a = b RETURNING a + b`},
+		{`DELETE FROM a WHERE a = b RETURNING NOTHING`},
+
+		{`DISCARD ALL`},
 
 		{`DROP DATABASE a`},
 		{`DROP DATABASE IF EXISTS a`},
@@ -197,17 +207,24 @@ func TestParse(t *testing.T) {
 		{`DROP VIEW a.b CASCADE`},
 		{`DROP VIEW a, b CASCADE`},
 
+		{`DROP USER a`},
+		{`DROP USER a, b`},
+
 		{`EXPLAIN SELECT 1`},
 		{`EXPLAIN EXPLAIN SELECT 1`},
-		{`EXPLAIN (DEBUG) SELECT 1`},
 		{`EXPLAIN (A, B, C) SELECT 1`},
+		{`SELECT * FROM [EXPLAIN SELECT 1]`},
+		{`SELECT * FROM [SHOW TRANSACTION STATUS]`},
 
 		{`HELP count`},
-		{`HELP VARCHAR`},
+		{`HELP "varchar"`},
 
-		{`SHOW BARFOO`},
-		{`SHOW DATABASE`},
-		{`SHOW SYNTAX`},
+		{`SHOW barfoo`},
+		{`SHOW database`},
+		{`SHOW TIME ZONE`},
+
+		{`SHOW CLUSTER SETTING a`},
+		{`SHOW CLUSTER SETTING all`},
 
 		{`SHOW DATABASES`},
 		{`SHOW TABLES`},
@@ -220,6 +237,24 @@ func TestParse(t *testing.T) {
 		{`SHOW CONSTRAINTS FROM a.b.c`},
 		{`SHOW TABLES FROM a; SHOW COLUMNS FROM b`},
 		{`SHOW USERS`},
+		{`SHOW JOBS`},
+		{`SHOW CLUSTER QUERIES`},
+		{`SHOW LOCAL QUERIES`},
+		{`SHOW CLUSTER SESSIONS`},
+		{`SHOW LOCAL SESSIONS`},
+		{`SHOW TRACE FOR SESSION`},
+		{`SHOW KV TRACE FOR SESSION`},
+		{`SHOW TRACE FOR SELECT 42`},
+		{`SHOW TRACE FOR TABLE foo`},
+		{`SHOW KV TRACE FOR TABLE foo`},
+		{`SHOW TESTING_RANGES FROM TABLE d.t`},
+		{`SHOW TESTING_RANGES FROM TABLE t`},
+		{`SHOW TESTING_RANGES FROM INDEX d.t@i`},
+		{`SHOW TESTING_RANGES FROM INDEX t@i`},
+		{`SHOW TESTING_RANGES FROM INDEX d.i`},
+		{`SHOW TESTING_RANGES FROM INDEX i`},
+		{`SHOW EXPERIMENTAL_FINGERPRINTS FROM TABLE d.t`},
+		{`SHOW EXPERIMENTAL_FINGERPRINTS FROM TABLE d.t AS OF SYSTEM TIME 'foo'`},
 
 		// Tables are the default, but can also be specified with
 		// GRANT x ON TABLE y. However, the stringer does not output TABLE.
@@ -236,6 +271,7 @@ func TestParse(t *testing.T) {
 		{`PREPARE a AS SELECT 1`},
 		{`PREPARE a AS INSERT INTO a VALUES (1)`},
 		{`PREPARE a AS UPDATE a SET b = 3`},
+		{`PREPARE a AS UPSERT INTO a VALUES (1)`},
 		{`PREPARE a AS DELETE FROM a`},
 		{`PREPARE a (INT) AS SELECT 1`},
 		{`PREPARE a (STRING, STRING) AS SELECT 1`},
@@ -280,6 +316,7 @@ func TestParse(t *testing.T) {
 		{`INSERT INTO a VALUES (1) RETURNING a, b`},
 		{`INSERT INTO a VALUES (1, 2) RETURNING 1, 2`},
 		{`INSERT INTO a VALUES (1, 2) RETURNING a + b, c`},
+		{`INSERT INTO a VALUES (1, 2) RETURNING NOTHING`},
 
 		{`UPSERT INTO a VALUES (1)`},
 		{`UPSERT INTO a.b VALUES (1)`},
@@ -291,6 +328,10 @@ func TestParse(t *testing.T) {
 		{`UPSERT INTO a(a, a.b) VALUES (1, 2)`},
 		{`UPSERT INTO a SELECT b, c FROM d`},
 		{`UPSERT INTO a DEFAULT VALUES`},
+		{`UPSERT INTO a DEFAULT VALUES RETURNING a, b`},
+		{`UPSERT INTO a DEFAULT VALUES RETURNING 1, 2`},
+		{`UPSERT INTO a DEFAULT VALUES RETURNING a + b`},
+		{`UPSERT INTO a DEFAULT VALUES RETURNING NOTHING`},
 
 		{`INSERT INTO a VALUES (1) ON CONFLICT DO NOTHING`},
 		{`INSERT INTO a VALUES (1) ON CONFLICT (a) DO NOTHING`},
@@ -301,10 +342,14 @@ func TestParse(t *testing.T) {
 		{`INSERT INTO a VALUES (1) ON CONFLICT (a) DO UPDATE SET a = 1 WHERE b > 2`},
 		{`INSERT INTO a VALUES (1) ON CONFLICT (a) DO UPDATE SET a = DEFAULT`},
 		{`INSERT INTO a VALUES (1) ON CONFLICT (a) DO UPDATE SET (a, b) = (SELECT 1, 2)`},
+		{`INSERT INTO a VALUES (1) ON CONFLICT (a) DO UPDATE SET (a, b) = (SELECT 1, 2) RETURNING a, b`},
+		{`INSERT INTO a VALUES (1) ON CONFLICT (a) DO UPDATE SET (a, b) = (SELECT 1, 2) RETURNING 1, 2`},
+		{`INSERT INTO a VALUES (1) ON CONFLICT (a) DO UPDATE SET (a, b) = (SELECT 1, 2) RETURNING a + b`},
+		{`INSERT INTO a VALUES (1) ON CONFLICT (a) DO UPDATE SET (a, b) = (SELECT 1, 2) RETURNING NOTHING`},
 
 		{`SELECT 1 + 1`},
-		{`SELECT - 1`},
-		{`SELECT + 1`},
+		{`SELECT -1`},
+		{`SELECT +1`},
 		{`SELECT .1`},
 		{`SELECT 1.2e1`},
 		{`SELECT 1.2e+1`},
@@ -327,6 +372,7 @@ func TestParse(t *testing.T) {
 		{`SELECT (ROW())`},
 		{`SELECT (TABLE a)`},
 		{`SELECT 0x1`},
+		{`SELECT 'Deutsch' COLLATE "DE"`},
 
 		{`SELECT 1 FROM t`},
 		{`SELECT 1, 2 FROM t`},
@@ -352,6 +398,7 @@ func TestParse(t *testing.T) {
 		{`SELECT 'a' FROM t@bar`},
 		{`SELECT 'a' FROM t@{NO_INDEX_JOIN}`},
 		{`SELECT 'a' FROM t@{FORCE_INDEX=bar,NO_INDEX_JOIN}`},
+		{`SELECT * FROM t AS "of" AS OF SYSTEM TIME '2016-01-01'`},
 
 		{`SELECT '1':::INT`},
 
@@ -363,7 +410,6 @@ func TestParse(t *testing.T) {
 		{`SELECT DATE 'foo'`},
 		{`SELECT TIMESTAMP 'foo'`},
 		{`SELECT TIMESTAMP WITH TIME ZONE 'foo'`},
-		{`SELECT INTERVAL 'foo'`},
 		{`SELECT CHAR 'foo'`},
 
 		{`SELECT 'a' AS "12345"`},
@@ -380,8 +426,9 @@ func TestParse(t *testing.T) {
 		{`SELECT e'a\\\\na' FROM t`},
 		{`SELECT e'\\\\n' FROM t`},
 		{`SELECT "a""a" FROM t`},
-		{`SELECT a FROM "t\n"`}, // no escaping in sql identifiers
-		{`SELECT a FROM "t"""`}, // no escaping in sql identifiers
+		{`SELECT a FROM "t\n"`},  // no escaping in sql identifiers
+		{`SELECT a FROM "t"""`},  // no escaping in sql identifiers
+		{`SELECT "full" FROM t`}, // must quote column name keyword
 
 		{`SELECT "FROM" FROM t`},
 		{`SELECT CAST(1 AS TEXT)`},
@@ -406,8 +453,8 @@ func TestParse(t *testing.T) {
 		{`SELECT a FROM t AS t1 (c1, c2, c3, c4)`},
 		{`SELECT a FROM s.t`},
 
-		{`SELECT COUNT(DISTINCT a) FROM t`},
-		{`SELECT COUNT(ALL a) FROM t`},
+		{`SELECT count(DISTINCT a) FROM t`},
+		{`SELECT count(ALL a) FROM t`},
 
 		{`SELECT a FROM t WHERE a = b`},
 		{`SELECT a FROM t WHERE NOT (a = b)`},
@@ -453,10 +500,10 @@ func TestParse(t *testing.T) {
 		{`SELECT a FROM t WHERE CASE WHEN a = b THEN c ELSE d END`},
 		{`SELECT a FROM t WHERE CASE WHEN a = b THEN c WHEN b = d THEN d ELSE d END`},
 		{`SELECT a FROM t WHERE CASE aa WHEN a = b THEN c END`},
-		{`SELECT a FROM t WHERE a = B()`},
-		{`SELECT a FROM t WHERE a = B(c)`},
-		{`SELECT a FROM t WHERE a = B(c, d)`},
-		{`SELECT a FROM t WHERE a = COUNT(*)`},
+		{`SELECT a FROM t WHERE a = b()`},
+		{`SELECT a FROM t WHERE a = b(c)`},
+		{`SELECT a FROM t WHERE a = b(c, d)`},
+		{`SELECT a FROM t WHERE a = count(*)`},
 		{`SELECT a FROM t WHERE a = IF(b, c, d)`},
 		{`SELECT a FROM t WHERE a = IFNULL(b, c)`},
 		{`SELECT a FROM t WHERE a = NULLIF(b, c)`},
@@ -466,6 +513,12 @@ func TestParse(t *testing.T) {
 		{`SELECT a FROM t ORDER BY a`},
 		{`SELECT a FROM t ORDER BY a ASC`},
 		{`SELECT a FROM t ORDER BY a DESC`},
+		{`SELECT a FROM t ORDER BY PRIMARY KEY t`},
+		{`SELECT a FROM t ORDER BY PRIMARY KEY t ASC`},
+		{`SELECT a FROM t ORDER BY PRIMARY KEY t DESC`},
+		{`SELECT a FROM t ORDER BY INDEX t@foo`},
+		{`SELECT a FROM t ORDER BY INDEX t@foo ASC`},
+		{`SELECT a FROM t ORDER BY INDEX t@foo DESC`},
 
 		{`SELECT 1 FROM t GROUP BY a`},
 		{`SELECT 1 FROM t GROUP BY a, b`},
@@ -505,6 +558,7 @@ func TestParse(t *testing.T) {
 		{`SELECT a FROM t1 NATURAL JOIN t2`},
 		{`SELECT a FROM t1 INNER JOIN t2 USING (a)`},
 		{`SELECT a FROM t1 FULL JOIN t2 USING (a)`},
+		{`SELECT * FROM (t1 WITH ORDINALITY AS o1 CROSS JOIN t2 WITH ORDINALITY AS o2) WITH ORDINALITY AS o3`},
 
 		{`SELECT a FROM t1 AS OF SYSTEM TIME '2016-01-01'`},
 		{`SELECT a FROM t1, t2 AS OF SYSTEM TIME '2016-01-01'`},
@@ -519,6 +573,8 @@ func TestParse(t *testing.T) {
 		{`SET a = '3'`},
 		{`SET a = 3.0`},
 		{`SET a = $1`},
+		{`SET TRANSACTION READ ONLY`},
+		{`SET TRANSACTION READ WRITE`},
 		{`SET TRANSACTION ISOLATION LEVEL SNAPSHOT`},
 		{`SET TRANSACTION ISOLATION LEVEL SERIALIZABLE`},
 		{`SET TRANSACTION PRIORITY LOW`},
@@ -527,18 +583,26 @@ func TestParse(t *testing.T) {
 		{`SET TRANSACTION ISOLATION LEVEL SNAPSHOT, PRIORITY HIGH`},
 		{`SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL SERIALIZABLE`},
 		{`SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL SNAPSHOT`},
-		{`SET TIME ZONE 'pst8pdt'`},
-		{`SET TIME ZONE 'Europe/Rome'`},
-		{`SET TIME ZONE -7`},
-		{`SET TIME ZONE -7.3`},
-		{`SET TIME ZONE DEFAULT`},
-		{`SET TIME ZONE LOCAL`},
+		{`SET CLUSTER SETTING a = 3`},
+		{`SET CLUSTER SETTING a = '3s'`},
+		{`SET CLUSTER SETTING a = '3'`},
+		{`SET CLUSTER SETTING a = 3.0`},
+		{`SET CLUSTER SETTING a = $1`},
+		{`RESET a`},
 
 		{`SELECT * FROM (VALUES (1, 2)) AS foo`},
 		{`SELECT * FROM (VALUES (1, 2)) AS foo (a, b)`},
 
-		// TODO(pmattis): Is this a postgres extension?
-		{`TABLE a`}, // Shorthand for: SELECT * FROM a
+		{`SELECT * FROM [123 AS t]`},
+		{`SELECT * FROM [123(1, 2, 3) AS t]`},
+		{`SELECT * FROM [123() AS t]`},
+		{`SELECT * FROM t@[123]`},
+		{`SELECT * FROM t@{FORCE_INDEX=[123],NO_INDEX_JOIN}`},
+		{`SELECT * FROM [123 AS t]@[456]`},
+		{`SELECT * FROM [123 AS t]@{FORCE_INDEX=[456],NO_INDEX_JOIN}`},
+
+		{`TABLE a`}, // Shorthand for: SELECT * FROM a; used e.g. in CREATE VIEW v AS TABLE t
+		{`TABLE [123 AS a]`},
 
 		{`TRUNCATE TABLE a`},
 		{`TRUNCATE TABLE a, b.c`},
@@ -555,8 +619,9 @@ func TestParse(t *testing.T) {
 		{`UPDATE a SET b = 3 WHERE a = b RETURNING a`},
 		{`UPDATE a SET b = 3 WHERE a = b RETURNING 1, 2`},
 		{`UPDATE a SET b = 3 WHERE a = b RETURNING a, a + b`},
+		{`UPDATE a SET b = 3 WHERE a = b RETURNING NOTHING`},
 
-		{`UPDATE T AS "0" SET K = ''`},                 // "0" lost its quotes
+		{`UPDATE t AS "0" SET k = ''`},                 // "0" lost its quotes
 		{`SELECT * FROM "0" JOIN "0" USING (id, "0")`}, // last "0" lost its quotes.
 
 		{`ALTER DATABASE a RENAME TO b`},
@@ -604,19 +669,52 @@ func TestParse(t *testing.T) {
 		{`COPY t FROM STDIN`},
 		{`COPY t (a, b, c) FROM STDIN`},
 
-		{`ALTER TABLE a SPLIT AT (1)`},
-		{`ALTER TABLE d.a SPLIT AT ('b', 2)`},
-		{`ALTER INDEX a@i SPLIT AT (1)`},
-		{`ALTER INDEX d.a@i SPLIT AT (2)`},
-		{`ALTER INDEX i SPLIT AT (1)`},
-		{`ALTER INDEX d.i SPLIT AT (2)`},
+		{`ALTER TABLE a SPLIT AT VALUES (1)`},
+		{`ALTER TABLE a SPLIT AT SELECT * FROM t`},
+		{`ALTER TABLE d.a SPLIT AT VALUES ('b', 2)`},
+		{`ALTER INDEX a@i SPLIT AT VALUES (1)`},
+		{`ALTER INDEX d.a@i SPLIT AT VALUES (2)`},
+		{`ALTER INDEX i SPLIT AT VALUES (1)`},
+		{`ALTER INDEX d.i SPLIT AT VALUES (2)`},
 
+		{`ALTER TABLE a TESTING_RELOCATE VALUES (ARRAY[1], 1)`},
+		{`ALTER TABLE a TESTING_RELOCATE SELECT * FROM t`},
+		{`ALTER TABLE d.a TESTING_RELOCATE VALUES (ARRAY[1, 2, 3], 'b', 2)`},
+		{`ALTER INDEX d.i TESTING_RELOCATE VALUES (ARRAY[1], 2)`},
+
+		{`ALTER TABLE a SCATTER`},
+		{`ALTER TABLE a SCATTER FROM (1, 2, 3) TO (4, 5, 6)`},
+		{`ALTER TABLE d.a SCATTER`},
+		{`ALTER INDEX d.i SCATTER FROM (1) TO (2)`},
+
+		{`BACKUP foo TO 'bar'`},
+		{`BACKUP foo.foo, baz.baz TO 'bar'`},
+		{`SHOW BACKUP 'bar'`},
+		{`BACKUP foo TO 'bar' AS OF SYSTEM TIME '1' INCREMENTAL FROM 'baz'`},
+		{`BACKUP foo TO $1 INCREMENTAL FROM 'bar', $2, 'baz'`},
 		{`BACKUP DATABASE foo TO 'bar'`},
-		{`BACKUP DATABASE foo TO 'bar' INCREMENTAL FROM 'baz'`},
+		{`BACKUP DATABASE foo, baz TO 'bar'`},
+		{`BACKUP DATABASE foo TO 'bar' AS OF SYSTEM TIME '1' INCREMENTAL FROM 'baz'`},
+		{`RESTORE foo FROM 'bar'`},
+		{`RESTORE foo FROM $1`},
+		{`RESTORE foo FROM $1, $2, 'bar'`},
+		{`RESTORE foo, baz FROM 'bar'`},
+		{`RESTORE foo, baz FROM 'bar' AS OF SYSTEM TIME '1'`},
 		{`RESTORE DATABASE foo FROM 'bar'`},
+		{`RESTORE DATABASE foo, baz FROM 'bar'`},
+		{`RESTORE DATABASE foo, baz FROM 'bar' AS OF SYSTEM TIME '1'`},
+		{`BACKUP foo TO 'bar' WITH key1, key2 = 'value'`},
+		{`RESTORE foo FROM 'bar' WITH key1, key2 = 'value'`},
+		{`IMPORT TABLE foo CREATE USING 'nodelocal:///some/file' CSV DATA ('path/to/some/file', $1) WITH temp = 'path/to/temp'`},
+		{`IMPORT TABLE foo (id INT PRIMARY KEY, email STRING, age INT) CSV DATA ('path/to/some/file', $1) WITH temp = 'path/to/temp'`},
+		{`IMPORT TABLE foo (id INT, email STRING, age INT) CSV DATA ('path/to/some/file', $1) WITH comma = ',', "nullif" = 'n/a', temp = $2`},
+		{`SET ROW (1, true, NULL)`},
+
+		// Regression for #15926
+		{`SELECT * FROM ((t1 NATURAL JOIN t2 WITH ORDINALITY AS o1)) WITH ORDINALITY AS o2`},
 	}
 	for _, d := range testData {
-		stmts, err := parseTraditional(d.sql)
+		stmts, err := Parse(d.sql)
 		if err != nil {
 			t.Fatalf("%s: expected success, but found %s", d.sql, err)
 		}
@@ -637,6 +735,10 @@ func TestParse2(t *testing.T) {
 	}{
 		{`CREATE DATABASE a WITH ENCODING = 'foo'`,
 			`CREATE DATABASE a ENCODING = 'foo'`},
+		{`CREATE DATABASE a TEMPLATE = template0`,
+			`CREATE DATABASE a TEMPLATE = 'template0'`},
+		{`CREATE DATABASE a TEMPLATE = invalid`,
+			`CREATE DATABASE a TEMPLATE = 'invalid'`},
 		{`CREATE TABLE a (b INT, UNIQUE INDEX foo (b))`,
 			`CREATE TABLE a (b INT, CONSTRAINT foo UNIQUE (b))`},
 		{`CREATE TABLE a (b INT, UNIQUE INDEX foo (b) INTERLEAVE IN PARENT c (d))`,
@@ -650,17 +752,21 @@ func TestParse2(t *testing.T) {
 		{`SELECT 'a' FROM t@{NO_INDEX_JOIN,FORCE_INDEX=bar}`,
 			`SELECT 'a' FROM t@{FORCE_INDEX=bar,NO_INDEX_JOIN}`},
 
+		{`SELECT 'a' FROM t@{FORCE_INDEX=[123]}`, `SELECT 'a' FROM t@[123]`},
+		{`SELECT 'a' FROM [123 AS t]@{FORCE_INDEX=[456]}`, `SELECT 'a' FROM [123 AS t]@[456]`},
+
 		{`SELECT a FROM t WHERE a IS UNKNOWN`, `SELECT a FROM t WHERE a IS NULL`},
 		{`SELECT a FROM t WHERE a IS NOT UNKNOWN`, `SELECT a FROM t WHERE a IS NOT NULL`},
 
-		{`SELECT - - 5`, `SELECT - (- 5)`},
-		{`SELECT a FROM t WHERE b = - 2`, `SELECT a FROM t WHERE b = (- 2)`},
+		{`SELECT - - 5`, `SELECT -(-5)`},
+		{`SELECT a FROM t WHERE b = - 2`, `SELECT a FROM t WHERE b = (-2)`},
 		{`SELECT a FROM t WHERE a = b AND a = c`, `SELECT a FROM t WHERE (a = b) AND (a = c)`},
 		{`SELECT a FROM t WHERE a = b OR a = c`, `SELECT a FROM t WHERE (a = b) OR (a = c)`},
 		{`SELECT a FROM t WHERE NOT a = b`, `SELECT a FROM t WHERE NOT (a = b)`},
 
 		{`SELECT a FROM t WHERE a = b & c`, `SELECT a FROM t WHERE a = (b & c)`},
 		{`SELECT a FROM t WHERE a = b | c`, `SELECT a FROM t WHERE a = (b | c)`},
+		{`SELECT a FROM t WHERE a = b # c`, `SELECT a FROM t WHERE a = (b # c)`},
 		{`SELECT a FROM t WHERE a = b ^ c`, `SELECT a FROM t WHERE a = (b ^ c)`},
 		{`SELECT a FROM t WHERE a = b + c`, `SELECT a FROM t WHERE a = (b + c)`},
 		{`SELECT a FROM t WHERE a = b - c`, `SELECT a FROM t WHERE a = (b - c)`},
@@ -668,9 +774,15 @@ func TestParse2(t *testing.T) {
 		{`SELECT a FROM t WHERE a = b / c`, `SELECT a FROM t WHERE a = (b / c)`},
 		{`SELECT a FROM t WHERE a = b % c`, `SELECT a FROM t WHERE a = (b % c)`},
 		{`SELECT a FROM t WHERE a = b || c`, `SELECT a FROM t WHERE a = (b || c)`},
-		{`SELECT a FROM t WHERE a = + b`, `SELECT a FROM t WHERE a = (+ b)`},
-		{`SELECT a FROM t WHERE a = - b`, `SELECT a FROM t WHERE a = (- b)`},
-		{`SELECT a FROM t WHERE a = ~ b`, `SELECT a FROM t WHERE a = (~ b)`},
+		{`SELECT a FROM t WHERE a = + b`, `SELECT a FROM t WHERE a = (+b)`},
+		{`SELECT a FROM t WHERE a = - b`, `SELECT a FROM t WHERE a = (-b)`},
+		{`SELECT a FROM t WHERE a = ~ b`, `SELECT a FROM t WHERE a = (~b)`},
+
+		// Special keywords are supported for index names.
+		{`SELECT a FROM t@primary`,
+			`SELECT a FROM t@"primary"`},
+		{`SELECT a FROM t ORDER BY INDEX t@primary`,
+			`SELECT a FROM t ORDER BY INDEX t@"primary"`},
 
 		// Escaped string literals are not always escaped the same because
 		// '''' and e'\'' scan to the same token. It's more convenient to
@@ -688,8 +800,8 @@ func TestParse2(t *testing.T) {
 		{`SELECT "a'a" FROM t`,
 			`SELECT "a'a" FROM t`},
 		// Hexadecimal literal strings are turned into regular strings.
-		{`SELECT x'61'`, `SELECT 'a'`},
-		{`SELECT X'61'`, `SELECT 'a'`},
+		{`SELECT x'61'`, `SELECT b'a'`},
+		{`SELECT X'61'`, `SELECT b'a'`},
 		// Comments are stripped.
 		{`SELECT 1 FROM t -- hello world`,
 			`SELECT 1 FROM t`},
@@ -711,6 +823,8 @@ func TestParse2(t *testing.T) {
 		{`SELECT a FROM t1 RIGHT OUTER JOIN t2 ON a = b`,
 			`SELECT a FROM t1 RIGHT JOIN t2 ON a = b`},
 		// Some functions are nearly keywords.
+		{`SELECT CURRENT_SCHEMA`,
+			`SELECT current_schema()`},
 		{`SELECT CURRENT_TIMESTAMP`,
 			`SELECT current_timestamp()`},
 		{`SELECT CURRENT_DATE`,
@@ -733,32 +847,61 @@ func TestParse2(t *testing.T) {
 		// We allow OFFSET before LIMIT, but always output LIMIT first.
 		{`SELECT a FROM t OFFSET a LIMIT b`,
 			`SELECT a FROM t LIMIT b OFFSET a`},
+		// FETCH FIRST ... is alternative syntax for LIMIT.
+		{`SELECT a FROM t FETCH FIRST 3 ROWS ONLY`,
+			`SELECT a FROM t LIMIT 3`},
+		{`SELECT a FROM t FETCH NEXT 3 ROWS ONLY`,
+			`SELECT a FROM t LIMIT 3`},
+		{`SELECT a FROM t FETCH FIRST ROW ONLY`,
+			`SELECT a FROM t LIMIT 1`},
+		{`SELECT a FROM t FETCH FIRST (2 * a) ROWS ONLY`,
+			`SELECT a FROM t LIMIT 2 * a`},
+		{`SELECT a FROM t OFFSET b FETCH FIRST (2 * a) ROWS ONLY`,
+			`SELECT a FROM t LIMIT 2 * a OFFSET b`},
+		{`SELECT a FROM t FETCH FIRST (2 * a) ROWS ONLY OFFSET b`,
+			`SELECT a FROM t LIMIT 2 * a OFFSET b`},
 		// Double negation. See #1800.
 		{`SELECT *,-/* comment */-5`,
-			`SELECT *, - (- 5)`},
+			`SELECT *, -(-5)`},
 		{"SELECT -\n-5",
-			`SELECT - (- 5)`},
+			`SELECT -(-5)`},
 		{`SELECT -0.-/*test*/-1`,
-			`SELECT (- 0.) - (- 1)`,
+			`SELECT (-0.) - (-1)`,
 		},
 		// See #1948.
 		{`SELECT~~+~++~bd(*)`,
-			`SELECT ~ (~ (+ (~ (+ (+ (~ bd(*)))))))`},
+			`SELECT ~(~(+(~(+(+(~bd(*)))))))`},
 		// See #1957.
 		{`SELECT+y[array[]]`,
-			`SELECT + y[ARRAY[]]`},
+			`SELECT +y[ARRAY[]]`},
 		{`SELECT a FROM t UNION DISTINCT SELECT 1 FROM t`,
 			`SELECT a FROM t UNION SELECT 1 FROM t`},
 		{`SELECT a FROM t EXCEPT DISTINCT SELECT 1 FROM t`,
 			`SELECT a FROM t EXCEPT SELECT 1 FROM t`},
 		{`SELECT a FROM t INTERSECT DISTINCT SELECT 1 FROM t`,
 			`SELECT a FROM t INTERSECT SELECT 1 FROM t`},
+
+		{`SET TIME ZONE 'pst8pdt'`,
+			`SET "time zone" = 'pst8pdt'`},
+		{`SET TIME ZONE 'Europe/Rome'`,
+			`SET "time zone" = 'Europe/Rome'`},
+		{`SET TIME ZONE -7`,
+			`SET "time zone" = -7`},
+		{`SET TIME ZONE -7.3`,
+			`SET "time zone" = -7.3`},
+		{`SET TIME ZONE DEFAULT`,
+			`SET "time zone" = 'default'`},
+		{`SET TIME ZONE LOCAL`,
+			`SET "time zone" = 'local'`},
 		{`SET TIME ZONE pst8pdt`,
-			`SET TIME ZONE 'pst8pdt'`},
+			`SET "time zone" = 'pst8pdt'`},
 		{`SET TIME ZONE "Europe/Rome"`,
-			`SET TIME ZONE 'Europe/Rome'`},
+			`SET "time zone" = 'Europe/Rome'`},
 		{`SET TIME ZONE INTERVAL '-7h'`,
-			`SET TIME ZONE INTERVAL '-7h0m0s'`},
+			`SET "time zone" = '-7h'`},
+		{`SET TIME ZONE INTERVAL '-7h0m5s' HOUR TO MINUTE`,
+			`SET "time zone" = '-6h-59m'`},
+
 		// Special substring syntax
 		{`SELECT SUBSTRING('RoacH' from 2 for 3)`,
 			`SELECT substring('RoacH', 2, 3)`},
@@ -806,12 +949,17 @@ func TestParse2(t *testing.T) {
 			`SELECT rtrim('xyxtrimyyx')`},
 		{`SELECT TRIM(trailing 'xyxtrimyyx')`,
 			`SELECT rtrim('xyxtrimyyx')`},
+		{`SELECT a IS NAN`, `SELECT isnan(a)`},
+		{`SELECT a IS NOT NAN`, `SELECT NOT isnan(a)`},
 		{`SHOW INDEX FROM t`,
 			`SHOW INDEXES FROM t`},
 		{`SHOW CONSTRAINT FROM t`,
 			`SHOW CONSTRAINTS FROM t`},
 		{`SHOW KEYS FROM t`,
 			`SHOW INDEXES FROM t`},
+		{`SHOW SESSION barfoo`, `SHOW barfoo`},
+		{`SHOW SESSION database`, `SHOW database`},
+		{`SHOW SESSION TIME ZONE`, `SHOW TIME ZONE`},
 		{`BEGIN`,
 			`BEGIN TRANSACTION`},
 		{`START TRANSACTION`,
@@ -824,6 +972,7 @@ func TestParse2(t *testing.T) {
 			`BEGIN TRANSACTION ISOLATION LEVEL SNAPSHOT, PRIORITY LOW`},
 		{`SET TRANSACTION PRIORITY NORMAL, ISOLATION LEVEL SERIALIZABLE`,
 			`SET TRANSACTION ISOLATION LEVEL SERIALIZABLE, PRIORITY NORMAL`},
+		{"SET CLUSTER SETTING a TO 1", "SET CLUSTER SETTING a = 1"},
 		{"RELEASE foo", "RELEASE SAVEPOINT foo"},
 		{"RELEASE SAVEPOINT foo", "RELEASE SAVEPOINT foo"},
 		{"ROLLBACK", "ROLLBACK TRANSACTION"},
@@ -836,9 +985,32 @@ func TestParse2(t *testing.T) {
 			`DEALLOCATE a`},
 		{`DEALLOCATE PREPARE ALL`,
 			`DEALLOCATE ALL`},
+
+		{`BACKUP DATABASE foo TO bar`,
+			`BACKUP DATABASE foo TO 'bar'`},
+		{`BACKUP DATABASE foo TO "bar.12" INCREMENTAL FROM "baz.34"`,
+			`BACKUP DATABASE foo TO 'bar.12' INCREMENTAL FROM 'baz.34'`},
+		{`RESTORE DATABASE foo FROM bar`,
+			`RESTORE DATABASE foo FROM 'bar'`},
+
+		{`SHOW ALL CLUSTER SETTINGS`, `SHOW CLUSTER SETTING all`},
+
+		{`SHOW SESSIONS`, `SHOW CLUSTER SESSIONS`},
+		{`SHOW QUERIES`, `SHOW CLUSTER QUERIES`},
+
+		{`USE foo`, `SET database = 'foo'`},
+
+		{`SET NAMES foo`, `SET client_encoding = 'foo'`},
+		{`SET NAMES 'foo'`, `SET client_encoding = 'foo'`},
+		{`SET NAMES DEFAULT`, `RESET client_encoding`},
+		{`SET NAMES`, `RESET client_encoding`},
+
+		{`SHOW NAMES`, `SHOW client_encoding`},
+
+		{`RESET NAMES`, `RESET client_encoding`},
 	}
 	for _, d := range testData {
-		stmts, err := parseTraditional(d.sql)
+		stmts, err := Parse(d.sql)
 		if err != nil {
 			t.Errorf("%s: expected success, but found %s", d.sql, err)
 			continue
@@ -847,7 +1019,7 @@ func TestParse2(t *testing.T) {
 		if d.expected != s {
 			t.Errorf("%s: expected %s, but found (%d statements): %s", d.sql, d.expected, len(stmts), s)
 		}
-		if _, err := parseTraditional(s); err != nil {
+		if _, err := Parse(s); err != nil {
 			t.Errorf("expected string found, but not parsable: %s:\n%s", err, s)
 		}
 	}
@@ -866,7 +1038,7 @@ func TestParseSyntax(t *testing.T) {
 		{`SELECT '\x' FROM t`},
 	}
 	for _, d := range testData {
-		if _, err := parseTraditional(d.sql); err != nil {
+		if _, err := Parse(d.sql); err != nil {
 			t.Fatalf("%s: expected success, but not parsable %s", d.sql, err)
 		}
 	}
@@ -877,7 +1049,7 @@ func TestParseError(t *testing.T) {
 		sql      string
 		expected string
 	}{
-		{`SELECT2 1`, `syntax error at or near "SELECT2"
+		{`SELECT2 1`, `syntax error at or near "select2"
 SELECT2 1
 ^
 `},
@@ -895,9 +1067,13 @@ SET a = 1,
 b = 2
   ^
 `},
-		{`SET TIME ZONE INTERVAL 'foobar'`, `could not parse 'foobar' as type interval: time: invalid duration foobar at or near "EOF"
+		{`SET TIME ZONE INTERVAL 'foobar'`, `could not parse 'foobar' as type interval: interval: missing unit at position 0: "foobar" at or near "EOF"
 SET TIME ZONE INTERVAL 'foobar'
                                ^
+`},
+		{`SELECT INTERVAL 'foo'`, `could not parse 'foo' as type interval: interval: missing unit at position 0: "foo" at or near "EOF"
+SELECT INTERVAL 'foo'
+                     ^
 `},
 		{`SELECT 1 /* hello`, `unterminated comment
 SELECT 1 /* hello
@@ -915,7 +1091,7 @@ SELECT * FROM t WHERE k=
 		},
 		{`CREATE TABLE test (
   CONSTRAINT foo INDEX (bar)
-)`, `syntax error at or near "INDEX"
+)`, `syntax error at or near "index"
 CREATE TABLE test (
   CONSTRAINT foo INDEX (bar)
                  ^
@@ -993,7 +1169,7 @@ CREATE VIEW a () AS select * FROM b
                ^
 `},
 		{`SELECT FROM t`,
-			`syntax error at or near "FROM"
+			`syntax error at or near "from"
 SELECT FROM t
        ^
 `},
@@ -1017,8 +1193,15 @@ SELECT 0x FROM t
 		},
 		{
 			`SELECT x'fail' FROM t`,
-			`invalid hexadecimal string literal
+			`invalid hexadecimal bytes literal
 SELECT x'fail' FROM t
+       ^
+`,
+		},
+		{
+			`SELECT x'AAB' FROM t`,
+			`invalid hexadecimal bytes literal
+SELECT x'AAB' FROM t
        ^
 `,
 		},
@@ -1059,14 +1242,14 @@ SELECT a FROM foo@{FORCE_INDEX=bar,NO_INDEX_JOIN,FORCE_INDEX=baz}
 		},
 		{
 			`SELECT a FROM foo@{NO_INDEX_JOIN,NO_INDEX_JOIN}`,
-			`NO_INDEX_JOIN specified multiple times at or near "NO_INDEX_JOIN"
+			`NO_INDEX_JOIN specified multiple times at or near "no_index_join"
 SELECT a FROM foo@{NO_INDEX_JOIN,NO_INDEX_JOIN}
                                  ^
 `,
 		},
 		{
 			`SELECT a FROM foo@{NO_INDEX_JOIN,FORCE_INDEX=baz,NO_INDEX_JOIN}`,
-			`NO_INDEX_JOIN specified multiple times at or near "NO_INDEX_JOIN"
+			`NO_INDEX_JOIN specified multiple times at or near "no_index_join"
 SELECT a FROM foo@{NO_INDEX_JOIN,FORCE_INDEX=baz,NO_INDEX_JOIN}
                                                  ^
 `,
@@ -1178,9 +1361,9 @@ SELECT 1 + ANY ARRAY[1, 2, 3]
 		},
 	}
 	for _, d := range testData {
-		_, err := parseTraditional(d.sql)
+		_, err := Parse(d.sql)
 		if err == nil || err.Error() != d.expected {
-			t.Fatalf("%s: expected\n%s, but found\n%v", d.sql, d.expected, err)
+			t.Errorf("%s: expected\n%s, but found\n%v", d.sql, d.expected, err)
 		}
 	}
 }
@@ -1203,7 +1386,7 @@ func TestParsePanic(t *testing.T) {
 		"(F(F(F(F(F(F(F(F(F(F" +
 		"(F(F(F(F(F(F(F(F(F((" +
 		"F(0"
-	_, err := parseTraditional(s)
+	_, err := Parse(s)
 	expected := `syntax error at or near "EOF"`
 	if !testutils.IsError(err, expected) {
 		t.Fatalf("expected %s, but found %v", expected, err)
@@ -1242,10 +1425,22 @@ func TestParsePrecedence(t *testing.T) {
 	or := func(left, right Expr) Expr {
 		return &OrExpr{Left: left, Right: right}
 	}
+	concat := func(left, right Expr) Expr {
+		return &BinaryExpr{Operator: Concat, Left: left, Right: right}
+	}
+	regmatch := func(left, right Expr) Expr {
+		return &ComparisonExpr{Operator: RegMatch, Left: left, Right: right}
+	}
+	regimatch := func(left, right Expr) Expr {
+		return &ComparisonExpr{Operator: RegIMatch, Left: left, Right: right}
+	}
 
 	one := &NumVal{Value: constant.MakeInt64(1), OrigString: "1"}
 	two := &NumVal{Value: constant.MakeInt64(2), OrigString: "2"}
 	three := &NumVal{Value: constant.MakeInt64(3), OrigString: "3"}
+	a := &StrVal{s: "a"}
+	b := &StrVal{s: "b"}
+	c := &StrVal{s: "c"}
 
 	testData := []struct {
 		sql      string
@@ -1305,6 +1500,10 @@ func TestParsePrecedence(t *testing.T) {
 		{`1>>2<<3`, binary(LShift, binary(RShift, one, two), three)},
 		{`1>>2>>3`, binary(RShift, binary(RShift, one, two), three)},
 
+		// Power combined with lower precedence.
+		{`1*2^3`, binary(Mult, one, binary(Pow, two, three))},
+		{`1^2*3`, binary(Mult, binary(Pow, one, two), three)},
+
 		// Bit-and combined with higher precedence.
 		{`1&2<<3`, binary(Bitand, one, binary(LShift, two, three))},
 		{`1<<2&3`, binary(Bitand, binary(LShift, one, two), three)},
@@ -1313,15 +1512,15 @@ func TestParsePrecedence(t *testing.T) {
 		{`1&2&3`, binary(Bitand, binary(Bitand, one, two), three)},
 
 		// Bit-xor combined with higher precedence.
-		{`1^2&3`, binary(Bitxor, one, binary(Bitand, two, three))},
-		{`1&2^3`, binary(Bitxor, binary(Bitand, one, two), three)},
+		{`1#2&3`, binary(Bitxor, one, binary(Bitand, two, three))},
+		{`1&2#3`, binary(Bitxor, binary(Bitand, one, two), three)},
 
 		// Bit-xor combined with self (left associative)
-		{`1^2^3`, binary(Bitxor, binary(Bitxor, one, two), three)},
+		{`1#2#3`, binary(Bitxor, binary(Bitxor, one, two), three)},
 
 		// Bit-or combined with higher precedence.
-		{`1|2^3`, binary(Bitor, one, binary(Bitxor, two, three))},
-		{`1^2|3`, binary(Bitor, binary(Bitxor, one, two), three)},
+		{`1|2#3`, binary(Bitor, one, binary(Bitxor, two, three))},
+		{`1#2|3`, binary(Bitor, binary(Bitxor, one, two), three)},
 
 		// Bit-or combined with self (left associative)
 		{`1|2|3`, binary(Bitor, binary(Bitor, one, two), three)},
@@ -1361,9 +1560,16 @@ func TestParsePrecedence(t *testing.T) {
 
 		// OR combined with self (left associative).
 		{`1 OR 2 OR 3`, or(or(one, two), three)},
+
+		// ~ and ~* should both be lower than ||.
+		{`'a' || 'b' ~ 'c'`, regmatch(concat(a, b), c)},
+		{`'a' || 'b' ~* 'c'`, regimatch(concat(a, b), c)},
+
+		// Unary ~ should have highest precedence.
+		{`~1+2`, binary(Plus, unary(UnaryComplement, one), two)},
 	}
 	for _, d := range testData {
-		expr, err := ParseExprTraditional(d.sql)
+		expr, err := ParseExpr(d.sql)
 		if err != nil {
 			t.Fatalf("%s: %v", d.sql, err)
 		}
@@ -1375,12 +1581,12 @@ func TestParsePrecedence(t *testing.T) {
 
 func BenchmarkParse(b *testing.B) {
 	for i := 0; i < b.N; i++ {
-		st, err := parse(`
+		st, err := Parse(`
 			BEGIN;
 			UPDATE pgbench_accounts SET abalance = abalance + 77 WHERE aid = 5;
 			SELECT abalance FROM pgbench_accounts WHERE aid = 5;
 			INSERT INTO pgbench_history (tid, bid, aid, delta, mtime) VALUES (1, 2, 5, 77, CURRENT_TIMESTAMP);
-			END`, Traditional)
+			END`)
 		if err != nil {
 			b.Fatal(err)
 		}
@@ -1410,28 +1616,57 @@ func testEncodeSQL(t *testing.T, encode func(*bytes.Buffer, string), forceUTF8 b
 			if forceUTF8 && !utf8.Valid(bytepair) {
 				continue
 			}
-			s := string(bytepair)
-			var buf bytes.Buffer
-			encode(&buf, s)
-			sql := fmt.Sprintf("SELECT %s", buf.String())
-			for n := 0; n < len(sql); n++ {
-				ch := sql[n]
-				if ch < 0x20 || ch >= 0x7F {
-					t.Fatalf("unprintable character: %v (%v, %v): %s %v", ch, i, j, sql, []byte(sql))
-				}
-			}
-			stmts, err := parseTraditional(sql)
-			if err != nil {
-				t.Fatalf("%s: expected success, but found %s", sql, err)
-			}
-			stmt := stmts.String()
+			stmt := testEncodeString(t, bytepair, encode)
 			if e, ok := seen[stmt]; ok {
 				t.Fatalf("duplicate entry: %s, from %v, currently at %v, %v", stmt, e, i, j)
 			}
 			seen[stmt] = entry{i, j}
-			if sql != stmt {
-				t.Fatalf("expected %s, but found %s", sql, stmt)
-			}
 		}
 	}
+}
+
+func TestEncodeSQLStringSpecial(t *testing.T) {
+	tests := [][]byte{
+		// UTF8 replacement character
+		{0xEF, 0xBF, 0xBD},
+	}
+	for _, tc := range tests {
+		testEncodeString(t, tc, encodeSQLString)
+	}
+}
+
+func testEncodeString(t *testing.T, input []byte, encode func(*bytes.Buffer, string)) string {
+	s := string(input)
+	var buf bytes.Buffer
+	encode(&buf, s)
+	sql := fmt.Sprintf("SELECT %s", buf.String())
+	for n := 0; n < len(sql); n++ {
+		ch := sql[n]
+		if ch < 0x20 || ch >= 0x7F {
+			t.Fatalf("unprintable character: %v (%v): %s %v", ch, input, sql, []byte(sql))
+		}
+	}
+	stmts, err := Parse(sql)
+	if err != nil {
+		t.Fatalf("%s: expected success, but found %s", sql, err)
+	}
+	stmt := stmts.String()
+	if sql != stmt {
+		t.Fatalf("expected %s, but found %s", sql, stmt)
+	}
+	return stmt
+}
+
+func BenchmarkEncodeSQLString(b *testing.B) {
+	str := strings.Repeat("foo", 10000)
+	b.Run("old version", func(b *testing.B) {
+		for i := 0; i < b.N; i++ {
+			encodeSQLStringWithFlags(bytes.NewBuffer(nil), str, FmtBareStrings)
+		}
+	})
+	b.Run("new version", func(b *testing.B) {
+		for i := 0; i < b.N; i++ {
+			encodeSQLStringInsideArray(bytes.NewBuffer(nil), str)
+		}
+	})
 }

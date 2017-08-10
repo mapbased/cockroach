@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Andrei Matei (andreimatei1@gmail.com)
 
 package sql_test
 
@@ -32,6 +30,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/server"
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/storage/storagebase"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
@@ -154,12 +153,8 @@ func checkEndTransactionTrigger(args storagebase.FilterArgs) *roachpb.Error {
 
 	var hasSystemKey bool
 	for _, span := range req.IntentSpans {
-		keyAddr, err := keys.Addr(span.Key)
-		if err != nil {
-			return roachpb.NewError(err)
-		}
-		if bytes.Compare(keyAddr, keys.SystemConfigSpan.Key) >= 0 &&
-			bytes.Compare(keyAddr, keys.SystemConfigSpan.EndKey) < 0 {
+		if bytes.Compare(span.Key, keys.SystemConfigSpan.Key) >= 0 &&
+			bytes.Compare(span.Key, keys.SystemConfigSpan.EndKey) < 0 {
 			hasSystemKey = true
 			break
 		}
@@ -183,7 +178,7 @@ func checkEndTransactionTrigger(args storagebase.FilterArgs) *roachpb.Error {
 
 // createTestServerParams creates a set of params suitable for SQL tests.
 // It enables some EndTransaction sanity checking and installs a flexible
-// TestingCommandFilter.
+// TestingEvalFilter.
 // TODO(andrei): this function is not used consistently by SQL tests. Figure out
 // if the EndTransaction checks are important.
 func createTestServerParams() (base.TestServerArgs, *CommandFilters) {
@@ -191,7 +186,7 @@ func createTestServerParams() (base.TestServerArgs, *CommandFilters) {
 	cmdFilters.AppendFilter(checkEndTransactionTrigger, true)
 	params := base.TestServerArgs{}
 	params.Knobs.Store = &storage.StoreTestingKnobs{
-		TestingCommandFilter: cmdFilters.runFilters,
+		TestingEvalFilter: cmdFilters.runFilters,
 	}
 	return params, &cmdFilters
 }
@@ -201,26 +196,25 @@ func createTestServerParams() (base.TestServerArgs, *CommandFilters) {
 // 'planhook'.
 func init() {
 	testingPlanHook := func(
-		ctx context.Context, stmt parser.Statement, cfg *sql.ExecutorConfig,
-	) (func() ([]parser.DTuple, error), sql.ResultColumns, error) {
+		stmt parser.Statement, state sql.PlanHookState,
+	) (func(context.Context, chan<- parser.Datums) error, sqlbase.ResultColumns, error) {
 		show, ok := stmt.(*parser.Show)
 		if !ok || show.Name != "planhook" {
 			return nil, nil, nil
 		}
-		header := sql.ResultColumns{
+		header := sqlbase.ResultColumns{
 			{Name: "value", Typ: parser.TypeString},
 		}
-		return func() ([]parser.DTuple, error) {
-			return []parser.DTuple{
-				{parser.NewDString(show.Name)},
-			}, nil
+		return func(_ context.Context, resultsCh chan<- parser.Datums) error {
+			resultsCh <- parser.Datums{parser.NewDString(show.Name)}
+			return nil
 		}, header, nil
 	}
 	sql.AddPlanHook(testingPlanHook)
 }
 
 func TestMain(m *testing.M) {
-	security.SetReadFileFn(securitytest.Asset)
+	security.SetAssetLoader(securitytest.EmbeddedAssets)
 	randutil.SeedForTests()
 	serverutils.InitTestServerFactory(server.TestServerFactory)
 	serverutils.InitTestClusterFactory(testcluster.TestClusterFactory)

@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Spencer Kimball (spencer.kimball@gmail.com)
 
 package storage
 
@@ -28,7 +26,7 @@ import (
 func newEntry(index, size uint64) raftpb.Entry {
 	return raftpb.Entry{
 		Index: index,
-		Data:  make([]byte, size, size),
+		Data:  make([]byte, size),
 	}
 }
 
@@ -55,6 +53,15 @@ func verifyGet(
 	}
 	if nextIndex != expNextIndex {
 		t.Fatalf("expected next index %d; got %d", nextIndex, expNextIndex)
+	}
+	for _, e := range ents {
+		term, ok := rec.getTerm(rangeID, e.Index)
+		if !ok {
+			t.Fatalf("expected to be able to retrieve term")
+		}
+		if term != e.Term {
+			t.Fatalf("expected term %d, but got %d", e.Term, term)
+		}
 	}
 }
 
@@ -92,6 +99,12 @@ func TestEntryCache(t *testing.T) {
 	rec.delEntries(rangeID, 10, 11)
 	// Verify get of entries at end of range.
 	verifyGet(t, rec, rangeID, 8, 11, ents[7:9], 10)
+
+	for _, index := range []uint64{0, 12} {
+		if term, ok := rec.getTerm(rangeID, index); ok {
+			t.Fatalf("expected no term, but found %d", term)
+		}
+	}
 }
 
 func TestEntryCacheClearTo(t *testing.T) {

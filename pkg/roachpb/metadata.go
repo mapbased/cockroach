@@ -11,18 +11,17 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Spencer Kimball (spencer.kimball@gmail.com)
-// Author: Bram Gruneir (bram+code@cockroachlabs.com)
 
 package roachpb
 
 import (
+	"bytes"
 	"fmt"
 	"sort"
 	"strconv"
 	"strings"
 
+	"github.com/cockroachdb/cockroach/pkg/util/humanizeutil"
 	"github.com/pkg/errors"
 )
 
@@ -171,6 +170,47 @@ func (r RangeDescriptor) Validate() error {
 	return nil
 }
 
+func (r RangeDescriptor) String() string {
+	var buf bytes.Buffer
+	fmt.Fprintf(&buf, "r%d:", r.RangeID)
+
+	if !r.IsInitialized() {
+		buf.WriteString("{-}")
+	} else {
+		buf.WriteString(r.RSpan().String())
+	}
+	buf.WriteString(" [")
+
+	if len(r.Replicas) > 0 {
+		for i, rep := range r.Replicas {
+			if i > 0 {
+				buf.WriteString(", ")
+			}
+			buf.WriteString(rep.String())
+		}
+	} else {
+		buf.WriteString("<no replicas>")
+	}
+	fmt.Fprintf(&buf, ", next=%d]", r.NextReplicaID)
+
+	return buf.String()
+}
+
+func (r ReplicationTarget) String() string {
+	return fmt.Sprintf("n%d,s%d", r.NodeID, r.StoreID)
+}
+
+func (r ReplicaDescriptor) String() string {
+	var buf bytes.Buffer
+	fmt.Fprintf(&buf, "(n%d,s%d):", r.NodeID, r.StoreID)
+	if r.ReplicaID == 0 {
+		buf.WriteString("?")
+	} else {
+		fmt.Fprintf(&buf, "%d", r.ReplicaID)
+	}
+	return buf.String()
+}
+
 // Validate performs some basic validation of the contents of a replica descriptor.
 func (r ReplicaDescriptor) Validate() error {
 	if r.NodeID == 0 {
@@ -183,6 +223,51 @@ func (r ReplicaDescriptor) Validate() error {
 		return errors.Errorf("ReplicaID must not be zero")
 	}
 	return nil
+}
+
+// PercentilesFromData derives percentiles from a slice of data points.
+// Sorts the input data if it isn't already sorted.
+func PercentilesFromData(data []float64) Percentiles {
+	sort.Float64s(data)
+
+	return Percentiles{
+		P10: percentileFromSortedData(data, 10),
+		P25: percentileFromSortedData(data, 25),
+		P50: percentileFromSortedData(data, 50),
+		P75: percentileFromSortedData(data, 75),
+		P90: percentileFromSortedData(data, 90),
+	}
+}
+
+func percentileFromSortedData(data []float64, percent float64) float64 {
+	if len(data) == 0 {
+		return 0
+	}
+	if percent < 0 {
+		percent = 0
+	}
+	if percent >= 100 {
+		return data[len(data)-1]
+	}
+	// TODO(a-robinson): Use go's rounding function once we're using 1.10.
+	idx := int(float64(len(data)) * percent / 100.0)
+	return data[idx]
+}
+
+// String returns a string representation of the Percentiles.
+func (p Percentiles) String() string {
+	return fmt.Sprintf("p10=%.2f p25=%.2f p50=%.2f p75=%.2f p90=%.2f",
+		p.P10, p.P25, p.P50, p.P75, p.P90)
+}
+
+// String returns a string representation of the StoreCapacity.
+func (sc StoreCapacity) String() string {
+	return fmt.Sprintf("diskAvailable=%s/%s (%.2f%%), "+
+		"ranges=%d, leases=%d, writes=%.2f,"+
+		"bytesPerReplica={%s}, writesPerReplica={%s}",
+		humanizeutil.IBytes(sc.Capacity-sc.Available), humanizeutil.IBytes(sc.Capacity),
+		sc.FractionUsed()*100, sc.RangeCount, sc.LeaseCount, sc.WritesPerSecond,
+		sc.BytesPerReplica, sc.WritesPerReplica)
 }
 
 // FractionUsed computes the fraction of storage capacity that is in use.

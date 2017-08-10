@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Peter Mattis (peter@cockroachlabs.com)
 
 package client
 
@@ -21,11 +19,11 @@ import (
 	"reflect"
 	"time"
 
-	"gopkg.in/inf.v0"
+	"github.com/gogo/protobuf/proto"
 
+	"github.com/cockroachdb/apd"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/util/duration"
-	"github.com/gogo/protobuf/proto"
 )
 
 // TODO(pmattis): The methods in this file needs tests.
@@ -69,7 +67,7 @@ func marshalValue(v interface{}) (roachpb.Value, error) {
 		r.SetBytes(t)
 		return r, nil
 
-	case inf.Dec:
+	case apd.Decimal:
 		err := r.SetDecimal(&t)
 		return r, err
 

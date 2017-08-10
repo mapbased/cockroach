@@ -11,22 +11,25 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Cuong Do (cdo@cockroachlabs.com)
 
 package cli
 
 import (
 	"fmt"
+	"math"
 	"os"
 	"strconv"
 	"time"
 
+	"golang.org/x/net/context"
+
 	"github.com/pkg/errors"
 	"github.com/spf13/cobra"
 
+	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
 	"github.com/cockroachdb/cockroach/pkg/server/status"
+	"github.com/cockroachdb/cockroach/pkg/util/retry"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
 )
 
@@ -45,8 +48,7 @@ var lsNodesCmd = &cobra.Command{
 	Displays IDs for all nodes in cluster, which can be used with the status and stores
 	commands.
 	`,
-	SilenceUsage: true,
-	RunE:         MaybeDecorateGRPCError(runLsNodes),
+	RunE: MaybeDecorateGRPCError(runLsNodes),
 }
 
 func runLsNodes(cmd *cobra.Command, args []string) error {
@@ -58,7 +60,7 @@ func runLsNodes(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return err
 	}
-	defer stopper.Stop()
+	defer stopper.Stop(stopperContext(stopper))
 
 	nodeStatuses, err := c.Nodes(stopperContext(stopper), &serverpb.NodesRequest{})
 	if err != nil {
@@ -72,11 +74,10 @@ func runLsNodes(cmd *cobra.Command, args []string) error {
 		})
 	}
 
-	printQueryOutput(os.Stdout, lsNodesColumnHeaders, rows, "", cliCtx.prettyFmt)
-	return nil
+	return printQueryOutput(os.Stdout, lsNodesColumnHeaders, newRowSliceIter(rows), "")
 }
 
-var nodesColumnHeaders = []string{
+var statusNodesColumnHeaders = []string{
 	"id",
 	"address",
 	"build",
@@ -101,8 +102,7 @@ var statusNodeCmd = &cobra.Command{
 	If a node ID is specified, this will show the status for the corresponding node. If no node ID
 	is specified, this will display the status for all nodes in the cluster.
 	`,
-	SilenceUsage: true,
-	RunE:         MaybeDecorateGRPCError(runStatusNode),
+	RunE: MaybeDecorateGRPCError(runStatusNode),
 }
 
 func runStatusNode(cmd *cobra.Command, args []string) error {
@@ -112,12 +112,13 @@ func runStatusNode(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return err
 	}
-	defer stopper.Stop()
+	ctx := stopperContext(stopper)
+	defer stopper.Stop(ctx)
 
 	switch len(args) {
 	case 0:
 		// Show status for all nodes.
-		nodes, err := c.Nodes(stopperContext(stopper), &serverpb.NodesRequest{})
+		nodes, err := c.Nodes(ctx, &serverpb.NodesRequest{})
 		if err != nil {
 			return err
 		}
@@ -125,7 +126,7 @@ func runStatusNode(cmd *cobra.Command, args []string) error {
 
 	case 1:
 		nodeID := args[0]
-		nodeStatus, err := c.Node(stopperContext(stopper), &serverpb.NodeRequest{NodeId: nodeID})
+		nodeStatus, err := c.Node(ctx, &serverpb.NodeRequest{NodeId: nodeID})
 		if err != nil {
 			return err
 		}
@@ -142,8 +143,7 @@ func runStatusNode(cmd *cobra.Command, args []string) error {
 		return errors.Errorf("expected no arguments or a single node ID")
 	}
 
-	printQueryOutput(os.Stdout, nodesColumnHeaders, nodeStatusesToRows(nodeStatuses), "", cliCtx.prettyFmt)
-	return nil
+	return printQueryOutput(os.Stdout, statusNodesColumnHeaders, newRowSliceIter(nodeStatusesToRows(nodeStatuses)), "")
 }
 
 // nodeStatusesToRows converts NodeStatuses to SQL-like result rows, so that we can pretty-print
@@ -187,16 +187,191 @@ func nodeStatusesToRows(statuses []status.NodeStatus) [][]string {
 	return rows
 }
 
+var decommissionNodesColumnHeaders = []string{
+	"id",
+	"is_live",
+	"replicas",
+	"is_decommissioning",
+	"is_draining",
+}
+
+var decommissionNodeCmd = &cobra.Command{
+	Use:   "decommission [<nodeID1> <nodeID2> ...]",
+	Short: "decommissions the node(s)",
+	Long: `
+Marks the nodes with the supplied IDs as decommissioning.
+This will cause leases and replicas to be removed from these nodes.
+
+When called without any targets, lists decommissioning status of
+all known nodes.
+	`,
+	RunE: MaybeDecorateGRPCError(runDecommissionNode),
+}
+
+func parseNodeIDs(strNodeIDs []string) ([]roachpb.NodeID, error) {
+	nodeIDs := make([]roachpb.NodeID, 0, len(strNodeIDs))
+	for _, str := range strNodeIDs {
+		i, err := strconv.ParseInt(str, 10, 32)
+		if err != nil {
+			return nil, errors.Errorf("unable to parse %s: %s", str, err)
+		}
+		nodeIDs = append(nodeIDs, roachpb.NodeID(i))
+	}
+	return nodeIDs, nil
+}
+
+func runDecommissionNode(cmd *cobra.Command, args []string) error {
+	c, stopper, err := getAdminClient()
+	if err != nil {
+		return err
+	}
+	ctx := stopperContext(stopper)
+	defer stopper.Stop(ctx)
+
+	if len(args) == 0 {
+		req := &serverpb.DecommissionStatusRequest{}
+		resp, err := c.DecommissionStatus(ctx, req)
+		if err != nil {
+			return err
+		}
+		return printDecommissionStatus(*resp)
+	}
+	return runDecommissionNodeImpl(ctx, c, nodeCtx.nodeDecommissionWait, args)
+}
+
+func runDecommissionNodeImpl(
+	ctx context.Context, c serverpb.AdminClient, wait nodeDecommissionWaitType, args []string,
+) error {
+	nodeIDs, err := parseNodeIDs(args)
+	if err != nil {
+		return err
+	}
+	minReplicaCount := int64(math.MaxInt64)
+	opts := retry.Options{
+		InitialBackoff: 5 * time.Millisecond,
+		Multiplier:     2,
+		MaxBackoff:     20 * time.Second,
+	}
+	for r := retry.StartWithCtx(ctx, opts); r.Next(); {
+		req := &serverpb.DecommissionRequest{
+			NodeIDs:         nodeIDs,
+			Decommissioning: true,
+		}
+		resp, err := c.Decommission(ctx, req)
+
+		if err != nil {
+			return errors.Wrap(err, "while trying to mark as decommissioning")
+		}
+		if err := printDecommissionStatus(*resp); err != nil {
+			return err
+		}
+		var replicaCount int64
+		allDecommissioning := true
+		for _, status := range resp.Status {
+			if wait != nodeDecommissionWaitLive || status.IsLive {
+				replicaCount += status.ReplicaCount
+			}
+			allDecommissioning = allDecommissioning && status.Decommissioning
+		}
+		if replicaCount == 0 && allDecommissioning {
+			if wait == nodeDecommissionWaitAll {
+				fmt.Fprintln(os.Stdout, "All target nodes report that they hold no more data. "+
+					"Please verify cluster health before removing the nodes.")
+			} else {
+				fmt.Fprintln(os.Stdout, "Decommissioning finished. Please verify cluster health "+
+					"before removing the nodes.")
+			}
+			break
+		}
+		if wait == nodeDecommissionWaitNone {
+			break
+		}
+		if replicaCount < minReplicaCount {
+			minReplicaCount = replicaCount
+			r.Reset()
+		}
+	}
+	return nil
+}
+
+// decommissionResponseValueToRows converts DecommissionStatusResponse_Status to
+// SQL-like result rows, so that we can pretty-print them.
+func decommissionResponseValueToRows(
+	statuses []serverpb.DecommissionStatusResponse_Status,
+) [][]string {
+	// Create results that are like the results for SQL results, so that we can pretty-print them.
+	var rows [][]string
+	for _, node := range statuses {
+		rows = append(rows, []string{
+			strconv.FormatInt(int64(node.NodeID), 10),
+			strconv.FormatBool(node.IsLive),
+			strconv.FormatInt(node.ReplicaCount, 10),
+			strconv.FormatBool(node.Decommissioning),
+			strconv.FormatBool(node.Draining),
+		})
+	}
+	return rows
+}
+
+var recommissionNodeCmd = &cobra.Command{
+	Use:   "recommission [<node ID>]+",
+	Short: "recommissions the node(s)",
+	Long: `
+For the nodes with the supplied IDs, resets the decommissioning states.
+The target nodes must be restarted, at which point the change will take
+effect and the nodes will participate in the cluster as regular nodes.
+	`,
+	RunE: MaybeDecorateGRPCError(runRecommissionNode),
+}
+
+func printDecommissionStatus(resp serverpb.DecommissionStatusResponse) error {
+	return printQueryOutput(os.Stdout, decommissionNodesColumnHeaders,
+		newRowSliceIter(decommissionResponseValueToRows(resp.Status)), "")
+}
+
+func runRecommissionNode(cmd *cobra.Command, args []string) error {
+	if len(args) == 0 {
+		return usageAndError(cmd)
+	}
+	nodeIDs, err := parseNodeIDs(args)
+	if err != nil {
+		return err
+	}
+
+	c, stopper, err := getAdminClient()
+	if err != nil {
+		return err
+	}
+	ctx := stopperContext(stopper)
+	defer stopper.Stop(ctx)
+
+	req := &serverpb.DecommissionRequest{
+		NodeIDs:         nodeIDs,
+		Decommissioning: false,
+	}
+	resp, err := c.Decommission(ctx, req)
+	if err != nil {
+		return err
+	}
+	if err := printDecommissionStatus(*resp); err != nil {
+		return err
+	}
+	fmt.Fprintln(os.Stdout, "The affected nodes must be restarted for the change to take effect.")
+	return nil
+}
+
 // Sub-commands for node command.
 var nodeCmds = []*cobra.Command{
 	lsNodesCmd,
 	statusNodeCmd,
+	decommissionNodeCmd,
+	recommissionNodeCmd,
 }
 
 var nodeCmd = &cobra.Command{
 	Use:   "node [command]",
-	Short: "list nodes and show their status",
-	Long:  "List nodes and show their status.",
+	Short: "list, inspect or remove nodes",
+	Long:  "List, inspect or remove nodes.",
 	RunE: func(cmd *cobra.Command, args []string) error {
 		return cmd.Usage()
 	},
@@ -207,7 +382,7 @@ func init() {
 }
 
 func getStatusClient() (serverpb.StatusClient, *stop.Stopper, error) {
-	conn, stopper, err := getGRPCConn()
+	conn, _, stopper, err := getClientGRPCConn()
 	if err != nil {
 		return nil, nil, err
 	}

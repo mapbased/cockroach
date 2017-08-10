@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Vivek Menezes (vivek@cockroachlabs.com)
 
 package sql_test
 
@@ -33,7 +31,9 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/internal/client"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	csql "github.com/cockroachdb/cockroach/pkg/sql"
+	"github.com/cockroachdb/cockroach/pkg/sql"
+	"github.com/cockroachdb/cockroach/pkg/sql/distsqlrun"
+	"github.com/cockroachdb/cockroach/pkg/sql/jobs"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
@@ -42,6 +42,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/cockroach/pkg/util/retry"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
+	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 )
 
@@ -55,12 +56,13 @@ func TestSchemaChangeLease(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	params, _ := createTestServerParams()
 	s, sqlDB, kvDB := serverutils.StartServer(t, params)
-	defer s.Stopper().Stop()
+	defer s.Stopper().Stop(context.TODO())
+	jobRegistry := s.JobRegistry().(*jobs.Registry)
 	// Set MinSchemaChangeLeaseDuration to always expire the lease.
-	minLeaseDuration := csql.MinSchemaChangeLeaseDuration
-	csql.MinSchemaChangeLeaseDuration = 2 * csql.SchemaChangeLeaseDuration
+	minLeaseDuration := sql.MinSchemaChangeLeaseDuration
+	sql.MinSchemaChangeLeaseDuration = 2 * sql.SchemaChangeLeaseDuration
 	defer func() {
-		csql.MinSchemaChangeLeaseDuration = minLeaseDuration
+		sql.MinSchemaChangeLeaseDuration = minLeaseDuration
 	}()
 
 	if _, err := sqlDB.Exec(`
@@ -73,10 +75,12 @@ CREATE TABLE t.test (k CHAR PRIMARY KEY, v CHAR);
 	var lease sqlbase.TableDescriptor_SchemaChangeLease
 	var id = sqlbase.ID(keys.MaxReservedDescID + 2)
 	var node = roachpb.NodeID(2)
-	changer := csql.NewSchemaChangerForTesting(id, 0, node, *kvDB, nil)
+	changer := sql.NewSchemaChangerForTesting(id, 0, node, *kvDB, nil, jobRegistry)
+
+	ctx := context.TODO()
 
 	// Acquire a lease.
-	lease, err := changer.AcquireLease()
+	lease, err := changer.AcquireLease(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -86,100 +90,98 @@ CREATE TABLE t.test (k CHAR PRIMARY KEY, v CHAR);
 	}
 
 	// Acquiring another lease will fail.
-	if _, err := changer.AcquireLease(); !testutils.IsError(
+	if _, err := changer.AcquireLease(ctx); !testutils.IsError(
 		err, "an outstanding schema change lease exists",
 	) {
 		t.Fatal(err)
 	}
 
 	// Extend the lease.
-	newLease, err := changer.ExtendLease(lease)
-	if err != nil {
+	oldLease := lease
+	if err := changer.ExtendLease(ctx, &lease); err != nil {
 		t.Fatal(err)
 	}
 
-	if !validExpirationTime(newLease.ExpirationTime) {
-		t.Fatalf("invalid expiration time: %s", time.Unix(0, newLease.ExpirationTime))
+	if !validExpirationTime(lease.ExpirationTime) {
+		t.Fatalf("invalid expiration time: %s", time.Unix(0, lease.ExpirationTime))
 	}
 
 	// The new lease is a brand new lease.
-	if newLease == lease {
+	if oldLease == lease {
 		t.Fatalf("lease was not extended: %v", lease)
 	}
 
 	// Extending an old lease fails.
-	if _, err := changer.ExtendLease(lease); !testutils.IsError(err, "table: .* has lease") {
+	if err := changer.ExtendLease(ctx, &oldLease); !testutils.IsError(err, "table: .* has lease") {
 		t.Fatal(err)
 	}
 
 	// Releasing an old lease fails.
-	err = changer.ReleaseLease(lease)
-	if err == nil {
+	if err := changer.ReleaseLease(ctx, oldLease); err == nil {
 		t.Fatal("releasing a old lease succeeded")
 	}
 
 	// Release lease.
-	err = changer.ReleaseLease(newLease)
-	if err != nil {
+	if err := changer.ReleaseLease(ctx, lease); err != nil {
 		t.Fatal(err)
 	}
 
 	// Extending the lease fails.
-	_, err = changer.ExtendLease(newLease)
-	if err == nil {
+	if err := changer.ExtendLease(ctx, &lease); err == nil {
 		t.Fatalf("was able to extend an already released lease: %d, %v", id, lease)
 	}
 
 	// acquiring the lease succeeds
-	lease, err = changer.AcquireLease()
+	lease, err = changer.AcquireLease(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	// Set MinSchemaChangeLeaseDuration to not expire the lease.
-	csql.MinSchemaChangeLeaseDuration = minLeaseDuration
-	newLease, err = changer.ExtendLease(lease)
-	if err != nil {
+	sql.MinSchemaChangeLeaseDuration = minLeaseDuration
+	oldLease = lease
+	if err := changer.ExtendLease(ctx, &lease); err != nil {
 		t.Fatal(err)
 	}
 	// The old lease is renewed.
-	if newLease != lease {
-		t.Fatalf("acquired new lease: %v, old lease: %v", newLease, lease)
+	if oldLease != lease {
+		t.Fatalf("acquired new lease: %v, old lease: %v", lease, oldLease)
 	}
 }
 
 func validExpirationTime(expirationTime int64) bool {
 	now := timeutil.Now()
-	return expirationTime > now.Add(csql.LeaseDuration/2).UnixNano() && expirationTime < now.Add(csql.LeaseDuration*3/2).UnixNano()
+	return expirationTime > now.Add(sql.LeaseDuration/2).UnixNano() && expirationTime < now.Add(sql.LeaseDuration*3/2).UnixNano()
 }
 
 func TestSchemaChangeProcess(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	// The descriptor changes made must have an immediate effect
 	// so disable leases on tables.
-	defer csql.TestDisableTableLeases()()
+	defer sql.TestDisableTableLeases()()
 
 	params, _ := createTestServerParams()
 	// Disable external processing of mutations.
-	params.Knobs.SQLSchemaChanger = &csql.SchemaChangerTestingKnobs{
+	params.Knobs.SQLSchemaChanger = &sql.SchemaChangerTestingKnobs{
 		AsyncExecNotification: asyncSchemaChangerDisabled,
 	}
 	s, sqlDB, kvDB := serverutils.StartServer(t, params)
-	defer s.Stopper().Stop()
+	defer s.Stopper().Stop(context.TODO())
 
 	var id = sqlbase.ID(keys.MaxReservedDescID + 2)
 	var node = roachpb.NodeID(2)
 	stopper := stop.NewStopper()
-	leaseMgr := csql.NewLeaseManager(
+	leaseMgr := sql.NewLeaseManager(
 		&base.NodeIDContainer{},
 		*kvDB,
 		hlc.NewClock(hlc.UnixNano, time.Nanosecond),
-		csql.LeaseManagerTestingKnobs{},
+		sql.LeaseManagerTestingKnobs{},
 		stopper,
-		&csql.MemoryMetrics{},
+		&sql.MemoryMetrics{},
 	)
-	defer stopper.Stop()
-	changer := csql.NewSchemaChangerForTesting(id, 0, node, *kvDB, leaseMgr)
+	jobRegistry := s.JobRegistry().(*jobs.Registry)
+	defer stopper.Stop(context.TODO())
+	changer := sql.NewSchemaChangerForTesting(id, 0, node, *kvDB, leaseMgr, jobRegistry)
 
 	if _, err := sqlDB.Exec(`
 CREATE DATABASE t;
@@ -193,8 +195,9 @@ INSERT INTO t.test VALUES ('a', 'b'), ('c', 'd');
 	tableDesc := sqlbase.GetTableDescriptor(kvDB, "t", "test")
 
 	expectedVersion := tableDesc.Version
+	ctx := context.TODO()
 
-	desc, err := changer.MaybeIncrementVersion()
+	desc, err := changer.MaybeIncrementVersion(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -203,33 +206,20 @@ INSERT INTO t.test VALUES ('a', 'b'), ('c', 'd');
 	if newVersion != expectedVersion {
 		t.Fatalf("bad version; e = %d, v = %d", expectedVersion, newVersion)
 	}
-	isDone, err := changer.IsDone()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !isDone {
-		t.Fatalf("table expected to not have an outstanding schema change: %v", tableDesc)
-	}
 
 	// Check that MaybeIncrementVersion increments the version
 	// correctly.
 	expectedVersion++
 	tableDesc.UpVersion = true
 	if err := kvDB.Put(
-		context.TODO(),
+		ctx,
 		sqlbase.MakeDescMetadataKey(tableDesc.ID),
 		sqlbase.WrapDescriptor(tableDesc),
 	); err != nil {
 		t.Fatal(err)
 	}
-	isDone, err = changer.IsDone()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if isDone {
-		t.Fatalf("table expected to have an outstanding schema change: %v", desc.GetTable())
-	}
-	desc, err = changer.MaybeIncrementVersion()
+
+	desc, err = changer.MaybeIncrementVersion(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -243,17 +233,10 @@ INSERT INTO t.test VALUES ('a', 'b'), ('c', 'd');
 	if newVersion != expectedVersion {
 		t.Fatalf("bad version in saved desc; e = %d, v = %d", expectedVersion, newVersion)
 	}
-	isDone, err = changer.IsDone()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !isDone {
-		t.Fatalf("table expected to not have an outstanding schema change: %v", tableDesc)
-	}
 
 	// Check that RunStateMachineBeforeBackfill doesn't do anything
 	// if there are no mutations queued.
-	if err := changer.RunStateMachineBeforeBackfill(); err != nil {
+	if err := changer.RunStateMachineBeforeBackfill(ctx); err != nil {
 		t.Fatal(err)
 	}
 
@@ -270,7 +253,8 @@ INSERT INTO t.test VALUES ('a', 'b'), ('c', 'd');
 	index.Name = "bar"
 	index.ID = tableDesc.NextIndexID
 	tableDesc.NextIndexID++
-	changer = csql.NewSchemaChangerForTesting(id, tableDesc.NextMutationID, node, *kvDB, leaseMgr)
+	changer = sql.NewSchemaChangerForTesting(
+		id, tableDesc.NextMutationID, node, *kvDB, leaseMgr, jobRegistry)
 	tableDesc.Mutations = append(tableDesc.Mutations, sqlbase.DescriptorMutation{
 		Descriptor_: &sqlbase.DescriptorMutation_Index{Index: index},
 		Direction:   sqlbase.DescriptorMutation_ADD,
@@ -284,20 +268,20 @@ INSERT INTO t.test VALUES ('a', 'b'), ('c', 'd');
 		tableDesc.Mutations[0].Direction = direction
 		expectedVersion++
 		if err := kvDB.Put(
-			context.TODO(),
+			ctx,
 			sqlbase.MakeDescMetadataKey(tableDesc.ID),
 			sqlbase.WrapDescriptor(tableDesc),
 		); err != nil {
 			t.Fatal(err)
 		}
 		// The expected end state.
-		expectedState := sqlbase.DescriptorMutation_WRITE_ONLY
+		expectedState := sqlbase.DescriptorMutation_DELETE_AND_WRITE_ONLY
 		if direction == sqlbase.DescriptorMutation_DROP {
 			expectedState = sqlbase.DescriptorMutation_DELETE_ONLY
 		}
 		// Run two times to ensure idempotency of operations.
 		for i := 0; i < 2; i++ {
-			if err := changer.RunStateMachineBeforeBackfill(); err != nil {
+			if err := changer.RunStateMachineBeforeBackfill(ctx); err != nil {
 				t.Fatal(err)
 			}
 
@@ -313,34 +297,30 @@ INSERT INTO t.test VALUES ('a', 'b'), ('c', 'd');
 		}
 	}
 	// RunStateMachineBeforeBackfill() doesn't complete the schema change.
-	isDone, err = changer.IsDone()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if isDone {
+	tableDesc = sqlbase.GetTableDescriptor(kvDB, "t", "test")
+	if len(tableDesc.Mutations) == 0 {
 		t.Fatalf("table expected to have an outstanding schema change: %v", tableDesc)
 	}
-
 }
 
 func TestAsyncSchemaChanger(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	// The descriptor changes made must have an immediate effect
 	// so disable leases on tables.
-	defer csql.TestDisableTableLeases()()
+	defer sql.TestDisableTableLeases()()
 	// Disable synchronous schema change execution so the asynchronous schema
 	// changer executes all schema changes.
 	params, _ := createTestServerParams()
 	params.Knobs = base.TestingKnobs{
-		SQLSchemaChanger: &csql.SchemaChangerTestingKnobs{
-			SyncFilter: func(tscc csql.TestingSchemaChangerCollection) {
+		SQLSchemaChanger: &sql.SchemaChangerTestingKnobs{
+			SyncFilter: func(tscc sql.TestingSchemaChangerCollection) {
 				tscc.ClearSchemaChangers()
 			},
 			AsyncExecQuickly: true,
 		},
 	}
 	s, sqlDB, kvDB := serverutils.StartServer(t, params)
-	defer s.Stopper().Stop()
+	defer s.Stopper().Stop(context.TODO())
 
 	if _, err := sqlDB.Exec(`
 CREATE DATABASE t;
@@ -427,16 +407,29 @@ CREATE INDEX foo ON t.test (v)
 	}
 }
 
+func checkTableKeyCount(ctx context.Context, kvDB *client.DB, multiple int, maxValue int) error {
+	tableDesc := sqlbase.GetTableDescriptor(kvDB, "t", "test")
+	tablePrefix := roachpb.Key(keys.MakeTablePrefix(uint32(tableDesc.ID)))
+	tableEnd := tablePrefix.PrefixEnd()
+	if kvs, err := kvDB.Scan(ctx, tablePrefix, tableEnd, 0); err != nil {
+		return err
+	} else if e := multiple * (maxValue + 1); len(kvs) != e {
+		return errors.Errorf("expected %d key value pairs, but got %d", e, len(kvs))
+	}
+	return nil
+}
+
 // Run a particular schema change and run some OLTP operations in parallel, as
 // soon as the schema change starts executing its backfill.
 func runSchemaChangeWithOperations(
 	t *testing.T,
 	sqlDB *gosql.DB,
 	kvDB *client.DB,
+	jobRegistry *jobs.Registry,
 	schemaChange string,
 	maxValue int,
 	keyMultiple int,
-	backfillNotification chan bool,
+	backfillNotification chan struct{},
 ) {
 	tableDesc := sqlbase.GetTableDescriptor(kvDB, "t", "test")
 
@@ -457,11 +450,12 @@ func runSchemaChangeWithOperations(
 	<-backfillNotification
 
 	// Run a variety of operations during the backfill.
+	ctx := context.TODO()
 
 	// Grabbing a schema change lease on the table will fail, disallowing
 	// another schema change from being simultaneously executed.
-	sc := csql.NewSchemaChangerForTesting(tableDesc.ID, 0, 0, *kvDB, nil)
-	if l, err := sc.AcquireLease(); err == nil {
+	sc := sql.NewSchemaChangerForTesting(tableDesc.ID, 0, 0, *kvDB, nil, jobRegistry)
+	if l, err := sc.AcquireLease(ctx); err == nil {
 		t.Fatalf("schema change lease acquisition on table %d succeeded: %v", tableDesc.ID, l)
 	}
 
@@ -511,15 +505,8 @@ func runSchemaChangeWithOperations(
 
 	// Verify the number of keys left behind in the table to validate schema
 	// change operations.
-	tablePrefix := roachpb.Key(keys.MakeTablePrefix(uint32(tableDesc.ID)))
-	tableEnd := tablePrefix.PrefixEnd()
-	if kvs, err := kvDB.Scan(context.TODO(), tablePrefix, tableEnd, 0); err != nil {
+	if err := checkTableKeyCount(ctx, kvDB, keyMultiple, maxValue+numInserts); err != nil {
 		t.Fatal(err)
-	} else if e := keyMultiple * (maxValue + numInserts + 1); len(kvs) != e {
-		for _, kv := range kvs {
-			t.Errorf("key %s, value %s", kv.Key, kv.Value)
-		}
-		t.Fatalf("expected %d key value pairs, but got %d", e, len(kvs))
 	}
 
 	// Delete the rows inserted.
@@ -544,25 +531,55 @@ func bulkInsertIntoTable(sqlDB *gosql.DB, maxValue int) error {
 // that run simultaneously.
 func TestRaceWithBackfill(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	var backfillNotification chan bool
+	// protects backfillNotification
+	var mu syncutil.Mutex
+	var backfillNotification chan struct{}
+
+	const numNodes, chunkSize, maxValue = 5, 100, 4000
 	params, _ := createTestServerParams()
+	initBackfillNotification := func() chan struct{} {
+		mu.Lock()
+		defer mu.Unlock()
+		backfillNotification = make(chan struct{})
+		return backfillNotification
+	}
+	notifyBackfill := func() {
+		mu.Lock()
+		defer mu.Unlock()
+		if backfillNotification != nil {
+			// Close channel to notify that the backfill has started.
+			close(backfillNotification)
+			backfillNotification = nil
+		}
+	}
 	// Disable asynchronous schema change execution to allow synchronous path
 	// to trigger start of backfill notification.
 	params.Knobs = base.TestingKnobs{
-		SQLSchemaChanger: &csql.SchemaChangerTestingKnobs{
+		SQLSchemaChanger: &sql.SchemaChangerTestingKnobs{
 			RunBeforeBackfillChunk: func(sp roachpb.Span) error {
-				if backfillNotification != nil {
-					// Close channel to notify that the backfill has started.
-					close(backfillNotification)
-					backfillNotification = nil
-				}
+				notifyBackfill()
 				return nil
 			},
 			AsyncExecNotification: asyncSchemaChangerDisabled,
+			BackfillChunkSize:     chunkSize,
+		},
+		DistSQL: &distsqlrun.TestingKnobs{
+			RunBeforeBackfillChunk: func(sp roachpb.Span) error {
+				notifyBackfill()
+				return nil
+			},
 		},
 	}
-	server, sqlDB, kvDB := serverutils.StartServer(t, params)
-	defer server.Stopper().Stop()
+
+	tc := serverutils.StartTestCluster(t, numNodes,
+		base.TestClusterArgs{
+			ReplicationMode: base.ReplicationManual,
+			ServerArgs:      params,
+		})
+	defer tc.Stopper().Stop(context.TODO())
+	kvDB := tc.Server(0).KVClient().(*client.DB)
+	sqlDB := tc.ServerConn(0)
+	jobRegistry := tc.Server(0).JobRegistry().(*jobs.Registry)
 
 	if _, err := sqlDB.Exec(`
 CREATE DATABASE t;
@@ -573,68 +590,71 @@ CREATE UNIQUE INDEX vidx ON t.test (v);
 	}
 
 	// Bulk insert.
-	maxValue := 4000
 	if err := bulkInsertIntoTable(sqlDB, maxValue); err != nil {
 		t.Fatal(err)
 	}
 
-	// Read table descriptor for version.
+	// Split the table into multiple ranges.
 	tableDesc := sqlbase.GetTableDescriptor(kvDB, "t", "test")
-	tablePrefix := roachpb.Key(keys.MakeTablePrefix(uint32(tableDesc.ID)))
-	tableEnd := tablePrefix.PrefixEnd()
-	// number of keys == 3 * number of rows; 2 column families and 1 index entry
+	// SplitTable moves the right range, so we split things back to front
+	// in order to move less data.
+	for i := numNodes - 1; i > 0; i-- {
+		sql.SplitTable(t, tc, tableDesc, i, maxValue/numNodes*i)
+	}
+
+	ctx := context.TODO()
+
+	// number of keys == 2 * number of rows; 1 column family and 1 index entry
 	// for each row.
-	if kvs, err := kvDB.Scan(context.TODO(), tablePrefix, tableEnd, 0); err != nil {
+	if err := checkTableKeyCount(ctx, kvDB, 2, maxValue); err != nil {
 		t.Fatal(err)
-	} else if e := 3 * (maxValue + 1); len(kvs) != e {
-		t.Fatalf("expected %d key value pairs, but got %d", e, len(kvs))
 	}
 
 	// Run some schema changes with operations.
 
 	// Add column.
-	backfillNotification = make(chan bool)
 	runSchemaChangeWithOperations(
 		t,
 		sqlDB,
 		kvDB,
+		jobRegistry,
 		"ALTER TABLE t.test ADD COLUMN x DECIMAL DEFAULT (DECIMAL '1.4')",
 		maxValue,
-		4,
-		backfillNotification)
+		2,
+		initBackfillNotification())
 
 	// Drop column.
-	backfillNotification = make(chan bool)
 	runSchemaChangeWithOperations(
 		t,
 		sqlDB,
 		kvDB,
+		jobRegistry,
 		"ALTER TABLE t.test DROP pi",
 		maxValue,
-		3,
-		backfillNotification)
+		2,
+		initBackfillNotification())
 
 	// Add index.
-	backfillNotification = make(chan bool)
 	runSchemaChangeWithOperations(
 		t,
 		sqlDB,
 		kvDB,
+		jobRegistry,
 		"CREATE UNIQUE INDEX foo ON t.test (v)",
 		maxValue,
-		4,
-		backfillNotification)
+		3,
+		initBackfillNotification())
 
 	// Drop index.
-	backfillNotification = make(chan bool)
 	runSchemaChangeWithOperations(
 		t,
 		sqlDB,
 		kvDB,
+		jobRegistry,
 		"DROP INDEX t.test@vidx",
 		maxValue,
-		3,
-		backfillNotification)
+		2,
+		initBackfillNotification())
 
 	// Verify that the index foo over v is consistent, and that column x has
 	// been backfilled properly.
@@ -642,6 +662,7 @@ CREATE UNIQUE INDEX vidx ON t.test (v);
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer rows.Close()
 
 	count := 0
 	for ; rows.Next(); count++ {
@@ -665,34 +686,103 @@ CREATE UNIQUE INDEX vidx ON t.test (v);
 	if eCount != count {
 		t.Fatalf("read the wrong number of rows: e = %d, v = %d", eCount, count)
 	}
+}
 
-	// Verify that a table delete in the middle of a backfill works properly.
-	// The backfill will terminate in the middle, and the delete will
-	// successfully delete all the table data.
-	//
-	// This test could be made its own test but is placed here to speed up the
-	// testing.
+// Test that a table drop in the middle of a backfill works properly.
+// The backfill will terminate in the middle, and the drop will
+// successfully complete without deleting the data.
+func TestDropWhileBackfill(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	// protects backfillNotification
+	var mu syncutil.Mutex
+	backfillNotification := make(chan struct{})
 
-	notification := make(chan bool)
-	backfillNotification = notification
+	var partialBackfillDone atomic.Value
+	partialBackfillDone.Store(false)
+	const numNodes, chunkSize, maxValue = 5, 100, 4000
+	params, _ := createTestServerParams()
+	notifyBackfill := func() {
+		mu.Lock()
+		defer mu.Unlock()
+		if backfillNotification != nil {
+			// Close channel to notify that the backfill has started.
+			close(backfillNotification)
+			backfillNotification = nil
+		}
+	}
+	// Disable asynchronous schema change execution to allow synchronous path
+	// to trigger start of backfill notification.
+	params.Knobs = base.TestingKnobs{
+		SQLSchemaChanger: &sql.SchemaChangerTestingKnobs{
+			AsyncExecNotification: asyncSchemaChangerDisabled,
+			BackfillChunkSize:     chunkSize,
+		},
+		DistSQL: &distsqlrun.TestingKnobs{
+			RunBeforeBackfillChunk: func(sp roachpb.Span) error {
+				if partialBackfillDone.Load().(bool) {
+					notifyBackfill()
+					// Returning DeadlineExceeded will result in the
+					// schema change being retried.
+					return context.DeadlineExceeded
+				}
+				partialBackfillDone.Store(true)
+				return nil
+			},
+		},
+	}
+
+	tc := serverutils.StartTestCluster(t, numNodes,
+		base.TestClusterArgs{
+			ReplicationMode: base.ReplicationManual,
+			ServerArgs:      params,
+		})
+	defer tc.Stopper().Stop(context.TODO())
+	kvDB := tc.Server(0).KVClient().(*client.DB)
+	sqlDB := tc.ServerConn(0)
+
+	if _, err := sqlDB.Exec(`
+CREATE DATABASE t;
+CREATE TABLE t.test (k INT PRIMARY KEY, v INT, pi DECIMAL DEFAULT (DECIMAL '3.14'));
+CREATE UNIQUE INDEX vidx ON t.test (v);
+`); err != nil {
+		t.Fatal(err)
+	}
+
+	// Bulk insert.
+	if err := bulkInsertIntoTable(sqlDB, maxValue); err != nil {
+		t.Fatal(err)
+	}
+
+	// Split the table into multiple ranges.
+	tableDesc := sqlbase.GetTableDescriptor(kvDB, "t", "test")
+	// SplitTable moves the right range, so we split things back to front
+	// in order to move less data.
+	for i := numNodes - 1; i > 0; i-- {
+		sql.SplitTable(t, tc, tableDesc, i, maxValue/numNodes*i)
+	}
+
+	ctx := context.TODO()
+
+	// number of keys == 2 * number of rows; 1 column family and 1 index entry
+	// for each row.
+	if err := checkTableKeyCount(ctx, kvDB, 2, maxValue); err != nil {
+		t.Fatal(err)
+	}
+
+	notification := backfillNotification
 	// Run the schema change in a separate goroutine.
 	var wg sync.WaitGroup
 	wg.Add(1)
 	go func() {
-		// Start schema change that eventually runs a backfill.
+		// Start schema change that eventually runs a partial backfill.
 		if _, err := sqlDB.Exec("CREATE UNIQUE INDEX bar ON t.test (v)"); err != nil {
 			t.Error(err)
 		}
 		wg.Done()
 	}()
 
-	// Wait until the schema change backfill starts.
+	// Wait until the schema change backfill is partially complete.
 	<-notification
-
-	// Wait for a short bit to ensure that the backfill has likely progressed
-	// and written some data, but not long enough that the backfill has
-	// completed.
-	time.Sleep(10 * time.Millisecond)
 
 	if _, err := sqlDB.Exec("DROP TABLE t.test"); err != nil {
 		t.Fatal(err)
@@ -701,11 +791,119 @@ CREATE UNIQUE INDEX vidx ON t.test (v);
 	// Wait until the schema change is done.
 	wg.Wait()
 
-	// Ensure that the table data has been deleted.
-	if kvs, err := kvDB.Scan(context.TODO(), tablePrefix, tableEnd, 0); err != nil {
+	// Ensure that the table data hasn't been deleted.
+	tablePrefix := roachpb.Key(keys.MakeTablePrefix(uint32(tableDesc.ID)))
+	tableEnd := tablePrefix.PrefixEnd()
+	if kvs, err := kvDB.Scan(ctx, tablePrefix, tableEnd, 0); err != nil {
 		t.Fatal(err)
-	} else if len(kvs) != 0 {
-		t.Fatalf("expected %d key value pairs, but got %d", 0, len(kvs))
+	} else if e := 2 * (maxValue + 1); len(kvs) != e {
+		t.Fatalf("expected %d key value pairs, but got %d", e, len(kvs))
+	}
+	// Check that the table descriptor exists so we know the data will
+	// eventually be deleted.
+	tbDescKey := sqlbase.MakeDescMetadataKey(tableDesc.ID)
+	if gr, err := kvDB.Get(ctx, tbDescKey); err != nil {
+		t.Fatal(err)
+	} else if !gr.Exists() {
+		t.Fatalf("table descriptor doesn't exist after table is dropped: %q", tbDescKey)
+	}
+}
+
+// Test that a schema change on encountering a permanent backfill error
+// on a remote node terminates properly and returns the database to a
+// proper state.
+func TestBackfillErrors(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	const numNodes, chunkSize, maxValue = 5, 100, 4000
+	params, _ := createTestServerParams()
+
+	// Disable asynchronous schema change execution.
+	params.Knobs = base.TestingKnobs{
+		SQLSchemaChanger: &sql.SchemaChangerTestingKnobs{
+			AsyncExecNotification: asyncSchemaChangerDisabled,
+			BackfillChunkSize:     chunkSize,
+		},
+	}
+
+	tc := serverutils.StartTestCluster(t, numNodes,
+		base.TestClusterArgs{
+			ReplicationMode: base.ReplicationManual,
+			ServerArgs:      params,
+		})
+	defer tc.Stopper().Stop(context.TODO())
+	kvDB := tc.Server(0).KVClient().(*client.DB)
+	sqlDB := tc.ServerConn(0)
+
+	if _, err := sqlDB.Exec(`
+CREATE DATABASE t;
+CREATE TABLE t.test (k INT PRIMARY KEY, v INT);
+`); err != nil {
+		t.Fatal(err)
+	}
+
+	// Bulk insert.
+	if err := bulkInsertIntoTable(sqlDB, maxValue); err != nil {
+		t.Fatal(err)
+	}
+
+	// Update v column on some rows to be the same so that the future
+	// UNIQUE index we create on it fails.
+	//
+	// Pick a set of random rows because if we pick a deterministic set
+	// we can't be sure they will end up on a remote node. We want this
+	// test to fail if an error is not reported correctly on a local or
+	// remote node and the randomness allows us to test both.
+	const numUpdatedRows = 10
+	for i := 0; i < numUpdatedRows; i++ {
+		k := rand.Intn(maxValue - numUpdatedRows)
+		if _, err := sqlDB.Exec(`UPDATE t.test SET v = $1 WHERE k = $2`, 1, k); err != nil {
+			t.Error(err)
+		}
+	}
+
+	// Split the table into multiple ranges.
+	tableDesc := sqlbase.GetTableDescriptor(kvDB, "t", "test")
+	// SplitTable moves the right range, so we split things back to front
+	// in order to move less data.
+	for i := numNodes - 1; i > 0; i-- {
+		sql.SplitTable(t, tc, tableDesc, i, maxValue/numNodes*i)
+	}
+
+	ctx := context.TODO()
+
+	if err := checkTableKeyCount(ctx, kvDB, 1, maxValue); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := sqlDB.Exec(`
+CREATE UNIQUE INDEX vidx ON t.test (v);
+`); !testutils.IsError(err, `duplicate key value \(v\)=\(1\) violates unique constraint "vidx"`) {
+		t.Fatalf("got err=%s", err)
+	}
+
+	if err := checkTableKeyCount(ctx, kvDB, 1, maxValue); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := sqlDB.Exec(`
+	   ALTER TABLE t.test ADD COLUMN p DECIMAL NOT NULL DEFAULT (DECIMAL '1-3');
+	   `); !testutils.IsError(err, `could not parse '1-3' as type decimal`) {
+		t.Fatalf("got err=%s", err)
+	}
+
+	if err := checkTableKeyCount(ctx, kvDB, 1, maxValue); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := sqlDB.Exec(`
+	ALTER TABLE t.test ADD COLUMN p DECIMAL NOT NULL;
+	`); !testutils.IsError(err, `null value in column \"p\" violates not-null constraint`) {
+		t.Fatalf("got err=%s", err)
+	}
+
+	if err := checkTableKeyCount(ctx, kvDB, 1, maxValue); err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -729,12 +927,7 @@ func TestAbortSchemaChangeBackfill(t *testing.T) {
 	// Disable asynchronous schema change execution to allow synchronous path
 	// to trigger start of backfill notification.
 	params.Knobs = base.TestingKnobs{
-		SQLExecutor: &csql.ExecutorTestingKnobs{
-			// Fix the priority to guarantee that a high priority transaction
-			// pushes a lower priority one.
-			FixTxnPriority: true,
-		},
-		SQLSchemaChanger: &csql.SchemaChangerTestingKnobs{
+		SQLSchemaChanger: &sql.SchemaChangerTestingKnobs{
 			RunBeforeBackfillChunk: func(sp roachpb.Span) error {
 				switch atomic.LoadInt64(&backfillCount) {
 				case 0:
@@ -744,7 +937,7 @@ func TestAbortSchemaChangeBackfill(t *testing.T) {
 				case 1:
 					// Ensure that the second backfill attempt provides the
 					// same span as the first.
-					if sp.Equal(retriedSpan) {
+					if sp.EqualValue(retriedSpan) {
 						atomic.AddInt64(&retriedBackfill, 1)
 					}
 				}
@@ -766,9 +959,39 @@ func TestAbortSchemaChangeBackfill(t *testing.T) {
 			AsyncExecNotification: asyncSchemaChangerDisabled,
 			BackfillChunkSize:     maxValue,
 		},
+		DistSQL: &distsqlrun.TestingKnobs{
+			RunBeforeBackfillChunk: func(sp roachpb.Span) error {
+				switch atomic.LoadInt64(&backfillCount) {
+				case 0:
+					// Keep track of the span provided with the first backfill
+					// attempt.
+					retriedSpan = sp
+				case 1:
+					// Ensure that the second backfill attempt provides the
+					// same span as the first.
+					if sp.EqualValue(retriedSpan) {
+						atomic.AddInt64(&retriedBackfill, 1)
+					}
+				}
+				return nil
+			},
+			RunAfterBackfillChunk: func() {
+				atomic.AddInt64(&backfillCount, 1)
+				if atomic.SwapUint32(&dontAbortBackfill, 1) == 1 {
+					return
+				}
+				// Close channel to notify that the backfill has been
+				// completed but hasn't yet committed.
+				close(backfillNotification)
+				// Receive signal that the commands that push the backfill
+				// transaction have completed; The backfill will attempt
+				// to commit and will abort.
+				<-commandsDone
+			},
+		},
 	}
 	server, sqlDB, kvDB := serverutils.StartServer(t, params)
-	defer server.Stopper().Stop()
+	defer server.Stopper().Stop(context.TODO())
 
 	if _, err := sqlDB.Exec(`
 CREATE DATABASE t;
@@ -796,13 +1019,13 @@ CREATE TABLE t.test (k INT PRIMARY KEY, v INT);
 		// number of keys representing a table row.
 		expectedNumKeysPerRow int
 	}{
-		{"ALTER TABLE t.test ADD COLUMN x DECIMAL DEFAULT (DECIMAL '1.4')", 2},
+		{"ALTER TABLE t.test ADD COLUMN x DECIMAL DEFAULT (DECIMAL '1.4')", 1},
 		{"ALTER TABLE t.test DROP x", 1},
 		{"CREATE UNIQUE INDEX foo ON t.test (v)", 2},
 		{"DROP INDEX t.test@foo", 1},
 	}
 
-	for i, testCase := range testCases {
+	for _, testCase := range testCases {
 		t.Run(testCase.sql, func(t *testing.T) {
 			// Delete two rows so that the table size is smaller than a backfill
 			// chunk. The two values will be added later to make the table larger
@@ -855,88 +1078,23 @@ COMMIT;
 
 			wg.Wait() // for schema change to complete
 
-			// Backfill retry happened.
-			if count, e := atomic.SwapInt64(&retriedBackfill, 0), int64(1); count != e {
-				t.Fatalf("expected = %d, found = %d", e, count)
-			}
-			// 1 failed + 2 retried backfill chunks.
-			expectNumBackfills := int64(3)
-			if i == len(testCases)-1 {
-				// The DROP INDEX case: The above INSERTs do not add any index
-				// entries for the inserted rows, so the index remains smaller
-				// than a backfill chunk and is dropped in a single retried
-				// backfill chunk.
-				expectNumBackfills = 2
-			}
-			if count := atomic.SwapInt64(&backfillCount, 0); count != expectNumBackfills {
-				t.Fatalf("expected = %d, found = %d", expectNumBackfills, count)
-			}
+			ctx := context.TODO()
 
 			// Verify the number of keys left behind in the table to validate
 			// schema change operations.
-			tableDesc := sqlbase.GetTableDescriptor(kvDB, "t", "test")
-			tablePrefix := roachpb.Key(keys.MakeTablePrefix(uint32(tableDesc.ID)))
-			tableEnd := tablePrefix.PrefixEnd()
-			if kvs, err := kvDB.Scan(context.TODO(), tablePrefix, tableEnd, 0); err != nil {
+			if err := checkTableKeyCount(
+				ctx, kvDB, testCase.expectedNumKeysPerRow, maxValue,
+			); err != nil {
 				t.Fatal(err)
-			} else if e := testCase.expectedNumKeysPerRow * (maxValue + 1); len(kvs) != e {
-				t.Fatalf("expected %d key value pairs, but got %d", e, len(kvs))
 			}
 		})
 	}
 }
 
-// Test schema changes are retried and complete properly. This also checks
-// that a mutation checkpoint reduces the number of chunks operated on during
-// a retry.
-func TestSchemaChangeRetry(t *testing.T) {
-	defer leaktest.AfterTest(t)()
-	params, _ := createTestServerParams()
-	attempts := 0
-	seenSpan := roachpb.Span{}
-	params.Knobs = base.TestingKnobs{
-		SQLSchemaChanger: &csql.SchemaChangerTestingKnobs{
-			RunBeforeBackfillChunk: func(sp roachpb.Span) error {
-				attempts++
-				// Fail somewhere in the middle.
-				if attempts == 3 {
-					return context.DeadlineExceeded
-				}
-				if seenSpan.Key != nil {
-					// Check that the keys are never reevaluated
-					if seenSpan.Key.Compare(sp.Key) >= 0 {
-						t.Errorf("reprocessing span %s, already seen span %s", sp, seenSpan)
-					}
-					if !seenSpan.EndKey.Equal(sp.EndKey) {
-						t.Errorf("different EndKey: span %s, already seen span %s", sp, seenSpan)
-					}
-				}
-				seenSpan = sp
-				return nil
-			},
-			// Disable asynchronous schema change execution to allow
-			// synchronous path to run schema changes.
-			AsyncExecNotification:   asyncSchemaChangerDisabled,
-			WriteCheckpointInterval: time.Nanosecond,
-		},
-	}
-	s, sqlDB, kvDB := serverutils.StartServer(t, params)
-	defer s.Stopper().Stop()
-
-	if _, err := sqlDB.Exec(`
-CREATE DATABASE t;
-CREATE TABLE t.test (k INT PRIMARY KEY, v INT);
-`); err != nil {
-		t.Fatal(err)
-	}
-
-	// Bulk insert.
-	maxValue := 5000
-	if err := bulkInsertIntoTable(sqlDB, maxValue); err != nil {
-		t.Fatal(err)
-	}
-
-	// Add an index and check that it succeeds.
+// Add an index and check that it succeeds.
+func addIndexSchemaChange(
+	t *testing.T, sqlDB *gosql.DB, kvDB *client.DB, maxValue int, numKeysPerRow int,
+) {
 	if _, err := sqlDB.Exec("CREATE UNIQUE INDEX foo ON t.test (v)"); err != nil {
 		t.Fatal(err)
 	}
@@ -947,6 +1105,7 @@ CREATE TABLE t.test (k INT PRIMARY KEY, v INT);
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer rows.Close()
 
 	count := 0
 	for ; rows.Next(); count++ {
@@ -966,27 +1125,26 @@ CREATE TABLE t.test (k INT PRIMARY KEY, v INT);
 		t.Fatalf("read the wrong number of rows: e = %d, v = %d", eCount, count)
 	}
 
-	tableDesc := sqlbase.GetTableDescriptor(kvDB, "t", "test")
-	tablePrefix := roachpb.Key(keys.MakeTablePrefix(uint32(tableDesc.ID)))
-	tableEnd := tablePrefix.PrefixEnd()
-	numKeysPerRow := 2
-	if kvs, err := kvDB.Scan(context.TODO(), tablePrefix, tableEnd, 0); err != nil {
-		t.Fatal(err)
-	} else if e := numKeysPerRow * (maxValue + 1); len(kvs) != e {
-		t.Fatalf("expected %d key value pairs, but got %d", e, len(kvs))
-	}
+	ctx := context.TODO()
 
-	// Add a column and check that it works.
-	attempts = 0
-	seenSpan = roachpb.Span{}
+	if err := checkTableKeyCount(ctx, kvDB, numKeysPerRow, maxValue); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// Add a column and check that it succeeds.
+func addColumnSchemaChange(
+	t *testing.T, sqlDB *gosql.DB, kvDB *client.DB, maxValue int, numKeysPerRow int,
+) {
 	if _, err := sqlDB.Exec("ALTER TABLE t.test ADD COLUMN x DECIMAL DEFAULT (DECIMAL '1.4')"); err != nil {
 		t.Fatal(err)
 	}
-	rows, err = sqlDB.Query(`SELECT x from t.test`)
+	rows, err := sqlDB.Query(`SELECT x from t.test`)
 	if err != nil {
 		t.Fatal(err)
 	}
-	count = 0
+	defer rows.Close()
+	count := 0
 	for ; rows.Next(); count++ {
 		var val float64
 		if err := rows.Scan(&val); err != nil {
@@ -1003,24 +1161,223 @@ CREATE TABLE t.test (k INT PRIMARY KEY, v INT);
 	if eCount := maxValue + 1; eCount != count {
 		t.Fatalf("read the wrong number of rows: e = %d, v = %d", eCount, count)
 	}
-	numKeysPerRow++
-	if kvs, err := kvDB.Scan(context.TODO(), tablePrefix, tableEnd, 0); err != nil {
-		t.Fatal(err)
-	} else if e := numKeysPerRow * (maxValue + 1); len(kvs) != e {
-		t.Fatalf("expected %d key value pairs, but got %d", e, len(kvs))
-	}
 
-	// Delete a column and check that it works.
-	attempts = 0
-	seenSpan = roachpb.Span{}
+	ctx := context.TODO()
+
+	if err := checkTableKeyCount(ctx, kvDB, numKeysPerRow, maxValue); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// Drop a column and check that it succeeds.
+func dropColumnSchemaChange(
+	t *testing.T, sqlDB *gosql.DB, kvDB *client.DB, maxValue int, numKeysPerRow int,
+) {
 	if _, err := sqlDB.Exec("ALTER TABLE t.test DROP x"); err != nil {
 		t.Fatal(err)
 	}
-	numKeysPerRow--
-	if kvs, err := kvDB.Scan(context.TODO(), tablePrefix, tableEnd, 0); err != nil {
+
+	ctx := context.TODO()
+
+	if err := checkTableKeyCount(ctx, kvDB, numKeysPerRow, maxValue); err != nil {
 		t.Fatal(err)
-	} else if e := numKeysPerRow * (maxValue + 1); len(kvs) != e {
-		t.Fatalf("expected %d key value pairs, but got %d", e, len(kvs))
+	}
+
+}
+
+// Test schema changes are retried and complete properly. This also checks
+// that a mutation checkpoint reduces the number of chunks operated on during
+// a retry.
+func TestSchemaChangeRetry(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	params, _ := createTestServerParams()
+	currChunk := 0
+	seenSpan := roachpb.Span{}
+	params.Knobs = base.TestingKnobs{
+		SQLSchemaChanger: &sql.SchemaChangerTestingKnobs{
+			RunBeforeBackfillChunk: func(sp roachpb.Span) error {
+				currChunk++
+				// Fail somewhere in the middle.
+				if currChunk == 3 {
+					return context.DeadlineExceeded
+				}
+				if seenSpan.Key != nil {
+					// Check that the keys are never reevaluated
+					if seenSpan.Key.Compare(sp.Key) >= 0 {
+						t.Errorf("reprocessing span %s, already seen span %s", sp, seenSpan)
+					}
+					if !seenSpan.EndKey.Equal(sp.EndKey) {
+						t.Errorf("different EndKey: span %s, already seen span %s", sp, seenSpan)
+					}
+				}
+				seenSpan = sp
+				return nil
+			},
+			// Disable asynchronous schema change execution to allow
+			// synchronous path to run schema changes.
+			AsyncExecNotification:   asyncSchemaChangerDisabled,
+			WriteCheckpointInterval: time.Nanosecond,
+		},
+		DistSQL: &distsqlrun.TestingKnobs{
+			RunBeforeBackfillChunk: func(sp roachpb.Span) error {
+				currChunk++
+				// Fail somewhere in the middle.
+				if currChunk == 3 {
+					return context.DeadlineExceeded
+				}
+				if seenSpan.Key != nil {
+					// Check that the keys are never reevaluated
+					if seenSpan.Key.Compare(sp.Key) >= 0 {
+						t.Errorf("reprocessing span %s, already seen span %s", sp, seenSpan)
+					}
+					if !seenSpan.EndKey.Equal(sp.EndKey) {
+						t.Errorf("different EndKey: span %s, already seen span %s", sp, seenSpan)
+					}
+				}
+				seenSpan = sp
+				return nil
+			},
+		},
+	}
+	s, sqlDB, kvDB := serverutils.StartServer(t, params)
+	defer s.Stopper().Stop(context.TODO())
+
+	if _, err := sqlDB.Exec(`
+CREATE DATABASE t;
+CREATE TABLE t.test (k INT PRIMARY KEY, v INT);
+`); err != nil {
+		t.Fatal(err)
+	}
+
+	// Bulk insert.
+	const maxValue = 5000
+	if err := bulkInsertIntoTable(sqlDB, maxValue); err != nil {
+		t.Fatal(err)
+	}
+
+	addIndexSchemaChange(t, sqlDB, kvDB, maxValue, 2)
+
+	currChunk = 0
+	seenSpan = roachpb.Span{}
+	addColumnSchemaChange(t, sqlDB, kvDB, maxValue, 2)
+
+	currChunk = 0
+	seenSpan = roachpb.Span{}
+	dropColumnSchemaChange(t, sqlDB, kvDB, maxValue, 2)
+}
+
+// Test schema changes are retried and complete properly when the table
+// version changes. This also checks that a mutation checkpoint reduces
+// the number of chunks operated on during a retry.
+func TestSchemaChangeRetryOnVersionChange(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	params, _ := createTestServerParams()
+	var upTableVersion func()
+	currChunk := 0
+	var numBackfills uint32
+	seenSpan := roachpb.Span{}
+	params.Knobs = base.TestingKnobs{
+		SQLSchemaChanger: &sql.SchemaChangerTestingKnobs{
+			RunBeforeBackfill: func() error {
+				atomic.AddUint32(&numBackfills, 1)
+				return nil
+			},
+			RunBeforeBackfillChunk: func(sp roachpb.Span) error {
+				currChunk++
+				// Fail somewhere in the middle.
+				if currChunk == 3 {
+					// Publish a new version of the table.
+					upTableVersion()
+				}
+				if seenSpan.Key != nil {
+					if !seenSpan.EndKey.Equal(sp.EndKey) {
+						t.Errorf("different EndKey: span %s, already seen span %s", sp, seenSpan)
+					}
+				}
+				seenSpan = sp
+				return nil
+			},
+			// Disable asynchronous schema change execution to allow
+			// synchronous path to run schema changes.
+			AsyncExecNotification:   asyncSchemaChangerDisabled,
+			WriteCheckpointInterval: time.Nanosecond,
+		},
+		DistSQL: &distsqlrun.TestingKnobs{
+			RunBeforeBackfillChunk: func(sp roachpb.Span) error {
+				currChunk++
+				// Fail somewhere in the middle.
+				if currChunk == 3 {
+					// Publish a new version of the table.
+					upTableVersion()
+				}
+				if seenSpan.Key != nil {
+					if !seenSpan.EndKey.Equal(sp.EndKey) {
+						t.Errorf("different EndKey: span %s, already seen span %s", sp, seenSpan)
+					}
+				}
+				seenSpan = sp
+				return nil
+			},
+		},
+	}
+	s, sqlDB, kvDB := serverutils.StartServer(t, params)
+	defer s.Stopper().Stop(context.TODO())
+
+	if _, err := sqlDB.Exec(`
+CREATE DATABASE t;
+CREATE TABLE t.test (k INT PRIMARY KEY, v INT);
+`); err != nil {
+		t.Fatal(err)
+	}
+
+	tableDesc := sqlbase.GetTableDescriptor(kvDB, "t", "test")
+	id := tableDesc.ID
+	ctx := context.TODO()
+
+	upTableVersion = func() {
+		leaseMgr := s.LeaseManager().(*sql.LeaseManager)
+		var version sqlbase.DescriptorVersion
+		if _, err := leaseMgr.Publish(ctx, id, func(table *sqlbase.TableDescriptor) error {
+			// Publish nothing; only update the version.
+			version = table.Version
+			return nil
+		}, nil); err != nil {
+			t.Error(err)
+		}
+		// Grab a lease at the latest version so that we are confident
+		// that all future leases will be taken at the latest version.
+		table, _, err := leaseMgr.AcquireAndAssertMinVersion(ctx, s.Clock().Now(), id, version+1)
+		if err != nil {
+			t.Error(err)
+		}
+		if err := leaseMgr.Release(table); err != nil {
+			t.Error(err)
+		}
+	}
+
+	// Bulk insert.
+	maxValue := 5000
+	if err := bulkInsertIntoTable(sqlDB, maxValue); err != nil {
+		t.Fatal(err)
+	}
+
+	addIndexSchemaChange(t, sqlDB, kvDB, maxValue, 2)
+	if num := atomic.SwapUint32(&numBackfills, 0); num != 2 {
+		t.Fatalf("expected %d backfills, but seen %d", 2, num)
+	}
+
+	currChunk = 0
+	seenSpan = roachpb.Span{}
+	addColumnSchemaChange(t, sqlDB, kvDB, maxValue, 2)
+	if num := atomic.SwapUint32(&numBackfills, 0); num != 2 {
+		t.Fatalf("expected %d backfills, but seen %d", 2, num)
+	}
+
+	currChunk = 0
+	seenSpan = roachpb.Span{}
+	dropColumnSchemaChange(t, sqlDB, kvDB, maxValue, 2)
+	if num := atomic.SwapUint32(&numBackfills, 0); num != 2 {
+		t.Fatalf("expected %d backfills, but seen %d", 2, num)
 	}
 }
 
@@ -1038,7 +1395,7 @@ func TestSchemaChangePurgeFailure(t *testing.T) {
 	// attempt 3: return an error while purging the schema change.
 	expectedAttempts := 3
 	params.Knobs = base.TestingKnobs{
-		SQLSchemaChanger: &csql.SchemaChangerTestingKnobs{
+		SQLSchemaChanger: &sql.SchemaChangerTestingKnobs{
 			RunBeforeBackfillChunk: func(sp roachpb.Span) error {
 				attempts++
 				// Return a deadline exceeded error during the third attempt
@@ -1059,9 +1416,20 @@ func TestSchemaChangePurgeFailure(t *testing.T) {
 			AsyncExecQuickly:  true,
 			BackfillChunkSize: chunkSize,
 		},
+		DistSQL: &distsqlrun.TestingKnobs{
+			RunBeforeBackfillChunk: func(sp roachpb.Span) error {
+				attempts++
+				// Return a deadline exceeded error during the third attempt
+				// which attempts to clean up the schema change.
+				if attempts == expectedAttempts {
+					return context.DeadlineExceeded
+				}
+				return nil
+			},
+		},
 	}
 	server, sqlDB, kvDB := serverutils.StartServer(t, params)
-	defer server.Stopper().Stop()
+	defer server.Stopper().Stop(context.TODO())
 
 	if _, err := sqlDB.Exec(`
 CREATE DATABASE t;
@@ -1118,12 +1486,11 @@ CREATE TABLE t.test (k INT PRIMARY KEY, v INT);
 	// rows from k = 0 to k = maxValue have index values. The k = maxValue + 1
 	// row with the conflict doesn't contain an index value.
 	numGarbageValues := chunkSize
-	tablePrefix := roachpb.Key(keys.MakeTablePrefix(uint32(tableDesc.ID)))
-	tableEnd := tablePrefix.PrefixEnd()
-	if kvs, err := kvDB.Scan(context.TODO(), tablePrefix, tableEnd, 0); err != nil {
+
+	ctx := context.TODO()
+
+	if err := checkTableKeyCount(ctx, kvDB, 1, maxValue+1+numGarbageValues); err != nil {
 		t.Fatal(err)
-	} else if e := 1*(maxValue+2) + numGarbageValues; len(kvs) != e {
-		t.Fatalf("expected %d key value pairs, but got %d", e, len(kvs))
 	}
 
 	// Enable async schema change processing to ensure that it cleans up the
@@ -1140,10 +1507,8 @@ CREATE TABLE t.test (k INT PRIMARY KEY, v INT);
 
 	// No garbage left behind.
 	numGarbageValues = 0
-	if kvs, err := kvDB.Scan(context.TODO(), tablePrefix, tableEnd, 0); err != nil {
+	if err := checkTableKeyCount(ctx, kvDB, 1, maxValue+1+numGarbageValues); err != nil {
 		t.Fatal(err)
-	} else if e := 1*(maxValue+2) + numGarbageValues; len(kvs) != e {
-		t.Fatalf("expected %d key value pairs, but got %d", e, len(kvs))
 	}
 
 	// A new attempt cleans up a chunk of data.
@@ -1162,8 +1527,8 @@ func TestSchemaChangeReverseMutations(t *testing.T) {
 	// processed asynchronously.
 	var enableAsyncSchemaChanges uint32
 	params.Knobs = base.TestingKnobs{
-		SQLSchemaChanger: &csql.SchemaChangerTestingKnobs{
-			SyncFilter: func(tscc csql.TestingSchemaChangerCollection) {
+		SQLSchemaChanger: &sql.SchemaChangerTestingKnobs{
+			SyncFilter: func(tscc sql.TestingSchemaChangerCollection) {
 				tscc.ClearSchemaChangers()
 			},
 			AsyncExecNotification: func() error {
@@ -1177,7 +1542,7 @@ func TestSchemaChangeReverseMutations(t *testing.T) {
 		},
 	}
 	s, sqlDB, kvDB := serverutils.StartServer(t, params)
-	defer s.Stopper().Stop()
+	defer s.Stopper().Stop(context.TODO())
 
 	// Create a k-v table.
 	if _, err := sqlDB.Exec(`
@@ -1254,6 +1619,7 @@ CREATE TABLE t.test (k INT PRIMARY KEY, v INT);
 
 		// Ensure that sql is using the correct table lease.
 		if len(cols) != len(expectedCols) {
+			defer rows.Close()
 			return errors.Errorf("incorrect columns: %v, expected: %v", cols, expectedCols)
 		}
 		if cols[0] != expectedCols[0] || cols[1] != expectedCols[1] {
@@ -1262,6 +1628,7 @@ CREATE TABLE t.test (k INT PRIMARY KEY, v INT);
 		return nil
 	})
 
+	defer rows.Close()
 	// rows contains the data; verify that it's the right data.
 	vals := make([]interface{}, len(expectedCols))
 	for i := range vals {
@@ -1308,6 +1675,7 @@ CREATE TABLE t.test (k INT PRIMARY KEY, v INT);
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer rows.Close()
 	count = 0
 	for ; rows.Next(); count++ {
 	}
@@ -1323,12 +1691,855 @@ CREATE TABLE t.test (k INT PRIMARY KEY, v INT);
 		t.Fatal("SELECT over index 'foo' works")
 	}
 
+	ctx := context.TODO()
+
 	// Check that the number of k-v pairs is accurate.
+	if err := checkTableKeyCount(ctx, kvDB, 2, maxValue); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// This test checks backward compatibility with old data that contains
+// sentinel k:v pairs at the start of each table row. Cockroachdb used
+// to write table rows with sentinel values in the past. When a new column
+// is added to such a table with the new column included in the same
+// column family as the primary key columns, the sentinel k:v pairs
+// start representing this new column. This test checks that the sentinel
+// values represent NULL column values, and that an UPDATE to such
+// a column works correctly.
+func TestParseSentinelValueWithNewColumnInSentinelFamily(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	params, _ := createTestServerParams()
+	server, sqlDB, kvDB := serverutils.StartServer(t, params)
+	defer server.Stopper().Stop(context.TODO())
+
+	if _, err := sqlDB.Exec(`
+CREATE DATABASE t;
+CREATE TABLE t.test (
+	k INT PRIMARY KEY,
+	FAMILY F1 (k)
+);
+`); err != nil {
+		t.Fatal(err)
+	}
+	tableDesc := sqlbase.GetTableDescriptor(kvDB, "t", "test")
+	if tableDesc.Families[0].DefaultColumnID != 0 {
+		t.Fatalf("default column id not set properly: %s", tableDesc)
+	}
+
+	// Add some data.
+	const maxValue = 10
+	inserts := make([]string, maxValue+1)
+	for i := range inserts {
+		inserts[i] = fmt.Sprintf(`(%d)`, i)
+	}
+	if _, err := sqlDB.Exec(`INSERT INTO t.test VALUES ` + strings.Join(inserts, ",")); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx := context.TODO()
+
+	// Convert table data created by the above INSERT into sentinel
+	// values. This is done to make the table appear like it were
+	// written in the past when cockroachdb used to write sentinel
+	// values for each table row.
+	startKey := roachpb.Key(keys.MakeTablePrefix(uint32(tableDesc.ID)))
+	kvs, err := kvDB.Scan(
+		ctx,
+		startKey,
+		startKey.PrefixEnd(),
+		maxValue+1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, kv := range kvs {
+		value := roachpb.MakeValueFromBytes(nil)
+		if err := kvDB.Put(ctx, kv.Key, &value); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Add a new column that gets added to column family 0,
+	// updating DefaultColumnID.
+	if _, err := sqlDB.Exec(`ALTER TABLE t.test ADD COLUMN v INT FAMILY F1`); err != nil {
+		t.Fatal(err)
+	}
+	tableDesc = sqlbase.GetTableDescriptor(kvDB, "t", "test")
+	if tableDesc.Families[0].DefaultColumnID != 2 {
+		t.Fatalf("default column id not set properly: %s", tableDesc)
+	}
+
+	// Update one of the rows.
+	const setKey = 5
+	const setVal = maxValue - setKey
+	if _, err := sqlDB.Exec(`UPDATE t.test SET v = $1 WHERE k = $2`, setVal, setKey); err != nil {
+		t.Fatal(err)
+	}
+
+	// The table contains the one updated value and remaining NULL values.
+	rows, err := sqlDB.Query(`SELECT v from t.test`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	const eCount = maxValue + 1
+	count := 0
+	for ; rows.Next(); count++ {
+		var val *int
+		if err := rows.Scan(&val); err != nil {
+			t.Errorf("row %d scan failed: %s", count, err)
+			continue
+		}
+		if count == setKey {
+			if val != nil {
+				if setVal != *val {
+					t.Errorf("value = %d, expected %d", *val, setVal)
+				}
+			} else {
+				t.Error("received nil value for column 'v'")
+			}
+		} else if val != nil {
+			t.Error("received non NULL value for column 'v'")
+		}
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	if eCount != count {
+		t.Fatalf("read the wrong number of rows: e = %d, v = %d", eCount, count)
+	}
+}
+
+// This test checks whether a column can be added using the name of a column that has just been dropped.
+func TestAddColumnDuringColumnDrop(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	params, _ := createTestServerParams()
+	backfillNotification := make(chan struct{})
+	continueBackfillNotification := make(chan struct{})
+	params.Knobs = base.TestingKnobs{
+		SQLSchemaChanger: &sql.SchemaChangerTestingKnobs{
+			RunBeforeBackfill: func() error {
+				if backfillNotification != nil {
+					// Close channel to notify that the schema change has
+					// been queued and the backfill has started.
+					close(backfillNotification)
+					backfillNotification = nil
+					<-continueBackfillNotification
+				}
+				return nil
+			},
+		},
+	}
+	server, sqlDB, _ := serverutils.StartServer(t, params)
+	defer server.Stopper().Stop(context.TODO())
+
+	if _, err := sqlDB.Exec(`
+CREATE DATABASE t;
+CREATE TABLE t.test (
+    k INT PRIMARY KEY NOT NULL,
+    v INT NOT NULL
+);
+`); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := bulkInsertIntoTable(sqlDB, 1000); err != nil {
+		t.Fatal(err)
+	}
+	// Run the column schema change in a separate goroutine.
+	notification := backfillNotification
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		if _, err := sqlDB.Exec(`ALTER TABLE t.test DROP column v;`); err != nil {
+			t.Error(err)
+		}
+		wg.Done()
+	}()
+
+	<-notification
+	if _, err := sqlDB.Exec(`ALTER TABLE t.test ADD column v INT DEFAULT 0;`); !testutils.IsError(err, `column "v" being dropped, try again later`) {
+		t.Fatal(err)
+	}
+
+	close(continueBackfillNotification)
+	wg.Wait()
+}
+
+// Test an UPDATE using a primary and a secondary index in the middle
+// of a column backfill.
+func TestUpdateDuringColumnBackfill(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	backfillNotification := make(chan bool)
+	continueBackfillNotification := make(chan bool)
+	params, _ := createTestServerParams()
+	params.Knobs = base.TestingKnobs{
+		DistSQL: &distsqlrun.TestingKnobs{
+			RunBeforeBackfillChunk: func(sp roachpb.Span) error {
+				if backfillNotification != nil {
+					// Close channel to notify that the schema change has
+					// been queued and the backfill has started.
+					close(backfillNotification)
+					backfillNotification = nil
+					<-continueBackfillNotification
+				}
+				return nil
+			},
+		},
+	}
+	server, sqlDB, _ := serverutils.StartServer(t, params)
+	defer server.Stopper().Stop(context.TODO())
+
+	if _, err := sqlDB.Exec(`
+CREATE DATABASE t;
+CREATE TABLE t.test (
+    k INT NOT NULL,
+    v INT NOT NULL,
+    length INT NOT NULL,
+    CONSTRAINT "primary" PRIMARY KEY (k),
+    INDEX v_idx (v),
+    FAMILY "primary" (k, v, length)
+);
+INSERT INTO t.test (k, v, length) VALUES (0, 1, 1);
+`); err != nil {
+		t.Fatal(err)
+	}
+
+	// Run the column schema change in a separate goroutine.
+	notification := backfillNotification
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		if _, err := sqlDB.Exec(`ALTER TABLE t.test ADD id int NOT NULL DEFAULT 0;`); err != nil {
+			t.Error(err)
+		}
+		wg.Done()
+	}()
+
+	<-notification
+
+	// UPDATE the row using the secondary index.
+	if _, err := sqlDB.Exec(`UPDATE t.test SET length = 27000 WHERE v = 1`); err != nil {
+		t.Error(err)
+	}
+
+	// UPDATE the row using the primary index.
+	if _, err := sqlDB.Exec(`UPDATE t.test SET length = 27001 WHERE k = 0`); err != nil {
+		t.Error(err)
+	}
+
+	close(continueBackfillNotification)
+
+	wg.Wait()
+}
+
+// Test that a schema change backfill that completes on a
+// backfill chunk boundary works correctly. A backfill is done
+// by scanning a table in chunks and backfilling the schema
+// element for each chunk. Normally the last chunk is smaller
+// than the other chunks (configured chunk size), but it can
+// sometimes be equal in size. This test deliberately runs a
+// schema change where the last chunk size is equal to the
+// configured chunk size.
+func TestBackfillCompletesOnChunkBoundary(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	const numNodes = 5
+	const chunkSize = 100
+	// The number of rows in the table is a multiple of chunkSize.
+	// [0...maxValue], so that the backfill processing ends on
+	// a chunk boundary.
+	const maxValue = 3*chunkSize - 1
+	params, _ := createTestServerParams()
+	params.Knobs = base.TestingKnobs{
+		SQLSchemaChanger: &sql.SchemaChangerTestingKnobs{
+			BackfillChunkSize: chunkSize,
+		},
+	}
+
+	tc := serverutils.StartTestCluster(t, numNodes,
+		base.TestClusterArgs{
+			ReplicationMode: base.ReplicationManual,
+			ServerArgs:      params,
+		})
+	defer tc.Stopper().Stop(context.TODO())
+	kvDB := tc.Server(0).KVClient().(*client.DB)
+	sqlDB := tc.ServerConn(0)
+
+	if _, err := sqlDB.Exec(`
+ CREATE DATABASE t;
+ CREATE TABLE t.test (k INT PRIMARY KEY, v INT, pi DECIMAL DEFAULT (DECIMAL '3.14'));
+ CREATE UNIQUE INDEX vidx ON t.test (v);
+ `); err != nil {
+		t.Fatal(err)
+	}
+
+	// Bulk insert.
+	if err := bulkInsertIntoTable(sqlDB, maxValue); err != nil {
+		t.Fatal(err)
+	}
+
+	// Split the table into multiple ranges.
+	tableDesc := sqlbase.GetTableDescriptor(kvDB, "t", "test")
+	// SplitTable moves the right range, so we split things back to front
+	// in order to move less data.
+	for i := numNodes - 1; i > 0; i-- {
+		sql.SplitTable(t, tc, tableDesc, i, maxValue/numNodes*i)
+	}
+
+	// Run some schema changes.
+	testCases := []struct {
+		sql           string
+		numKeysPerRow int
+	}{
+		{sql: "ALTER TABLE t.test ADD COLUMN x DECIMAL DEFAULT (DECIMAL '1.4')", numKeysPerRow: 2},
+		{sql: "ALTER TABLE t.test DROP pi", numKeysPerRow: 2},
+		{sql: "CREATE UNIQUE INDEX foo ON t.test (v)", numKeysPerRow: 3},
+		{sql: "DROP INDEX t.test@vidx", numKeysPerRow: 2},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.sql, func(t *testing.T) {
+			// Start schema change that eventually runs a backfill.
+			if _, err := sqlDB.Exec(tc.sql); err != nil {
+				t.Error(err)
+			}
+
+			ctx := context.TODO()
+
+			// Verify the number of keys left behind in the table to
+			// validate schema change operations.
+			if err := checkTableKeyCount(ctx, kvDB, tc.numKeysPerRow, maxValue); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
+func TestSchemaChangeInTxn(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	params, _ := createTestServerParams()
+	s, sqlDB, _ := serverutils.StartServer(t, params)
+	defer s.Stopper().Stop(context.TODO())
+
+	if _, err := sqlDB.Exec(`
+CREATE DATABASE t;
+CREATE TABLE t.kv (k CHAR PRIMARY KEY, v CHAR);
+INSERT INTO t.kv VALUES ('a', 'b');
+`); err != nil {
+		t.Fatal(err)
+	}
+
+	testCases := []struct {
+		name        string
+		firstStmt   string
+		secondStmt  string
+		expectedErr string
+	}{
+		// DROP TABLE followed by CREATE TABLE case.
+		{`drop-create`, `DROP TABLE t.kv`, `CREATE TABLE t.kv (k CHAR PRIMARY KEY, v CHAR)`,
+			`relation "kv" already exists`},
+		// schema change followed by another statement works.
+		{`createindex-insert`, `CREATE INDEX foo ON t.kv (v)`, `INSERT INTO t.kv VALUES ('c', 'd')`,
+			``},
+		// CREATE TABLE followed by INSERT works.
+		{`createtable-insert`, `CREATE TABLE t.origin (k CHAR PRIMARY KEY, v CHAR);`,
+			`INSERT INTO t.origin VALUES ('c', 'd')`, ``},
+		// Support multiple schema changes for ORMs: #15269
+		// Support insert into another table after schema changes: #15297
+		{`multiple-schema-change`,
+			`CREATE TABLE t.orm1 (k CHAR PRIMARY KEY, v CHAR); CREATE TABLE t.orm2 (k CHAR PRIMARY KEY, v CHAR);`,
+			`CREATE INDEX foo ON t.orm1 (v); CREATE INDEX foo ON t.orm2 (v); INSERT INTO t.origin VALUES ('e', 'f')`,
+			``},
+		// schema change at the end of a transaction that has written.
+		{`insert-create`, `INSERT INTO t.kv VALUES ('e', 'f')`, `CREATE INDEX foo ON t.kv (v)`,
+			`schema change statement cannot follow a statement that has written in the same transaction`},
+		// schema change at the end of a read only transaction.
+		{`select-create`, `SELECT * FROM t.kv`, `CREATE INDEX bar ON t.kv (v)`, ``},
+	}
+
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			tx, err := sqlDB.Begin()
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			if _, err := tx.Exec(testCase.firstStmt); err != nil {
+				t.Fatal(err)
+			}
+
+			_, err = tx.Exec(testCase.secondStmt)
+
+			if testCase.expectedErr != "" {
+				// Can't commit after ALTER errored, so we ROLLBACK.
+				if rollbackErr := tx.Rollback(); rollbackErr != nil {
+					t.Fatal(rollbackErr)
+				}
+
+				if !testutils.IsError(err, testCase.expectedErr) {
+					t.Fatalf("different error than expected: %v", err)
+				}
+			} else {
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := tx.Commit(); err != nil {
+					t.Fatal(err)
+				}
+			}
+		})
+	}
+}
+
+func TestSecondaryIndexWithOldStoringEncoding(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	params, _ := createTestServerParams()
+	server, sqlDB, kvDB := serverutils.StartServer(t, params)
+	defer server.Stopper().Stop(context.TODO())
+
+	if _, err := sqlDB.Exec(`
+CREATE DATABASE d;
+CREATE TABLE d.t (
+  k INT PRIMARY KEY,
+  a INT,
+  b INT,
+  INDEX i (a) STORING (b),
+  UNIQUE INDEX u (a) STORING (b)
+);
+`); err != nil {
+		t.Fatal(err)
+	}
+	tableDesc := sqlbase.GetTableDescriptor(kvDB, "d", "t")
+	// Verify that this descriptor uses the new STORING encoding. Overwrite it
+	// with one that uses the old encoding.
+	for i, index := range tableDesc.Indexes {
+		if len(index.ExtraColumnIDs) != 1 {
+			t.Fatalf("ExtraColumnIDs not set properly: %s", tableDesc)
+		}
+		if len(index.StoreColumnIDs) != 1 {
+			t.Fatalf("StoreColumnIDs not set properly: %s", tableDesc)
+		}
+		index.ExtraColumnIDs = append(index.ExtraColumnIDs, index.StoreColumnIDs...)
+		index.StoreColumnIDs = nil
+		tableDesc.Indexes[i] = index
+	}
+	if err := kvDB.Put(
+		context.TODO(),
+		sqlbase.MakeDescMetadataKey(tableDesc.GetID()),
+		sqlbase.WrapDescriptor(tableDesc),
+	); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sqlDB.Exec(`INSERT INTO d.t VALUES (11, 1, 2);`); err != nil {
+		t.Fatal(err)
+	}
+	// Force another ID allocation to ensure that the old encoding persists.
+	if _, err := sqlDB.Exec(`ALTER TABLE d.t ADD COLUMN c INT;`); err != nil {
+		t.Fatal(err)
+	}
+	// Ensure that the decoder sees the old encoding.
+	for indexName, expExplainRow := range map[string]string{
+		"i": "fetched: /t/i/1/11/2 -> NULL",
+		"u": "fetched: /t/u/1 -> /11/2",
+	} {
+		{
+			rows, err := sqlDB.Query(
+				fmt.Sprintf(
+					`SELECT message FROM [SHOW KV TRACE FOR SELECT k, a, b FROM d.t@%s] `+
+						`WHERE message LIKE 'fetched:%%'`,
+					indexName,
+				))
+			if err != nil {
+				t.Error(err)
+				continue
+			}
+			defer rows.Close()
+			count := 0
+			for ; rows.Next(); count++ {
+				var msg string
+				if err := rows.Scan(&msg); err != nil {
+					t.Errorf("row %d scan failed: %s", count, err)
+					continue
+				}
+				if msg != expExplainRow {
+					t.Errorf("expected %q but read %q", expExplainRow, msg)
+				}
+			}
+			if err := rows.Err(); err != nil {
+				t.Error(err)
+			} else if count != 1 {
+				t.Errorf("expected one row but read %d", count)
+			}
+		}
+		{
+			rows, err := sqlDB.Query(fmt.Sprintf(`SELECT k, a, b FROM d.t@%s;`, indexName))
+			if err != nil {
+				t.Error(err)
+				continue
+			}
+			defer rows.Close()
+			count := 0
+			for ; rows.Next(); count++ {
+				var i1, i2, i3 *int
+				if err := rows.Scan(&i1, &i2, &i3); err != nil {
+					t.Errorf("row %d scan failed: %s", count, err)
+					continue
+				}
+				row := fmt.Sprintf("%d %d %d", *i1, *i2, *i3)
+				const expRow = "11 1 2"
+				if row != expRow {
+					t.Errorf("expected %q but read %q", expRow, row)
+				}
+			}
+			if err := rows.Err(); err != nil {
+				t.Error(err)
+			} else if count != 1 {
+				t.Errorf("expected one row but read %d", count)
+			}
+		}
+	}
+}
+
+// Test that a backfill is executed with an EvalContext generated on the
+// gateway. We assert that by checking that the same timestamp is used by all
+// the backfilled columns.
+func TestSchemaChangeEvalContext(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	const numNodes = 3
+	const chunkSize = 200
+	const maxValue = 5000
+	params, _ := createTestServerParams()
+	// Disable asynchronous schema change execution.
+	params.Knobs = base.TestingKnobs{
+		SQLSchemaChanger: &sql.SchemaChangerTestingKnobs{
+			AsyncExecNotification: asyncSchemaChangerDisabled,
+			BackfillChunkSize:     chunkSize,
+		},
+	}
+
+	tc := serverutils.StartTestCluster(t, numNodes,
+		base.TestClusterArgs{
+			ReplicationMode: base.ReplicationManual,
+			ServerArgs:      params,
+		})
+	defer tc.Stopper().Stop(context.TODO())
+	kvDB := tc.Server(0).KVClient().(*client.DB)
+	sqlDB := tc.ServerConn(0)
+
+	if _, err := sqlDB.Exec(`
+CREATE DATABASE t;
+CREATE TABLE t.test (k INT PRIMARY KEY, v INT);
+`); err != nil {
+		t.Fatal(err)
+	}
+
+	// Bulk insert.
+	if err := bulkInsertIntoTable(sqlDB, maxValue); err != nil {
+		t.Fatal(err)
+	}
+
+	// Split the table into multiple ranges.
+	tableDesc := sqlbase.GetTableDescriptor(kvDB, "t", "test")
+	// SplitTable moves the right range, so we split things back to front
+	// in order to move less data.
+	for i := numNodes - 1; i > 0; i-- {
+		sql.SplitTable(t, tc, tableDesc, i, maxValue/numNodes*i)
+	}
+
+	testCases := []struct {
+		sql    string
+		column string
+	}{
+		{"ALTER TABLE t.test ADD COLUMN x TIMESTAMP DEFAULT current_timestamp;", "x"},
+	}
+
+	for _, testCase := range testCases {
+		t.Run(testCase.sql, func(t *testing.T) {
+
+			if _, err := sqlDB.Exec(testCase.sql); err != nil {
+				t.Fatal(err)
+			}
+
+			rows, err := sqlDB.Query(fmt.Sprintf(`SELECT DISTINCT %s from t.test`, testCase.column))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer rows.Close()
+
+			count := 0
+			for rows.Next() {
+				count++
+			}
+			if err := rows.Err(); err != nil {
+				t.Fatal(err)
+			}
+			if count != 1 {
+				t.Fatalf("read the wrong number of rows: e = %d, v = %d", 1, count)
+			}
+
+		})
+	}
+}
+
+// Tests that a schema change that is queued behind another schema change
+// is executed through the synchronous execution path properly even if it
+// gets to run before the first schema change.
+func TestSchemaChangeCompletion(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	params, _ := createTestServerParams()
+	var notifySchemaChange chan struct{}
+	var restartSchemaChange chan struct{}
+	params.Knobs = base.TestingKnobs{
+		SQLSchemaChanger: &sql.SchemaChangerTestingKnobs{
+			SyncFilter: func(tscc sql.TestingSchemaChangerCollection) {
+				notify := notifySchemaChange
+				restart := restartSchemaChange
+				if notify != nil {
+					close(notify)
+					<-restart
+				}
+			},
+			// Turn off asynchronous schema change manager.
+			AsyncExecNotification: asyncSchemaChangerDisabled,
+		},
+	}
+	s, sqlDB, kvDB := serverutils.StartServer(t, params)
+	ctx := context.TODO()
+	defer s.Stopper().Stop(ctx)
+
+	if _, err := sqlDB.Exec(`
+CREATE DATABASE t;
+CREATE TABLE t.test (k INT PRIMARY KEY, v INT);
+`); err != nil {
+		t.Fatal(err)
+	}
+
+	// Add some data
+	const maxValue = 200
+	if err := bulkInsertIntoTable(sqlDB, maxValue); err != nil {
+		t.Fatal(err)
+	}
+	if err := checkTableKeyCount(ctx, kvDB, 1, maxValue); err != nil {
+		t.Fatal(err)
+	}
+
+	// Do not execute the first schema change so that the second schema
+	// change gets queued up behind it. The second schema change will be
+	// given the green signal to execute before the first one.
+	var wg sync.WaitGroup
+	wg.Add(2)
+	notifySchemaChange = make(chan struct{})
+	restartSchemaChange = make(chan struct{})
+	restart := restartSchemaChange
+	go func() {
+		if _, err := sqlDB.Exec(`CREATE UNIQUE INDEX foo ON t.test (v)`); err != nil {
+			t.Error(err)
+		}
+		wg.Done()
+	}()
+
+	<-notifySchemaChange
+
+	notifySchemaChange = make(chan struct{})
+	restartSchemaChange = make(chan struct{})
+	go func() {
+		if _, err := sqlDB.Exec(`CREATE UNIQUE INDEX bar ON t.test (v)`); err != nil {
+			t.Error(err)
+		}
+		wg.Done()
+	}()
+
+	<-notifySchemaChange
+	// Allow second schema change to execute.
+	close(restartSchemaChange)
+
+	// Allow first schema change to execute after a bit.
+	time.Sleep(time.Millisecond)
+	close(restart)
+
+	// Check that both schema changes have completed.
+	wg.Wait()
+	if err := checkTableKeyCount(ctx, kvDB, 3, maxValue); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// Test that a table TRUNCATE leaves the database in the correct state
+// for the asynchronous schema changer to eventually execute it.
+func TestTruncateInternals(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	const maxValue = 2000
+	params, _ := createTestServerParams()
+	// Disable schema changes.
+	params.Knobs = base.TestingKnobs{
+		SQLSchemaChanger: &sql.SchemaChangerTestingKnobs{
+			AsyncExecNotification: asyncSchemaChangerDisabled,
+			SyncFilter: func(tscc sql.TestingSchemaChangerCollection) {
+				tscc.ClearSchemaChangers()
+			},
+		},
+	}
+
+	s, sqlDB, kvDB := serverutils.StartServer(t, params)
+	ctx := context.TODO()
+	defer s.Stopper().Stop(ctx)
+
+	if _, err := sqlDB.Exec(`
+CREATE DATABASE t;
+CREATE TABLE t.test (k INT PRIMARY KEY, v INT, pi DECIMAL DEFAULT (DECIMAL '3.14'));
+`); err != nil {
+		t.Fatal(err)
+	}
+
+	// Bulk insert.
+	if err := bulkInsertIntoTable(sqlDB, maxValue); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := checkTableKeyCount(ctx, kvDB, 1, maxValue); err != nil {
+		t.Fatal(err)
+	}
+
+	tableDesc := sqlbase.GetTableDescriptor(kvDB, "t", "test")
+
+	if _, err := sqlDB.Exec("TRUNCATE TABLE t.test"); err != nil {
+		t.Error(err)
+	}
+
+	// Check that SQL thinks the table is empty.
+	if err := checkTableKeyCount(ctx, kvDB, 0, 0); err != nil {
+		t.Fatal(err)
+	}
+
+	newTableDesc := sqlbase.GetTableDescriptor(kvDB, "t", "test")
+	if !newTableDesc.Adding() {
+		t.Fatalf("bad state = %s", newTableDesc.State)
+	}
+
+	// Ensure that the table data hasn't been deleted.
 	tablePrefix := roachpb.Key(keys.MakeTablePrefix(uint32(tableDesc.ID)))
 	tableEnd := tablePrefix.PrefixEnd()
-	if kvs, err := kvDB.Scan(context.TODO(), tablePrefix, tableEnd, 0); err != nil {
+	if kvs, err := kvDB.Scan(ctx, tablePrefix, tableEnd, 0); err != nil {
 		t.Fatal(err)
-	} else if e := 2 * (maxValue + 1); len(kvs) != e {
+	} else if e := maxValue + 1; len(kvs) != e {
+		t.Fatalf("expected %d key value pairs, but got %d", e, len(kvs))
+	}
+	// Check that the table descriptor exists so we know the data will
+	// eventually be deleted.
+	var droppedDesc *sqlbase.TableDescriptor
+	if err := kvDB.Txn(ctx, func(ctx context.Context, txn *client.Txn) error {
+		var err error
+		droppedDesc, err = sqlbase.GetTableDescFromID(ctx, txn, tableDesc.ID)
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if droppedDesc == nil {
+		t.Fatalf("table descriptor doesn't exist after table is truncated: %d", tableDesc.ID)
+	}
+	if !droppedDesc.Dropped() {
+		t.Fatalf("bad state = %s", droppedDesc.State)
+	}
+}
+
+// Test that a table truncation completes properly.
+func TestTruncateCompletion(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	const maxValue = 2000
+	params, _ := createTestServerParams()
+	params.Knobs = base.TestingKnobs{
+		SQLSchemaChanger: &sql.SchemaChangerTestingKnobs{
+			AsyncExecQuickly: true,
+		},
+	}
+
+	s, sqlDB, kvDB := serverutils.StartServer(t, params)
+	ctx := context.TODO()
+	defer s.Stopper().Stop(ctx)
+
+	if _, err := sqlDB.Exec(`
+CREATE DATABASE t;
+CREATE TABLE t.pi (d DECIMAL PRIMARY KEY);
+CREATE TABLE t.test (k INT PRIMARY KEY, v INT, pi DECIMAL REFERENCES t.pi (d) DEFAULT (DECIMAL '3.14'));
+`); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := sqlDB.Exec(`INSERT INTO t.pi VALUES (3.14)`); err != nil {
+		t.Fatal(err)
+	}
+
+	// Bulk insert.
+	if err := bulkInsertIntoTable(sqlDB, maxValue); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := checkTableKeyCount(ctx, kvDB, 2, maxValue); err != nil {
+		t.Fatal(err)
+	}
+
+	tableDesc := sqlbase.GetTableDescriptor(kvDB, "t", "test")
+
+	if _, err := sqlDB.Exec("TRUNCATE TABLE t.test"); err != nil {
+		t.Error(err)
+	}
+
+	// Check that SQL thinks the table is empty.
+	if err := checkTableKeyCount(ctx, kvDB, 0, 0); err != nil {
+		t.Fatal(err)
+	}
+
+	// Bulk insert.
+	if err := bulkInsertIntoTable(sqlDB, maxValue); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := checkTableKeyCount(ctx, kvDB, 2, maxValue); err != nil {
+		t.Fatal(err)
+	}
+
+	// Ensure that the FK property still holds.
+	if _, err := sqlDB.Exec(
+		`INSERT INTO t.test VALUES ($1 , $2, $3)`, maxValue+2, maxValue+2, 3.15,
+	); !testutils.IsError(err, "foreign key violation") {
+		t.Fatalf("err = %v", err)
+	}
+
+	newTableDesc := sqlbase.GetTableDescriptor(kvDB, "t", "test")
+	if newTableDesc.Adding() {
+		t.Fatalf("bad state = %s", newTableDesc.State)
+	}
+
+	// Wait until the older descriptor has been deleted.
+	testutils.SucceedsSoon(t, func() error {
+		if err := kvDB.Txn(ctx, func(ctx context.Context, txn *client.Txn) error {
+			var err error
+			_, err = sqlbase.GetTableDescFromID(ctx, txn, tableDesc.ID)
+			return err
+		}); err != nil {
+			if err == sqlbase.ErrDescriptorNotFound {
+				return nil
+			}
+			return err
+		}
+		return errors.Errorf("table descriptor exists after table is truncated: %d", tableDesc.ID)
+	})
+
+	// Ensure that the table data has been deleted.
+	tablePrefix := roachpb.Key(keys.MakeTablePrefix(uint32(tableDesc.ID)))
+	tableEnd := tablePrefix.PrefixEnd()
+	if kvs, err := kvDB.Scan(ctx, tablePrefix, tableEnd, 0); err != nil {
+		t.Fatal(err)
+	} else if e := 0; len(kvs) != e {
+		t.Fatalf("expected %d key value pairs, but got %d", e, len(kvs))
+	}
+
+	fkTableDesc := sqlbase.GetTableDescriptor(kvDB, "t", "pi")
+	tablePrefix = roachpb.Key(keys.MakeTablePrefix(uint32(fkTableDesc.ID)))
+	tableEnd = tablePrefix.PrefixEnd()
+	if kvs, err := kvDB.Scan(ctx, tablePrefix, tableEnd, 0); err != nil {
+		t.Fatal(err)
+	} else if e := 1; len(kvs) != e {
 		t.Fatalf("expected %d key value pairs, but got %d", e, len(kvs))
 	}
 }

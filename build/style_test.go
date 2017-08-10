@@ -12,7 +12,7 @@
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
 
-// +build check
+// +build lint
 
 package build_test
 
@@ -27,10 +27,9 @@ import (
 	"strings"
 	"testing"
 
-	"golang.org/x/tools/go/buildutil"
-
 	"github.com/ghemawat/stream"
 	"github.com/pkg/errors"
+	"golang.org/x/tools/go/buildutil"
 )
 
 const cockroachDB = "github.com/cockroachdb/cockroach/pkg"
@@ -140,8 +139,11 @@ func TestStyle(t *testing.T) {
 
 		if err := stream.ForEach(stream.Sequence(
 			filter,
-			stream.GrepNot(`^cmd/`),
-			stream.GrepNot(`^(build/style_test\.go|((util/(log|envutil|sdnotify))|acceptance(/.*)?)/\w+\.go)\b`),
+			stream.GrepNot(`^cmd(/.*)?/\w+\.go\b`),
+			stream.GrepNot(`^build/style_test\.go\b`),
+			stream.GrepNot(`^ccl/(sqlccl/backup_cloud|storageccl/export_storage|acceptanceccl/backup)_test\.go\b`),
+			stream.GrepNot(`^acceptance(/.*)?/\w+\.go\b`),
+			stream.GrepNot(`^util/(log|envutil|sdnotify)/\w+\.go\b`),
 		), func(s string) {
 			t.Errorf(`%s <- forbidden; use "envutil" instead`, s)
 		}); err != nil {
@@ -182,6 +184,30 @@ func TestStyle(t *testing.T) {
 		}
 	})
 
+	t.Run("TestTodoStyle", func(t *testing.T) {
+		t.Parallel()
+		cmd, stderr, filter, err := dirCmd(pkg.Dir, "git", "grep", "-nE", `\sTODO\([^)]*\)[^:]`, "--", "*.go")
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if err := cmd.Start(); err != nil {
+			t.Fatal(err)
+		}
+
+		if err := stream.ForEach(filter, func(s string) {
+			t.Errorf(`%s <- use 'TODO(...): ' instead`, s)
+		}); err != nil {
+			t.Error(err)
+		}
+
+		if err := cmd.Wait(); err != nil {
+			if out := stderr.String(); len(out) > 0 {
+				t.Fatalf("err=%s, stderr=%s", err, out)
+			}
+		}
+	})
+
 	t.Run("TestTimeutil", func(t *testing.T) {
 		t.Parallel()
 		cmd, stderr, filter, err := dirCmd(pkg.Dir, "git", "grep", "-nE", `time\.(Now|Since)`, "--", "*.go")
@@ -195,7 +221,7 @@ func TestStyle(t *testing.T) {
 
 		if err := stream.ForEach(stream.Sequence(
 			filter,
-			stream.GrepNot(`^util/(log|syncutil|timeutil)/\w+\.go\b`),
+			stream.GrepNot(`^util/(log|syncutil|timeutil|tracing)/\w+\.go\b`),
 		), func(s string) {
 			t.Errorf(`%s <- forbidden; use "timeutil" instead`, s)
 		}); err != nil {
@@ -432,6 +458,8 @@ func TestStyle(t *testing.T) {
 				"Eventf:1",
 				"ErrEvent:1",
 				"ErrEventf:1",
+				"NewError:1",
+				"NewErrorf:1",
 				"VEvent:2",
 				"VEventf:2",
 				"UnimplementedWithIssueErrorf:1",
@@ -464,6 +492,30 @@ func TestStyle(t *testing.T) {
 			t.Error(s)
 		}); err != nil {
 			t.Error(err)
+		}
+	})
+
+	t.Run("TestAuthorTags", func(t *testing.T) {
+		t.Parallel()
+		cmd, stderr, filter, err := dirCmd(pkg.Dir, "git", "grep", "-lE", "^// Author:")
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if err := cmd.Start(); err != nil {
+			t.Fatal(err)
+		}
+
+		if err := stream.ForEach(filter, func(s string) {
+			t.Errorf(`%s <- please remove the Author comment within`, s)
+		}); err != nil {
+			t.Error(err)
+		}
+
+		if err := cmd.Wait(); err != nil {
+			if out := stderr.String(); len(out) > 0 {
+				t.Fatalf("err=%s, stderr=%s", err, out)
+			}
 		}
 	})
 
@@ -500,30 +552,38 @@ func TestStyle(t *testing.T) {
 			}
 			return nil
 		})
+		settingsPkgPrefix := `github.com/cockroachdb/cockroach/pkg/settings`
 		if err := stream.ForEach(stream.Sequence(
 			filter,
 			stream.Sort(),
 			stream.Uniq(),
 			stream.GrepNot(`cockroach/pkg/cmd/`),
-			stream.Grep(` (github\.com/golang/protobuf/proto|github\.com/satori/go\.uuid|log|path|context)$`),
+			stream.Grep(`^`+settingsPkgPrefix+`: | (github\.com/golang/protobuf/proto|github\.com/satori/go\.uuid|log|path|context|syscall)$`),
+			stream.GrepNot(`cockroach/pkg/(cli|security): syscall$`),
 			stream.GrepNot(`cockroach/pkg/(base|security|util/(log|randutil|stop)): log$`),
 			stream.GrepNot(`cockroach/pkg/(server/serverpb|ts/tspb): github\.com/golang/protobuf/proto$`),
+			stream.GrepNot(`cockroach/pkg/util/caller: path$`),
+			stream.GrepNot(`cockroach/pkg/ccl/storageccl: path$`),
 			stream.GrepNot(`cockroach/pkg/util/uuid: github\.com/satori/go\.uuid$`),
 		), func(s string) {
-			if strings.HasSuffix(s, " path") {
+			switch {
+			case strings.HasSuffix(s, " path"):
 				t.Errorf(`%s <- please use "path/filepath" instead of "path"`, s)
-			}
-			if strings.HasSuffix(s, " log") {
+			case strings.HasSuffix(s, " log"):
 				t.Errorf(`%s <- please use "util/log" instead of "log"`, s)
-			}
-			if strings.HasSuffix(s, " github.com/golang/protobuf/proto") {
+			case strings.HasSuffix(s, " github.com/golang/protobuf/proto"):
 				t.Errorf(`%s <- please use "github.com/gogo/protobuf/proto" instead of "github.com/golang/protobuf/proto"`, s)
-			}
-			if strings.HasSuffix(s, " github.com/satori/go.uuid") {
+			case strings.HasSuffix(s, " github.com/satori/go.uuid"):
 				t.Errorf(`%s <- please use "util/uuid" instead of "github.com/satori/go.uuid"`, s)
-			}
-			if strings.HasSuffix(s, " context") {
+			case strings.HasSuffix(s, " context"):
 				t.Errorf(`%s <- please use "golang.org/x/net/context" instead of "context"`, s)
+			case strings.HasSuffix(s, " syscall"):
+				t.Errorf(`%s <- please use "golang.org/x/sys" instead of "syscall"`, s)
+			case strings.HasPrefix(s, settingsPkgPrefix+": github.com/cockroachdb/cockroach"):
+				if !strings.HasSuffix(s, "testutils") && !strings.HasSuffix(s, "humanizeutil") &&
+					!strings.HasSuffix(s, settingsPkgPrefix) {
+					t.Errorf("%s <- please don't add CRDB dependencies to settings pkg", s)
+				}
 			}
 		}); err != nil {
 			t.Error(err)
@@ -536,8 +596,10 @@ func TestStyle(t *testing.T) {
 		pkgScope = "./..."
 	}
 
+	// TODO(tamird): replace this with errcheck.NewChecker() when
+	// https://github.com/dominikh/go-tools/issues/57 is fixed.
 	t.Run("TestErrCheck", func(t *testing.T) {
-		t.Parallel()
+		// errcheck uses 1GB of ram (as of 2017-02-18), so don't parallelize it.
 		cmd, stderr, filter, err := dirCmd(
 			pkg.Dir,
 			"errcheck",
@@ -567,8 +629,7 @@ func TestStyle(t *testing.T) {
 	})
 
 	t.Run("TestReturnCheck", func(t *testing.T) {
-		t.Skip("TODO(dt): need to update this upstream or pull it into repo")
-		t.Parallel()
+		// returncheck uses 1GB of ram (as of 2017-02-18), so don't parallelize it.
 		cmd, stderr, filter, err := dirCmd(pkg.Dir, "returncheck", pkgScope)
 		if err != nil {
 			t.Fatal(err)
@@ -604,7 +665,7 @@ func TestStyle(t *testing.T) {
 
 		if err := stream.ForEach(stream.Sequence(
 			filter,
-			stream.GrepNot(`((\.pb|\.pb\.gw|embedded|_string)\.go|sql/parser/(yaccpar|sql\.y):)`),
+			stream.GrepNot(`((\.pb|\.pb\.gw|embedded|_string|\.ir|\.tmpl)\.go|sql/ir/irgen/parser/(yaccpar|irgen\.y):|sql/parser/(yaccpar|sql\.y):)`),
 		), func(s string) {
 			t.Error(s)
 		}); err != nil {
@@ -619,6 +680,9 @@ func TestStyle(t *testing.T) {
 	})
 
 	t.Run("TestUnconvert", func(t *testing.T) {
+		if testing.Short() {
+			t.Skip("short flag")
+		}
 		t.Parallel()
 		cmd, stderr, filter, err := dirCmd(pkg.Dir, "unconvert", pkgScope)
 		if err != nil {
@@ -646,7 +710,10 @@ func TestStyle(t *testing.T) {
 	})
 
 	t.Run("TestMetacheck", func(t *testing.T) {
-		t.Parallel()
+		if testing.Short() {
+			t.Skip("short flag")
+		}
+		// metacheck uses 2.5GB of ram (as of 2017-02-18), so don't parallelize it.
 		cmd, stderr, filter, err := dirCmd(
 			pkg.Dir,
 			"metacheck",
@@ -663,17 +730,84 @@ func TestStyle(t *testing.T) {
 				//
 				// TODO(bdarnell): remove when/if #8360 is fixed.
 				"github.com/cockroachdb/cockroach/pkg/storage/intent_resolver.go:SA4009",
-				// Loop intentionally exits unconditionally; it's cleaner than
-				// explicitly checking length and extracting the first element.
-				"github.com/cockroachdb/cockroach/pkg/sql/errors.go:SA4004",
-				// A value assigned to a variable is never read; this might be worth
-				// investigating, but it's cumbersome because the reported file
-				// differs from the source.
+				// The generated parser is full of `case` arms such as:
 				//
-				// Reported as pkg/sql/parser/yaccpar, but the real file is sql.y.
-				"github.com/cockroachdb/cockroach/pkg/sql/parser/sql.y:SA4006",
+				// case 1:
+				// 	sqlDollar = sqlS[sqlpt-1 : sqlpt+1]
+				// 	//line sql.y:781
+				// 	{
+				// 		sqllex.(*Scanner).stmts = sqlDollar[1].union.stmts()
+				// 	}
+				//
+				// where the code in braces is generated from the grammar action; if
+				// the action does not make use of the matched expression, sqlDollar
+				// will be assigned but not used. This is expected and intentional.
+				//
+				// Concretely, the grammar:
+				//
+				// stmt:
+				//   alter_table_stmt
+				// | backup_stmt
+				// | copy_from_stmt
+				// | create_stmt
+				// | delete_stmt
+				// | drop_stmt
+				// | explain_stmt
+				// | help_stmt
+				// | prepare_stmt
+				// | execute_stmt
+				// | deallocate_stmt
+				// | grant_stmt
+				// | insert_stmt
+				// | rename_stmt
+				// | revoke_stmt
+				// | savepoint_stmt
+				// | select_stmt
+				//   {
+				//     $$.val = $1.slct()
+				//   }
+				// | set_stmt
+				// | show_stmt
+				// | split_stmt
+				// | transaction_stmt
+				// | release_stmt
+				// | truncate_stmt
+				// | update_stmt
+				// | /* EMPTY */
+				//   {
+				//     $$.val = Statement(nil)
+				//   }
+				//
+				// is compiled into the `case` arm:
+				//
+				// case 28:
+				// 	sqlDollar = sqlS[sqlpt-0 : sqlpt+1]
+				// 	//line sql.y:830
+				// 	{
+				// 		sqlVAL.union.val = Statement(nil)
+				// 	}
+				//
+				// which results in the unused warning:
+				//
+				// sql/parser/yaccpar:362:3: this value of sqlDollar is never used (SA4006)
+				"github.com/cockroachdb/cockroach/pkg/sql/parser/sql.go:SA4006",
+				// sql/ir/irgen/parser/yaccpar:362:3: this value of irgenDollar is never used (SA4006)
+				"github.com/cockroachdb/cockroach/pkg/sql/ir/irgen/parser/irgen.go:SA4006",
+				// sql/parser/yaccpar:14:6: type sqlParser is unused (U1000)
+				// sql/parser/yaccpar:15:2: func sqlParser.Parse is unused (U1000)
+				// sql/parser/yaccpar:16:2: func sqlParser.Lookahead is unused (U1000)
+				// sql/parser/yaccpar:29:6: func sqlNewParser is unused (U1000)
+				// sql/parser/yaccpar:152:6: func sqlParse is unused (U1000)
+				"github.com/cockroachdb/cockroach/pkg/sql/parser/sql.go:U1000",
+				"github.com/cockroachdb/cockroach/pkg/sql/irgen/parser/irgen.go:U1000",
 				// Generated file containing many unused postgres error codes.
 				"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror/codes.go:U1000",
+				// Deprecated database/sql/driver interfaces not compatible with 1.7.
+				"github.com/cockroachdb/cockroach/pkg/sql/*.go:SA1019",
+				"github.com/cockroachdb/cockroach/pkg/cli/sql_util.go:SA1019",
+
+				// IR templates.
+				"github.com/cockroachdb/cockroach/pkg/sql/ir/base/*.go:U1000",
 			}, " "),
 			// NB: this doesn't use `pkgScope` because `honnef.co/go/unused`
 			// produces many false positives unless it inspects all our packages.

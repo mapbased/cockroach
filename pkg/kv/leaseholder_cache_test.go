@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Tobias Schottdorf (tobias.schottdorf@gmail.com)
 
 package kv
 
@@ -28,7 +26,7 @@ import (
 func TestLeaseHolderCache(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	ctx := context.TODO()
-	lc := newLeaseHolderCache(3)
+	lc := NewLeaseHolderCache(3)
 	if repDesc, ok := lc.Lookup(ctx, 12); ok {
 		t.Errorf("lookup of missing key returned: %+v", repDesc)
 	}

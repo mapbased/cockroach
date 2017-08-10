@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Peter Mattis (peter@cockroachlabs.com)
 
 package parser
 
@@ -141,7 +139,9 @@ func binExprFmtWithParen(buf *bytes.Buffer, f FmtFlags, e1 Expr, op string, e2 E
 	binExprFmtWithParenAndSubOp(buf, f, e1, "", op, e2)
 }
 
-func binExprFmtWithParenAndSubOp(buf *bytes.Buffer, f FmtFlags, e1 Expr, subOp, op string, e2 Expr) {
+func binExprFmtWithParenAndSubOp(
+	buf *bytes.Buffer, f FmtFlags, e1 Expr, subOp, op string, e2 Expr,
+) {
 	exprFmtWithParen(buf, f, e1)
 	buf.WriteByte(' ')
 	if subOp != "" {
@@ -399,7 +399,7 @@ func (node *ComparisonExpr) memoizeFn() {
 	case Any, Some, All:
 		// Array operators memoize the SubOperator's CmpOp.
 		fOp, _, _, _, _ = foldComparisonExpr(node.SubOperator, nil, nil)
-		rightRet = rightRet.(tArray).Typ
+		rightRet = rightRet.(TArray).Typ
 	}
 
 	fn, ok := CmpOps[fOp].lookupImpl(leftRet, rightRet)
@@ -433,7 +433,7 @@ func (node *ComparisonExpr) IsMixedTypeComparison() bool {
 		}
 		return false
 	case Any, Some, All:
-		array := node.TypedRight().ResolvedType().(tArray)
+		array := node.TypedRight().ResolvedType().(TArray)
 		return !sameTypeOrNull(node.TypedLeft().ResolvedType(), array.Typ)
 	default:
 		return !sameTypeOrNull(node.TypedLeft().ResolvedType(), node.TypedRight().ResolvedType())
@@ -441,7 +441,7 @@ func (node *ComparisonExpr) IsMixedTypeComparison() bool {
 }
 
 func sameTypeOrNull(left, right Type) bool {
-	return left == TypeNull || right == TypeNull || left.Equal(right)
+	return left == TypeNull || right == TypeNull || left.Equivalent(right)
 }
 
 // RangeCond represents a BETWEEN or a NOT BETWEEN expression.
@@ -494,7 +494,7 @@ func (*IsOfTypeExpr) operatorExpr() {}
 
 // Format implements the NodeFormatter interface.
 func (node *IsOfTypeExpr) Format(buf *bytes.Buffer, f FmtFlags) {
-	FormatNode(buf, f, node.Expr)
+	exprFmtWithParen(buf, f, node.Expr)
 	buf.WriteString(" IS")
 	if node.Not {
 		buf.WriteString(" NOT")
@@ -744,6 +744,7 @@ const (
 	Div
 	FloorDiv
 	Mod
+	Pow
 	Concat
 	LShift
 	RShift
@@ -752,13 +753,14 @@ const (
 var binaryOpName = [...]string{
 	Bitand:   "&",
 	Bitor:    "|",
-	Bitxor:   "^",
+	Bitxor:   "#",
 	Plus:     "+",
 	Minus:    "-",
 	Mult:     "*",
 	Div:      "/",
 	FloorDiv: "//",
 	Mod:      "%",
+	Pow:      "^",
 	Concat:   "||",
 	LShift:   "<<",
 	RShift:   ">>",
@@ -815,7 +817,7 @@ func newBinExprIfValidOverload(op BinaryOperator, left TypedExpr, right TypedExp
 			Right:    right,
 			fn:       fn,
 		}
-		expr.typ = fn.returnType()
+		expr.typ = returnTypeToFixedType(fn.returnType())
 		return expr
 	}
 	return nil
@@ -865,7 +867,6 @@ func (*UnaryExpr) operatorExpr() {}
 // Format implements the NodeFormatter interface.
 func (node *UnaryExpr) Format(buf *bytes.Buffer, f FmtFlags) {
 	buf.WriteString(node.Operator.String())
-	buf.WriteByte(' ')
 	exprFmtWithParen(buf, f, node.Expr)
 }
 
@@ -876,9 +877,11 @@ func (node *UnaryExpr) TypedInnerExpr() TypedExpr {
 
 // FuncExpr represents a function call.
 type FuncExpr struct {
-	Func      ResolvableFunctionReference
-	Type      funcType
-	Exprs     Exprs
+	Func  ResolvableFunctionReference
+	Type  funcType
+	Exprs Exprs
+	// Filter is used for filters on aggregates: SUM(k) FILTER (WHERE k > 0)
+	Filter    Expr
 	WindowDef *WindowDef
 
 	typeAnnotation
@@ -887,14 +890,34 @@ type FuncExpr struct {
 
 // GetAggregateConstructor exposes the AggregateFunc field for use by
 // the group node in package sql.
-func (node *FuncExpr) GetAggregateConstructor() func() AggregateFunc {
-	return node.fn.AggregateFunc
+func (node *FuncExpr) GetAggregateConstructor() func(*EvalContext) AggregateFunc {
+	if node.fn.AggregateFunc == nil {
+		return nil
+	}
+	return func(evalCtx *EvalContext) AggregateFunc {
+		types := typesOfExprs(node.Exprs)
+		return node.fn.AggregateFunc(types, evalCtx)
+	}
 }
 
 // GetWindowConstructor returns a window function constructor if the
 // FuncExpr is a built-in window function.
-func (node *FuncExpr) GetWindowConstructor() func() WindowFunc {
-	return node.fn.WindowFunc
+func (node *FuncExpr) GetWindowConstructor() func(*EvalContext) WindowFunc {
+	if node.fn.WindowFunc == nil {
+		return nil
+	}
+	return func(evalCtx *EvalContext) WindowFunc {
+		types := typesOfExprs(node.Exprs)
+		return node.fn.WindowFunc(types, evalCtx)
+	}
+}
+
+func typesOfExprs(exprs Exprs) []Type {
+	types := make([]Type, len(exprs))
+	for i, expr := range exprs {
+		types[i] = expr.(TypedExpr).ResolvedType()
+	}
+	return types
 }
 
 // IsWindowFunctionApplication returns if the function is being applied as a window function.
@@ -909,10 +932,9 @@ func (node *FuncExpr) IsImpure() bool {
 	return node.fn.impure
 }
 
-// IsContextDependent returns whether the function depends on data stored in the
-// EvalContext.
-func (node *FuncExpr) IsContextDependent() bool {
-	return node.fn.ContextDependent()
+// IsDistSQLBlacklist returns whether the function is not supported by DistSQL.
+func (node *FuncExpr) IsDistSQLBlacklist() bool {
+	return node.fn.DistSQLBlacklist()
 }
 
 type funcType int
@@ -935,7 +957,9 @@ func (node *FuncExpr) Format(buf *bytes.Buffer, f FmtFlags) {
 	if node.Type != 0 {
 		typ = funcTypeName[node.Type] + " "
 	}
-	FormatNode(buf, f, node.Func)
+	fmtDisableAnonymize := *f
+	fmtDisableAnonymize.anonymize = false
+	FormatNode(buf, &fmtDisableAnonymize, node.Func)
 	buf.WriteByte('(')
 	buf.WriteString(typ)
 	FormatNode(buf, f, node.Exprs)
@@ -947,6 +971,11 @@ func (node *FuncExpr) Format(buf *bytes.Buffer, f FmtFlags) {
 		} else {
 			FormatNode(buf, f, window)
 		}
+	}
+	if node.Filter != nil {
+		buf.WriteString(" FILTER (WHERE ")
+		FormatNode(buf, f, node.Filter)
+		buf.WriteString(")")
 	}
 }
 
@@ -997,39 +1026,7 @@ type castSyntaxMode int
 const (
 	castExplicit castSyntaxMode = iota
 	castShort
-	castPrefix
-	castPrefixParens
-)
-
-// CastTargetType represents a type that is a valid cast target.
-type CastTargetType interface {
-	fmt.Stringer
-	NodeFormatter
-	castTargetType()
-}
-
-// PGOIDType represents a postgres oid pseudo-type.
-// See https://www.postgresql.org/docs/9.6/static/datatype-oid.html.
-type PGOIDType struct {
-	Name string
-}
-
-func (*PGOIDType) castTargetType() {}
-
-// Format implements the NodeFormatter interface.
-func (node *PGOIDType) Format(buf *bytes.Buffer, f FmtFlags) {
-	buf.WriteString(node.Name)
-}
-
-func (node *PGOIDType) String() string { return AsString(node) }
-
-// Pre-allocated immutable postgres oid pseudo-types.
-var (
-	oidPseudoTypeOid          = &PGOIDType{Name: "OID"}
-	oidPseudoTypeRegProc      = &PGOIDType{Name: "REGPROC"}
-	oidPseudoTypeRegClass     = &PGOIDType{Name: "REGCLASS"}
-	oidPseudoTypeRegType      = &PGOIDType{Name: "REGTYPE"}
-	oidPseudoTypeRegNamespace = &PGOIDType{Name: "REGNAMESPACE"}
+	castPrepend
 )
 
 // CastExpr represents a CAST(expr AS type) expression.
@@ -1044,19 +1041,21 @@ type CastExpr struct {
 // Format implements the NodeFormatter interface.
 func (node *CastExpr) Format(buf *bytes.Buffer, f FmtFlags) {
 	switch node.syntaxMode {
+	case castPrepend:
+		// This is a special case for things like INTERVAL '1s'. These only work
+		// with string constats; if the underlying expression was changed, we fall
+		// back to the short syntax.
+		if _, ok := node.Expr.(*StrVal); ok {
+			FormatNode(buf, f, node.Type)
+			buf.WriteByte(' ')
+			FormatNode(buf, f, node.Expr)
+			break
+		}
+		fallthrough
 	case castShort:
-		FormatNode(buf, f, node.Expr)
+		exprFmtWithParen(buf, f, node.Expr)
 		buf.WriteString("::")
 		FormatNode(buf, f, node.Type)
-	case castPrefix:
-		FormatNode(buf, f, node.Type)
-		buf.WriteByte(' ')
-		FormatNode(buf, f, node.Expr)
-	case castPrefixParens:
-		FormatNode(buf, f, node.Type)
-		buf.WriteString(" (")
-		FormatNode(buf, f, node.Expr)
-		buf.WriteByte(')')
 	default:
 		buf.WriteString("CAST(")
 		FormatNode(buf, f, node.Expr)
@@ -1067,29 +1066,30 @@ func (node *CastExpr) Format(buf *bytes.Buffer, f FmtFlags) {
 }
 
 func (node *CastExpr) castType() Type {
-	return columnTypeToDatumType(node.Type)
+	return CastTargetToDatumType(node.Type)
 }
 
 var (
-	boolCastTypes = []Type{TypeNull, TypeBool, TypeInt, TypeFloat, TypeDecimal, TypeString}
-	intCastTypes  = []Type{TypeNull, TypeBool, TypeInt, TypeFloat, TypeDecimal, TypeString,
+	boolCastTypes = []Type{TypeNull, TypeBool, TypeInt, TypeFloat, TypeDecimal, TypeString, TypeCollatedString}
+	intCastTypes  = []Type{TypeNull, TypeBool, TypeInt, TypeFloat, TypeDecimal, TypeString, TypeCollatedString,
+		TypeTimestamp, TypeTimestampTZ, TypeDate, TypeInterval, TypeOid}
+	floatCastTypes = []Type{TypeNull, TypeBool, TypeInt, TypeFloat, TypeDecimal, TypeString, TypeCollatedString,
 		TypeTimestamp, TypeTimestampTZ, TypeDate, TypeInterval}
-	floatCastTypes = []Type{TypeNull, TypeBool, TypeInt, TypeFloat, TypeDecimal, TypeString,
+	decimalCastTypes = []Type{TypeNull, TypeBool, TypeInt, TypeFloat, TypeDecimal, TypeString, TypeCollatedString,
 		TypeTimestamp, TypeTimestampTZ, TypeDate, TypeInterval}
-	decimalCastTypes = []Type{TypeNull, TypeBool, TypeInt, TypeFloat, TypeDecimal, TypeString,
-		TypeTimestamp, TypeTimestampTZ, TypeDate, TypeInterval}
-	stringCastTypes = []Type{TypeNull, TypeBool, TypeInt, TypeFloat, TypeDecimal, TypeString,
-		TypeBytes, TypeTimestamp, TypeTimestampTZ, TypeInterval, TypeDate}
-	bytesCastTypes     = []Type{TypeNull, TypeString, TypeBytes}
-	dateCastTypes      = []Type{TypeNull, TypeString, TypeDate, TypeTimestamp, TypeTimestampTZ, TypeInt}
-	timestampCastTypes = []Type{TypeNull, TypeString, TypeDate, TypeTimestamp, TypeTimestampTZ, TypeInt}
-	intervalCastTypes  = []Type{TypeNull, TypeString, TypeInt, TypeInterval}
-	oidCastTypes       = []Type{TypeNull, TypeString, TypeInt}
+	stringCastTypes = []Type{TypeNull, TypeBool, TypeInt, TypeFloat, TypeDecimal, TypeString, TypeCollatedString,
+		TypeBytes, TypeTimestamp, TypeTimestampTZ, TypeInterval, TypeUUID, TypeDate, TypeOid}
+	bytesCastTypes     = []Type{TypeNull, TypeString, TypeCollatedString, TypeBytes, TypeUUID}
+	dateCastTypes      = []Type{TypeNull, TypeString, TypeCollatedString, TypeDate, TypeTimestamp, TypeTimestampTZ, TypeInt}
+	timestampCastTypes = []Type{TypeNull, TypeString, TypeCollatedString, TypeDate, TypeTimestamp, TypeTimestampTZ, TypeInt}
+	intervalCastTypes  = []Type{TypeNull, TypeString, TypeCollatedString, TypeInt, TypeInterval}
+	oidCastTypes       = []Type{TypeNull, TypeString, TypeCollatedString, TypeInt, TypeOid}
+	uuidCastTypes      = []Type{TypeNull, TypeString, TypeCollatedString, TypeBytes, TypeUUID}
 )
 
 // validCastTypes returns a set of types that can be cast into the provided type.
 func validCastTypes(t Type) []Type {
-	switch t {
+	switch UnwrapType(t) {
 	case TypeBool:
 		return boolCastTypes
 	case TypeInt:
@@ -1108,23 +1108,43 @@ func validCastTypes(t Type) []Type {
 		return timestampCastTypes
 	case TypeInterval:
 		return intervalCastTypes
-	case TypePGOID:
+	case TypeUUID:
+		return uuidCastTypes
+	case TypeOid, TypeRegClass, TypeRegNamespace, TypeRegProc, TypeRegProcedure, TypeRegType:
 		return oidCastTypes
+	default:
+		// TODO(eisen): currently dead -- there is no syntax yet for casting
+		// directly to collated string.
+		if t.FamilyEqual(TypeCollatedString) {
+			return stringCastTypes
+		} else if t.FamilyEqual(TypeArray) {
+			return []Type{TypeNull}
+		}
+		return nil
 	}
-	return nil
+}
+
+// ArraySubscripts represents a sequence of one or more array subscripts.
+type ArraySubscripts []*ArraySubscript
+
+// Format implements the NodeFormatter interface.
+func (a ArraySubscripts) Format(buf *bytes.Buffer, f FmtFlags) {
+	for _, s := range a {
+		FormatNode(buf, f, s)
+	}
 }
 
 // IndirectionExpr represents a subscript expression.
 type IndirectionExpr struct {
 	Expr        Expr
-	Indirection UnresolvedName
+	Indirection ArraySubscripts
 
 	typeAnnotation
 }
 
 // Format implements the NodeFormatter interface.
 func (node *IndirectionExpr) Format(buf *bytes.Buffer, f FmtFlags) {
-	FormatNode(buf, f, node.Expr)
+	exprFmtWithParen(buf, f, node.Expr)
 	FormatNode(buf, f, node.Indirection)
 }
 
@@ -1140,7 +1160,6 @@ type AnnotateTypeExpr struct {
 	Expr Expr
 	Type CastTargetType
 
-	typeAnnotation
 	syntaxMode annotateSyntaxMode
 }
 
@@ -1148,9 +1167,10 @@ type AnnotateTypeExpr struct {
 func (node *AnnotateTypeExpr) Format(buf *bytes.Buffer, f FmtFlags) {
 	switch node.syntaxMode {
 	case annotateShort:
-		FormatNode(buf, f, node.Expr)
+		exprFmtWithParen(buf, f, node.Expr)
 		buf.WriteString(":::")
 		FormatNode(buf, f, node.Type)
+
 	default:
 		buf.WriteString("ANNOTATE_TYPE(")
 		FormatNode(buf, f, node.Expr)
@@ -1166,7 +1186,7 @@ func (node *AnnotateTypeExpr) TypedInnerExpr() TypedExpr {
 }
 
 func (node *AnnotateTypeExpr) annotationType() Type {
-	return columnTypeToDatumType(node.Type)
+	return CastTargetToDatumType(node.Type)
 }
 
 // CollateExpr represents an (expr COLLATE locale) expression.
@@ -1179,9 +1199,9 @@ type CollateExpr struct {
 
 // Format implements the NodeFormatter interface.
 func (node *CollateExpr) Format(buf *bytes.Buffer, f FmtFlags) {
-	FormatNode(buf, f, node.Expr)
+	exprFmtWithParen(buf, f, node.Expr)
 	buf.WriteString(" COLLATE ")
-	buf.WriteString(node.Locale)
+	encodeSQLIdent(buf, node.Locale, FmtSimple)
 }
 
 func (node *AliasedTableExpr) String() string { return AsString(node) }
@@ -1195,6 +1215,7 @@ func (node *CastExpr) String() string         { return AsString(node) }
 func (node *CoalesceExpr) String() string     { return AsString(node) }
 func (node *CollateExpr) String() string      { return AsString(node) }
 func (node *ComparisonExpr) String() string   { return AsString(node) }
+func (node *Datums) String() string           { return AsString(node) }
 func (node *DBool) String() string            { return AsString(node) }
 func (node *DBytes) String() string           { return AsString(node) }
 func (node *DDate) String() string            { return AsString(node) }
@@ -1202,6 +1223,7 @@ func (node *DDecimal) String() string         { return AsString(node) }
 func (node *DFloat) String() string           { return AsString(node) }
 func (node *DInt) String() string             { return AsString(node) }
 func (node *DInterval) String() string        { return AsString(node) }
+func (node *DUuid) String() string            { return AsString(node) }
 func (node *DString) String() string          { return AsString(node) }
 func (node *DCollatedString) String() string  { return AsString(node) }
 func (node *DTimestamp) String() string       { return AsString(node) }
@@ -1209,6 +1231,8 @@ func (node *DTimestampTZ) String() string     { return AsString(node) }
 func (node *DTuple) String() string           { return AsString(node) }
 func (node *DArray) String() string           { return AsString(node) }
 func (node *DTable) String() string           { return AsString(node) }
+func (node *DOid) String() string             { return AsString(node) }
+func (node *DOidWrapper) String() string      { return AsString(node) }
 func (node *ExistsExpr) String() string       { return AsString(node) }
 func (node Exprs) String() string             { return AsString(node) }
 func (node *ArrayFlatten) String() string     { return AsString(node) }

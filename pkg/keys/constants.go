@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Peter Mattis (peter@cockroachlabs.com)
 
 package keys
 
@@ -41,7 +39,7 @@ const (
 var (
 	// localPrefix is the prefix for keys which hold data local to a
 	// RocksDB instance, such as store and range-specific metadata which
-	// must not pollute the user key space, but must be collocate with
+	// must not pollute the user key space, but must be collocated with
 	// the store and/or ranges which they refer to. Storing this
 	// information in the normal system keyspace would place the data on
 	// an arbitrary set of stores, with no guarantee of collocation.
@@ -80,6 +78,12 @@ var (
 	// localStoreGossipSuffix stores gossip bootstrap metadata for this
 	// store, updated any time new gossip hosts are encountered.
 	localStoreGossipSuffix = []byte("goss")
+	// localStoreLastUpSuffix stores the last timestamp that a store's node
+	// acknowledged that it was still running. This value will be regularly
+	// refreshed on all stores for a running node; the intention of this value
+	// is to allow a restarting node to discover approximately how long it has
+	// been down without needing to retrieve liveness records from the cluster.
+	localStoreLastUpSuffix = []byte("uptm")
 
 	// LocalRangeIDPrefix is the prefix identifying per-range data
 	// indexed by Range ID. The Range ID is appended to this prefix,
@@ -103,6 +107,7 @@ var (
 	// after it's been aborted.
 	LocalAbortCacheSuffix = []byte("abc-")
 	// LocalRangeFrozenStatusSuffix is the suffix for a frozen status.
+	// No longer used; exists only to reserve the key so we don't use it.
 	LocalRangeFrozenStatusSuffix = []byte("fzn-")
 	// LocalRangeLastGCSuffix is the suffix for the last GC.
 	LocalRangeLastGCSuffix = []byte("lgc-")
@@ -191,6 +196,16 @@ var (
 	SystemPrefix = roachpb.Key{systemPrefixByte}
 	SystemMax    = roachpb.Key{systemMaxByte}
 
+	// MigrationPrefix specifies the key prefix to store all migration details.
+	MigrationPrefix = roachpb.Key(makeKey(SystemPrefix, roachpb.RKey("system-version/")))
+
+	// MigrationKeyMax is the maximum value for any system migration key.
+	MigrationKeyMax = MigrationPrefix.PrefixEnd()
+
+	// MigrationLease is the key that nodes must take a lease on in order to run
+	// system migrations on the cluster.
+	MigrationLease = roachpb.Key(makeKey(MigrationPrefix, roachpb.RKey("lease")))
+
 	// NodeLivenessPrefix specifies the key prefix for the node liveness
 	// table.  Note that this should sort before the rest of the system
 	// keyspace in order to limit the number of ranges which must use
@@ -220,16 +235,16 @@ var (
 	// TimeseriesPrefix is the key prefix for all timeseries data.
 	TimeseriesPrefix = roachpb.Key(makeKey(SystemPrefix, roachpb.RKey("tsd")))
 
-	// UpdateCheckPrefix is the key prefix for all update check times.
-	UpdateCheckPrefix  = roachpb.Key(makeKey(SystemPrefix, roachpb.RKey("update-")))
-	UpdateCheckCluster = roachpb.Key(makeKey(UpdateCheckPrefix, roachpb.RKey("cluster")))
-
 	// TableDataMin is the start of the range of table data keys.
-	TableDataMin = roachpb.Key(encoding.EncodeVarintAscending(nil, math.MinInt64))
+	TableDataMin = roachpb.Key(encoding.EncodeVarintAscending(nil, 0))
 	// TableDataMin is the end of the range of table data keys.
 	TableDataMax = roachpb.Key(encoding.EncodeVarintAscending(nil, math.MaxInt64))
 
-	// SystemConfigTableDataMax is the end key of system config structured data.
+	// SystemConfigSplitKey is the key to split at immediately prior to the
+	// system config span. NB: Split keys need to be valid column keys.
+	// TODO(bdarnell): this should be either roachpb.Key or RKey, not []byte.
+	SystemConfigSplitKey = []byte(TableDataMin)
+	// SystemConfigTableDataMax is the end key of system config span.
 	SystemConfigTableDataMax = roachpb.Key(MakeTablePrefix(MaxSystemConfigDescID + 1))
 
 	// UserTableDataMin is the start key of user structured data.
@@ -268,12 +283,19 @@ const (
 	DescriptorTableID = 3
 	UsersTableID      = 4
 	ZonesTableID      = 5
+	SettingsTableID   = 6
 
-	// Reserved IDs for other system tables. If you're adding a new system table,
-	// it probably belongs here.
+	// Reserved IDs for other system tables. Note that some of these IDs refer
+	// to "Ranges" instead of a Table - these IDs are needed to store custom
+	// configuration for non-table ranges (e.g. Zone Configs).
 	// NOTE: IDs must be <= MaxReservedDescID.
-	LeaseTableID      = 11
-	EventLogTableID   = 12
-	RangeEventTableID = 13
-	UITableID         = 14
+	LeaseTableID       = 11
+	EventLogTableID    = 12
+	RangeEventTableID  = 13
+	UITableID          = 14
+	JobsTableID        = 15
+	MetaRangesID       = 16
+	SystemRangesID     = 17
+	TimeseriesRangesID = 18
+	WebSessionsTableID = 19
 )

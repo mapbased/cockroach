@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Matt Jibson (mjibson@cockroachlabs.com)
 
 package pgwire
 
@@ -29,7 +27,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/cockroachdb/cockroach/pkg/sql"
+	"golang.org/x/net/context"
+
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/metric"
@@ -59,7 +58,7 @@ func testBinaryDatumType(t *testing.T, typ string, datumConstructor func(val str
 		buf.wrapped.Reset()
 
 		d := datumConstructor(test.In)
-		oid, _ := sql.DatumToOid(d.ResolvedType())
+		oid := d.ResolvedType().Oid()
 		func() {
 			defer func() {
 				if r := recover(); r != nil {
@@ -67,15 +66,17 @@ func testBinaryDatumType(t *testing.T, typ string, datumConstructor func(val str
 					panic(r)
 				}
 			}()
-			buf.writeBinaryDatum(d, time.UTC)
+			buf.writeBinaryDatum(context.Background(), d, time.UTC)
 			if buf.err != nil {
 				t.Fatal(buf.err)
 			}
+			evalCtx := parser.NewTestingEvalContext()
+			defer evalCtx.Stop(context.Background())
 			if got := buf.wrapped.Bytes(); !bytes.Equal(got, test.Expect) {
 				t.Errorf("%q:\n\t%v found,\n\t%v expected", test.In, got, test.Expect)
 			} else if datum, err := decodeOidDatum(oid, formatBinary, got[4:]); err != nil {
 				t.Fatalf("unable to decode %v: %s", got[4:], err)
-			} else if d.Compare(datum) != 0 {
+			} else if d.Compare(evalCtx, datum) != 0 {
 				t.Errorf("expected %s, got %s", d, datum)
 			}
 		}()
@@ -86,7 +87,7 @@ func TestBinaryDecimal(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	testBinaryDatumType(t, "decimal", func(val string) parser.Datum {
 		dec := new(parser.DDecimal)
-		if _, ok := dec.SetString(val); !ok {
+		if err := dec.SetString(val); err != nil {
 			t.Fatalf("could not set %q on decimal", val)
 		}
 		return dec
@@ -124,6 +125,30 @@ func TestBinaryDate(t *testing.T) {
 		}
 		return d
 	})
+}
+
+func TestBinaryIntArray(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	buf := writeBuffer{bytecount: metric.NewCounter(metric.Metadata{})}
+	d := parser.NewDArray(parser.TypeInt)
+	for i := 0; i < 10; i++ {
+		if err := d.Append(parser.NewDInt(parser.DInt(i))); err != nil {
+			t.Fatal(err)
+		}
+	}
+	buf.writeBinaryDatum(context.Background(), d, time.UTC)
+
+	b := buf.wrapped.Bytes()
+
+	got, err := decodeOidDatum(oid.T__int8, formatBinary, b[4:])
+	if err != nil {
+		t.Fatal(err)
+	}
+	evalCtx := parser.NewTestingEvalContext()
+	defer evalCtx.Stop(context.Background())
+	if got.Compare(evalCtx, d) != 0 {
+		t.Fatalf("expected %s, got %s", d, got)
+	}
 }
 
 var generateBinaryCmd = flag.String("generate-binary", "", "generate-binary command invocation")
@@ -176,19 +201,32 @@ func TestRandomBinaryDecimal(t *testing.T) {
 		buf := writeBuffer{bytecount: metric.NewCounter(metric.Metadata{})}
 		dec := new(parser.DDecimal)
 
-		if _, ok := dec.SetString(test.In); !ok {
+		if err := dec.SetString(test.In); err != nil {
 			t.Fatalf("could not set %q on decimal", test.In)
 		}
-		buf.writeBinaryDatum(dec, time.UTC)
+		buf.writeBinaryDatum(context.Background(), dec, time.UTC)
 		if buf.err != nil {
 			t.Fatal(buf.err)
 		}
+		evalCtx := parser.NewTestingEvalContext()
 		if got := buf.wrapped.Bytes(); !bytes.Equal(got, test.Expect) {
 			t.Errorf("%q:\n\t%v found,\n\t%v expected", test.In, got, test.Expect)
 		} else if datum, err := decodeOidDatum(oid.T_numeric, formatBinary, got[4:]); err != nil {
 			t.Errorf("%q: unable to decode %v: %s", test.In, got[4:], err)
-		} else if dec.Compare(datum) != 0 {
+		} else if dec.Compare(evalCtx, datum) != 0 {
 			t.Errorf("%q: expected %s, got %s", test.In, dec, datum)
 		}
+		evalCtx.Stop(context.Background())
 	}
+}
+
+func TestBinaryUuid(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	testBinaryDatumType(t, "uuid", func(val string) parser.Datum {
+		u, err := parser.ParseDUuidFromString(val)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return u
+	})
 }

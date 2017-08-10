@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Raphael 'kena' Poss (knz@cockroachlabs.com)
 
 package parser
 
@@ -51,7 +49,7 @@ import (
 
 // generatorFactory is the type of constructor functions for
 // ValueGenerator objects suitable for use with DTable.
-type generatorFactory func(ctx *EvalContext, args DTuple) (ValueGenerator, error)
+type generatorFactory func(ctx *EvalContext, args Datums) (ValueGenerator, error)
 
 // ValueGenerator is the interface provided by the object held by a
 // DTable; objects that implement this interface are able to produce
@@ -70,7 +68,7 @@ type ValueGenerator interface {
 	Next() (bool, error)
 
 	// Values retrieves the current row of data.
-	Values() DTuple
+	Values() Datums
 
 	// Close must be called after Start() before disposing of the
 	// ValueGenerator. It does not need to be called if Start() has not
@@ -79,10 +77,11 @@ type ValueGenerator interface {
 }
 
 var _ ValueGenerator = &seriesValueGenerator{}
+var _ ValueGenerator = &arrayValueGenerator{}
 
 func initGeneratorBuiltins() {
 	// Add all windows to the Builtins map after a few sanity checks.
-	for k, v := range generators {
+	for k, v := range Generators {
 		for _, g := range v {
 			if !g.impure {
 				panic(fmt.Sprintf("generator functions should all be impure, found %v", g))
@@ -91,30 +90,56 @@ func initGeneratorBuiltins() {
 				panic(fmt.Sprintf("generator functions should be marked with the GeneratorClass "+
 					"function class, found %v", g))
 			}
-			if g.generator == nil {
-				panic(fmt.Sprintf("generator functions should have Generator objects, "+
-					"found %v", g))
-			}
 		}
 		Builtins[k] = v
 	}
 }
 
-var generators = map[string][]Builtin{
-	"pg_catalog.generate_series": {
-		makeGeneratorBuiltin(ArgTypes{TypeInt, TypeInt}, TTuple{TypeInt}, makeSeriesGenerator),
-		makeGeneratorBuiltin(ArgTypes{TypeInt, TypeInt, TypeInt}, TTuple{TypeInt}, makeSeriesGenerator),
+// Generators is a map from name to slice of Builtins for all built-in
+// generators.
+var Generators = map[string][]Builtin{
+	"generate_series": {
+		makeGeneratorBuiltin(
+			ArgTypes{{"start", TypeInt}, {"end", TypeInt}},
+			TTuple{TypeInt},
+			makeSeriesGenerator,
+			"Produces a virtual table containing the integer values from `start` to `end`, inclusive.",
+		),
+		makeGeneratorBuiltin(
+			ArgTypes{{"start", TypeInt}, {"end", TypeInt}, {"step", TypeInt}},
+			TTuple{TypeInt},
+			makeSeriesGenerator,
+			"Produces a virtual table containing the integer values from `start` to `end`, inclusive, by increment of `step`.",
+		),
+	},
+	"unnest": {
+		makeGeneratorBuiltinWithReturnType(
+			ArgTypes{{"input", TypeAnyArray}},
+			func(args []TypedExpr) Type {
+				if len(args) == 0 {
+					return unknownReturnType
+				}
+				return TTable{Cols: TTuple{args[0].ResolvedType().(TArray).Typ}}
+			},
+			makeArrayGenerator,
+			"Returns the input array as a set of rows",
+		),
 	},
 }
 
-func makeGeneratorBuiltin(in ArgTypes, ret TTuple, g generatorFactory) Builtin {
+func makeGeneratorBuiltin(in ArgTypes, ret TTuple, g generatorFactory, info string) Builtin {
+	return makeGeneratorBuiltinWithReturnType(in, fixedReturnType(TTable{Cols: ret}), g, info)
+}
+
+func makeGeneratorBuiltinWithReturnType(
+	in ArgTypes, retType returnTyper, g generatorFactory, info string,
+) Builtin {
 	return Builtin{
 		impure:     true,
 		class:      GeneratorClass,
 		Types:      in,
-		ReturnType: TTable{Cols: ret},
-		generator:  g,
-		fn: func(ctx *EvalContext, args DTuple) (Datum, error) {
+		ReturnType: retType,
+		fn: func(ctx *EvalContext, args Datums) (Datum, error) {
 			gen, err := g(ctx, args)
 			if err != nil {
 				return nil, err
@@ -122,6 +147,7 @@ func makeGeneratorBuiltin(in ArgTypes, ret TTuple, g generatorFactory) Builtin {
 			return &DTable{gen}, nil
 		},
 		category: categoryCompatibility,
+		Info:     info,
 	}
 }
 
@@ -133,12 +159,12 @@ type seriesValueGenerator struct {
 
 var errStepCannotBeZero = errors.New("step cannot be 0")
 
-func makeSeriesGenerator(_ *EvalContext, args DTuple) (ValueGenerator, error) {
-	start := int64(*args[0].(*DInt))
-	stop := int64(*args[1].(*DInt))
+func makeSeriesGenerator(_ *EvalContext, args Datums) (ValueGenerator, error) {
+	start := int64(MustBeDInt(args[0]))
+	stop := int64(MustBeDInt(args[1]))
 	step := int64(1)
 	if len(args) > 2 {
-		step = int64(*args[2].(*DInt))
+		step = int64(MustBeDInt(args[2]))
 	}
 	if step == 0 {
 		return nil, errStepCannotBeZero
@@ -169,6 +195,44 @@ func (s *seriesValueGenerator) Next() (bool, error) {
 }
 
 // Values implements the ValueGenerator interface.
-func (s *seriesValueGenerator) Values() DTuple {
-	return DTuple{NewDInt(DInt(s.value))}
+func (s *seriesValueGenerator) Values() Datums {
+	return Datums{NewDInt(DInt(s.value))}
+}
+
+func makeArrayGenerator(_ *EvalContext, args Datums) (ValueGenerator, error) {
+	arr := MustBeDArray(args[0])
+	return &arrayValueGenerator{array: arr}, nil
+}
+
+// arrayValueGenerator is a value generator that returns each element of an
+// array.
+type arrayValueGenerator struct {
+	array     *DArray
+	nextIndex int
+}
+
+// ColumnTypes implements the ValueGenerator interface.
+func (s *arrayValueGenerator) ColumnTypes() TTuple { return TTuple{s.array.ParamTyp} }
+
+// Start implements the ValueGenerator interface.
+func (s *arrayValueGenerator) Start() error {
+	s.nextIndex = -1
+	return nil
+}
+
+// Close implements the ValueGenerator interface.
+func (s *arrayValueGenerator) Close() {}
+
+// Next implements the ValueGenerator interface.
+func (s *arrayValueGenerator) Next() (bool, error) {
+	s.nextIndex++
+	if s.nextIndex >= s.array.Len() {
+		return false, nil
+	}
+	return true, nil
+}
+
+// Values implements the ValueGenerator interface.
+func (s *arrayValueGenerator) Values() Datums {
+	return Datums{s.array.Array[s.nextIndex]}
 }

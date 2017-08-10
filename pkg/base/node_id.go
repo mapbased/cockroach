@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Radu Berinde (radu@cockroachlabs.com)
 
 package base
 
@@ -59,7 +57,9 @@ func (n *NodeIDContainer) Set(ctx context.Context, val roachpb.NodeID) {
 	}
 	oldVal := atomic.SwapInt32(&n.nodeID, int32(val))
 	if oldVal == 0 {
-		log.Infof(ctx, "NodeID set to %d", val)
+		if log.V(2) {
+			log.Infof(ctx, "NodeID set to %d", val)
+		}
 	} else if oldVal != int32(val) {
 		log.Fatalf(ctx, "different NodeIDs set: %d, then %d", oldVal, val)
 	}

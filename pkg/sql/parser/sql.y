@@ -10,8 +10,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Peter Mattis (peter@cockroachlabs.com)
 
 // Portions Copyright (c) 1996-2015, PostgreSQL Global Development Group
 // Portions Copyright (c) 1994, Regents of the University of California
@@ -33,15 +31,13 @@ const MaxUint = ^uint(0)
 // MaxInt is the maximum value of an int.
 const MaxInt = int(MaxUint >> 1)
 
-func unimplemented(sqllex sqlLexer) int {
-    sqllex.Error("unimplemented")
+func unimplemented(sqllex sqlLexer, feature string) int {
+    sqllex.(*Scanner).Unimplemented(feature)
     return 1
 }
 
 func unimplementedWithIssue(sqllex sqlLexer, issue int) int {
-    sqllex.Error(fmt.Sprintf("unimplemented "+
-			     "(see issue https://github.com/cockroachdb/cockroach/issues/%d)",
-			     issue))
+    sqllex.(*Scanner).UnimplementedWithIssue(issue)
     return 1
 }
 %}
@@ -104,6 +100,9 @@ func (u *sqlSymUnion) strVal() *StrVal {
 func (u *sqlSymUnion) bool() bool {
     return u.val.(bool)
 }
+func (u *sqlSymUnion) strPtr() *string {
+    return u.val.(*string)
+}
 func (u *sqlSymUnion) strs() []string {
     return u.val.([]string)
 }
@@ -145,6 +144,15 @@ func (u *sqlSymUnion) tableNameReferences() TableNameReferences {
 }
 func (u *sqlSymUnion) indexHints() *IndexHints {
     return u.val.(*IndexHints)
+}
+func (u *sqlSymUnion) arraySubscript() *ArraySubscript {
+    return u.val.(*ArraySubscript)
+}
+func (u *sqlSymUnion) arraySubscripts() ArraySubscripts {
+    if as, ok := u.val.(ArraySubscripts); ok {
+        return as
+    }
+    return nil
 }
 func (u *sqlSymUnion) stmt() Statement {
     if stmt, ok := u.val.(Statement); ok {
@@ -188,6 +196,12 @@ func (u *sqlSymUnion) colType() ColumnType {
     }
     return nil
 }
+func (u *sqlSymUnion) tableRefCols() []ColumnID {
+    if refCols, ok := u.val.([]ColumnID); ok {
+        return refCols
+    }
+    return nil
+}
 func (u *sqlSymUnion) castTargetType() CastTargetType {
     return u.val.(CastTargetType)
 }
@@ -209,8 +223,8 @@ func (u *sqlSymUnion) selExpr() SelectExpr {
 func (u *sqlSymUnion) selExprs() SelectExprs {
     return u.val.(SelectExprs)
 }
-func (u *sqlSymUnion) retExprs() ReturningExprs {
-    return ReturningExprs(u.val.(SelectExprs))
+func (u *sqlSymUnion) retClause() ReturningClause {
+	return u.val.(ReturningClause)
 }
 func (u *sqlSymUnion) aliasClause() AliasClause {
     return u.val.(AliasClause)
@@ -287,6 +301,9 @@ func (u *sqlSymUnion) isoLevel() IsolationLevel {
 func (u *sqlSymUnion) userPriority() UserPriority {
     return u.val.(UserPriority)
 }
+func (u *sqlSymUnion) readWriteMode() ReadWriteMode {
+    return u.val.(ReadWriteMode)
+}
 func (u *sqlSymUnion) idxElem() IndexElem {
     return u.val.(IndexElem)
 }
@@ -314,8 +331,134 @@ func (u *sqlSymUnion) op() operator {
 func (u *sqlSymUnion) cmpOp() ComparisonOperator {
     return u.val.(ComparisonOperator)
 }
+func (u *sqlSymUnion) durationField() durationField {
+    return u.val.(durationField)
+}
+func (u *sqlSymUnion) kvOption() KVOption {
+    return u.val.(KVOption)
+}
+func (u *sqlSymUnion) kvOptions() []KVOption {
+    if colType, ok := u.val.([]KVOption); ok {
+        return colType
+    }
+    return nil
+}
+func (u *sqlSymUnion) transactionModes() TransactionModes {
+    return u.val.(TransactionModes)
+}
 
 %}
+
+// NB: the %token definitions must come before the %type definitions in this
+// file to work around a bug in goyacc. See #16369 for more details.
+
+// Non-keyword token types.
+%token <str>   IDENT SCONST BCONST
+%token <*NumVal> ICONST FCONST
+%token <str>   PLACEHOLDER
+%token <str>   TYPECAST TYPEANNOTATE DOT_DOT
+%token <str>   LESS_EQUALS GREATER_EQUALS NOT_EQUALS
+%token <str>   NOT_REGMATCH REGIMATCH NOT_REGIMATCH
+%token <str>   ERROR
+
+// If you want to make any keyword changes, add the new keyword here as well as
+// to the appropriate one of the reserved-or-not-so-reserved keyword lists,
+// below; search this file for "Keyword category lists".
+
+// Ordinary key words in alphabetical order.
+%token <str>   ACTION ADD
+%token <str>   ALL ALTER ANALYSE ANALYZE AND ANY ANNOTATE_TYPE ARRAY AS ASC
+%token <str>   ASYMMETRIC AT
+
+%token <str>   BACKUP BEGIN BETWEEN BIGINT BIGSERIAL BIT
+%token <str>   BLOB BOOL BOOLEAN BOTH BY BYTEA BYTES
+
+%token <str>   CANCEL CASCADE CASE CAST CHAR
+%token <str>   CHARACTER CHARACTERISTICS CHECK
+%token <str>   CLUSTER COALESCE COLLATE COLLATION COLUMN COLUMNS COMMIT
+%token <str>   COMMITTED CONCAT CONFLICT CONSTRAINT CONSTRAINTS
+%token <str>   COPY COVERING CREATE
+%token <str>   CROSS CSV CUBE CURRENT CURRENT_CATALOG CURRENT_DATE CURRENT_SCHEMA
+%token <str>   CURRENT_ROLE CURRENT_TIME CURRENT_TIMESTAMP
+%token <str>   CURRENT_USER CYCLE
+
+%token <str>   DATA DATABASE DATABASES DATE DAY DEC DECIMAL DEFAULT
+%token <str>   DEALLOCATE DEFERRABLE DELETE DESC
+%token <str>   DISCARD DISTINCT DO DOUBLE DROP
+
+%token <str>   ELSE ENCODING END ESCAPE EXCEPT
+%token <str>   EXISTS EXECUTE EXPERIMENTAL_FINGERPRINTS EXPLAIN EXTRACT EXTRACT_DURATION
+
+%token <str>   FALSE FAMILY FETCH FILTER FIRST FLOAT FLOAT4 FLOAT8 FLOORDIV FOLLOWING FOR
+%token <str>   FORCE_INDEX FOREIGN FROM FULL
+
+%token <str>   GRANT GRANTS GREATEST GROUP GROUPING
+
+%token <str>   HAVING HELP HIGH HOUR
+
+%token <str>   IMPORT INCREMENTAL IF IFNULL ILIKE IN INTERLEAVE
+%token <str>   INDEX INDEXES INITIALLY
+%token <str>   INNER INSERT INT INT2VECTOR INT2 INT4 INT8 INT64 INTEGER
+%token <str>   INTERSECT INTERVAL INTO IS ISOLATION
+
+%token <str>   JOB JOBS JOIN
+
+%token <str>   KEY KEYS KV
+
+%token <str>   LATERAL LC_CTYPE LC_COLLATE
+%token <str>   LEADING LEAST LEFT LEVEL LIKE LIMIT LOCAL
+%token <str>   LOCALTIME LOCALTIMESTAMP LOW LSHIFT
+
+%token <str>   MATCH MINUTE MONTH
+
+%token <str>   NAN NAME NAMES NATURAL NEXT NO NO_INDEX_JOIN NORMAL
+%token <str>   NOT NOTHING NULL NULLIF
+%token <str>   NULLS NUMERIC
+
+%token <str>   OF OFF OFFSET OID ON ONLY OPTIONS OR
+%token <str>   ORDER ORDINALITY OUT OUTER OVER OVERLAPS OVERLAY
+
+%token <str>   PARENT PARTIAL PARTITION PASSWORD PAUSE PLACING PLANS POSITION
+%token <str>   PRECEDING PRECISION PREPARE PRIMARY PRIORITY
+
+%token <str>   QUERIES QUERY
+
+%token <str>   RANGE READ REAL RECURSIVE REF REFERENCES
+%token <str>   REGCLASS REGPROC REGPROCEDURE REGNAMESPACE REGTYPE
+%token <str>   RENAME REPEATABLE
+%token <str>   RELEASE RESET RESTORE RESTRICT RESUME RETURNING REVOKE RIGHT
+%token <str>   ROLLBACK ROLLUP ROW ROWS RSHIFT
+
+%token <str>   SAVEPOINT SCATTER SEARCH SECOND SELECT SEQUENCES
+%token <str>   SERIAL SERIALIZABLE SESSION SESSIONS SESSION_USER SET SETTING SETTINGS
+%token <str>   SHOW SIMILAR SIMPLE SMALLINT SMALLSERIAL SNAPSHOT SOME SPLIT SQL
+%token <str>   START STATUS STDIN STRICT STRING STORE STORING SUBSTRING
+%token <str>   SYMMETRIC SYSTEM
+
+%token <str>   TABLE TABLES TEMP TEMPLATE TEMPORARY TESTING_RANGES TESTING_RELOCATE TEXT THEN
+%token <str>   TIME TIMESTAMP TIMESTAMPTZ TO TRAILING TRACE TRANSACTION TREAT TRIM TRUE
+%token <str>   TRUNCATE TYPE
+
+%token <str>   UNBOUNDED UNCOMMITTED UNION UNIQUE UNKNOWN
+%token <str>   UPDATE UPSERT USE USER USERS USING UUID
+
+%token <str>   VALID VALIDATE VALUE VALUES VARCHAR VARIADIC VIEW VARYING
+
+%token <str>   WHEN WHERE WINDOW WITH WITHIN WITHOUT WRITE
+
+%token <str>   YEAR
+
+%token <str>   ZONE
+
+// The grammar thinks these are keywords, but they are not in any category
+// and so can never be entered directly. The filter in scan.go creates these
+// tokens when required (based on looking one token ahead).
+//
+// NOT_LA exists so that productions such as NOT LIKE can be given the same
+// precedence as LIKE; otherwise they'd effectively have the same precedence as
+// NOT, at least with respect to their left-hand subexpression. WITH_LA is
+// needed to make the grammar LALR(1).
+%token     NOT_LA WITH_LA AS_LA
 
 %union {
   id             int
@@ -329,9 +472,41 @@ func (u *sqlSymUnion) cmpOp() ComparisonOperator {
 %type <[]Statement> stmt_list
 %type <Statement> stmt
 
+%type <Statement> alter_stmt
 %type <Statement> alter_table_stmt
+%type <Statement> alter_index_stmt
+%type <Statement> alter_view_stmt
+%type <Statement> alter_database_stmt
+
+// ALTER TABLE
+%type <Statement> alter_onetable_stmt
+%type <Statement> alter_split_stmt
+%type <Statement> alter_rename_table_stmt
+%type <Statement> alter_scatter_stmt
+%type <Statement> alter_testing_relocate_stmt
+
+// ALTER DATABASE
+%type <Statement> alter_rename_database_stmt
+
+// ALTER INDEX
+%type <Statement> alter_scatter_index_stmt
+%type <Statement> alter_split_index_stmt
+%type <Statement> alter_rename_index_stmt
+%type <Statement> alter_testing_relocate_index_stmt
+
+// ALTER VIEW
+%type <Statement> alter_rename_view_stmt
+
 %type <Statement> backup_stmt
+%type <Statement> begin_stmt
+
+%type <Statement> cancel_stmt
+%type <Statement> cancel_job_stmt
+%type <Statement> cancel_query_stmt
+
+%type <Statement> commit_stmt
 %type <Statement> copy_from_stmt
+
 %type <Statement> create_stmt
 %type <Statement> create_database_stmt
 %type <Statement> create_index_stmt
@@ -340,32 +515,80 @@ func (u *sqlSymUnion) cmpOp() ComparisonOperator {
 %type <Statement> create_user_stmt
 %type <Statement> create_view_stmt
 %type <Statement> delete_stmt
+%type <Statement> discard_stmt
+
 %type <Statement> drop_stmt
+%type <Statement> drop_database_stmt
+%type <Statement> drop_index_stmt
+%type <Statement> drop_table_stmt
+%type <Statement> drop_user_stmt
+%type <Statement> drop_view_stmt
+
 %type <Statement> explain_stmt
-%type <Statement> explainable_stmt
 %type <Statement> help_stmt
 %type <Statement> prepare_stmt
 %type <Statement> preparable_stmt
+%type <Statement> explainable_stmt
 %type <Statement> execute_stmt
 %type <Statement> deallocate_stmt
 %type <Statement> grant_stmt
 %type <Statement> insert_stmt
+%type <Statement> import_stmt
+%type <Statement> pause_stmt
 %type <Statement> release_stmt
-%type <Statement> rename_stmt
+%type <Statement> reset_stmt
+%type <Statement> resume_stmt
+%type <Statement> restore_stmt
 %type <Statement> revoke_stmt
 %type <*Select> select_stmt
+%type <Statement> rollback_stmt
 %type <Statement> savepoint_stmt
+
 %type <Statement> set_stmt
+%type <Statement> set_session_stmt
+%type <Statement> set_csetting_stmt
+%type <Statement> set_transaction_stmt
+%type <Statement> set_exprs_internal
+%type <Statement> generic_set
+%type <Statement> set_rest_more
+%type <Statement> set_names
+
 %type <Statement> show_stmt
-%type <Statement> split_stmt
+%type <Statement> show_backup_stmt
+%type <Statement> show_columns_stmt
+%type <Statement> show_constraints_stmt
+%type <Statement> show_create_table_stmt
+%type <Statement> show_create_view_stmt
+%type <Statement> show_csettings_stmt
+%type <Statement> show_databases_stmt
+%type <Statement> show_grants_stmt
+%type <Statement> show_indexes_stmt
+%type <Statement> show_jobs_stmt
+%type <Statement> show_queries_stmt
+%type <Statement> show_session_stmt
+%type <Statement> show_sessions_stmt
+%type <Statement> show_tables_stmt
+%type <Statement> show_testing_stmt
+%type <Statement> show_trace_stmt
+%type <Statement> show_transaction_stmt
+%type <Statement> show_users_stmt
+
+%type <str> session_var
+
 %type <Statement> transaction_stmt
 %type <Statement> truncate_stmt
 %type <Statement> update_stmt
+%type <Statement> upsert_stmt
+%type <Statement> use_stmt
 
-%type <*StrVal> opt_incremental
+%type <[]string> opt_incremental
+%type <KVOption> kv_option
+%type <[]KVOption> kv_option_list opt_with_options
+%type <str> import_data_format
 
 %type <*Select> select_no_parens
-%type <SelectStatement> select_clause select_with_parens simple_select values_clause
+%type <SelectStatement> select_clause select_with_parens simple_select values_clause table_clause simple_select_clause
+%type <SelectStatement> set_operation
 
 %type <empty> alter_using
 %type <Expr> alter_column_default
@@ -381,12 +604,12 @@ func (u *sqlSymUnion) cmpOp() ComparisonOperator {
 
 %type <ValidationBehavior> opt_validate_behavior
 
-%type <*StrVal> opt_template_clause opt_encoding_clause opt_lc_collate_clause opt_lc_ctype_clause
-
-%type <*StrVal> opt_password
+%type <str> opt_template_clause opt_encoding_clause opt_lc_collate_clause opt_lc_ctype_clause
+%type <*string> opt_password
 
 %type <IsolationLevel> transaction_iso_level
 %type <UserPriority>  transaction_user_priority
+%type <ReadWriteMode> transaction_read_mode
 
 %type <str>   name opt_name opt_name_parens opt_to_savepoint
 %type <str>   savepoint_name
@@ -406,7 +629,7 @@ func (u *sqlSymUnion) cmpOp() ComparisonOperator {
 
 %type <IsolationLevel> iso_level
 %type <UserPriority> user_priority
-%type <empty> opt_encoding
+%type <empty> opt_default
 
 %type <TableDefs> opt_table_elem_list table_elem_list
 %type <*InterleaveDef> opt_interleave
@@ -429,14 +652,14 @@ func (u *sqlSymUnion) cmpOp() ComparisonOperator {
 %type <SelectExprs> target_list
 %type <UpdateExprs> set_clause_list
 %type <*UpdateExpr> set_clause multiple_set_clause
-%type <UnresolvedName> indirection opt_indirection
+%type <ArraySubscripts> array_subscripts
 %type <UnresolvedName> qname_indirection
 %type <NamePart> name_indirection_elem
 %type <Exprs> ctext_expr_list ctext_row
 %type <GroupBy> group_clause
 %type <*Limit> select_limit
 %type <TableNameReferences> relation_expr_list
-%type <ReturningExprs> returning_clause
+%type <ReturningClause> returning_clause
 
 %type <bool> all_or_distinct
 %type <empty> join_outer
@@ -449,7 +672,7 @@ func (u *sqlSymUnion) cmpOp() ComparisonOperator {
 %type <Exprs> substr_list
 %type <Exprs> trim_list
 %type <Exprs> execute_param_clause
-%type <empty> opt_interval interval_second
+%type <durationField> opt_interval interval_second
 %type <Expr> overlay_placing
 
 %type <bool> opt_unique opt_column
@@ -458,15 +681,16 @@ func (u *sqlSymUnion) cmpOp() ComparisonOperator {
 
 %type <*Limit> limit_clause offset_clause
 %type <Expr>  select_limit_value
-// %type <empty> opt_select_fetch_first_value
+%type <Expr> opt_select_fetch_first_value
 %type <empty> row_or_rows
-// %type <empty> first_or_next
+%type <empty> first_or_next
 
 %type <Statement>  insert_rest
 %type <NameList> opt_conf_expr
 %type <*OnConflict> on_conflict
 
-%type <Statement>  generic_set set_rest set_rest_more transaction_mode_list opt_transaction_mode_list set_exprs_internal
+%type <Statement>  begin_transaction
+%type <TransactionModes> transaction_mode_list transaction_mode
 
 %type <NameList> opt_storing
 %type <*ColumnTableDef> column_def
@@ -474,7 +698,7 @@ func (u *sqlSymUnion) cmpOp() ComparisonOperator {
 %type <Expr>  where_clause
 %type <NamePart> glob_indirection
 %type <NamePart> name_indirection
-%type <NamePart> indirection_elem
+%type <*ArraySubscript> array_subscript
 %type <Expr> opt_slice_bound
 %type <*IndexHints> opt_index_hints
 %type <*IndexHints> index_hints_param
@@ -484,6 +708,7 @@ func (u *sqlSymUnion) cmpOp() ComparisonOperator {
 %type <Expr>  in_expr
 %type <Expr>  having_clause
 %type <Expr>  array_expr
+%type <Expr>  interval
 %type <[]ColumnType> type_list prep_type_clause
 %type <Exprs> array_expr_list
 %type <Expr>  row explicit_row implicit_row
@@ -527,9 +752,11 @@ func (u *sqlSymUnion) cmpOp() ComparisonOperator {
 %type <UnresolvedName> var_name
 %type <str>   unrestricted_name type_function_name
 %type <str>   non_reserved_word
-%type <Expr>  non_reserved_word_or_sconst
+%type <str>   non_reserved_word_or_sconst
 %type <Expr>  var_value
 %type <Expr>  zone_value
+%type <Expr> string_or_placeholder
+%type <Expr> string_or_placeholder_list
 
 %type <str>   unreserved_keyword type_func_name_keyword
 %type <str>   col_name_keyword reserved_keyword
@@ -549,131 +776,20 @@ func (u *sqlSymUnion) cmpOp() ComparisonOperator {
 %type <empty> cte_list
 
 %type <empty> within_group_clause
-%type <empty> filter_clause
+%type <Expr> filter_clause
 %type <Exprs> opt_partition_clause
 %type <Window> window_clause window_definition_list
 %type <*WindowDef> window_definition over_clause window_specification
 %type <str> opt_existing_window_name
 %type <empty> opt_frame_clause frame_extent frame_bound
 
-%type <TargetList>    privilege_target
+%type <[]ColumnID> opt_tableref_col_list tableref_col_list
+
+%type <TargetList>    targets
 %type <*TargetList> on_privilege_target_clause
 %type <NameList>       grantee_list for_grantee_clause
 %type <privilege.List> privileges privilege_list
 %type <privilege.Kind> privilege
-
-// Non-keyword token types. These are hard-wired into the "flex" lexer. They
-// must be listed first so that their numeric codes do not depend on the set of
-// keywords. PL/pgsql depends on this so that it can share the same lexer. If
-// you add/change tokens here, fix PL/pgsql to match!
-//
-// DOT_DOT is unused in the core SQL grammar, and so will always provoke parse
-// errors. It is needed by PL/pgsql.
-%token <str>   IDENT SCONST BCONST
-%token <*NumVal> ICONST FCONST
-%token <str>   PLACEHOLDER
-%token <str>   TYPECAST TYPEANNOTATE DOT_DOT
-%token <str>   LESS_EQUALS GREATER_EQUALS NOT_EQUALS
-%token <str>   NOT_REGMATCH REGIMATCH NOT_REGIMATCH
-%token <str>   ERROR
-
-// If you want to make any keyword changes, update the keyword table in
-// src/include/parser/kwlist.h and add new keywords to the appropriate one of
-// the reserved-or-not-so-reserved keyword lists, below; search this file for
-// "Keyword category lists".
-
-// Ordinary key words in alphabetical order.
-%token <str>   ACTION ADD
-%token <str>   ALL ALTER ANALYSE ANALYZE AND ANY ANNOTATE_TYPE ARRAY AS ASC
-%token <str>   ASYMMETRIC AT
-
-%token <str>   BACKUP BEGIN BETWEEN BIGINT BIGSERIAL BIT
-%token <str>   BLOB BOOL BOOLEAN BOTH BY BYTEA BYTES
-
-%token <str>   CASCADE CASE CAST CHAR
-%token <str>   CHARACTER CHARACTERISTICS CHECK
-%token <str>   COALESCE COLLATE COLLATION COLUMN COLUMNS COMMIT
-%token <str>   COMMITTED CONCAT CONFLICT CONSTRAINT CONSTRAINTS
-%token <str>   COPY COVERING CREATE
-%token <str>   CROSS CUBE CURRENT CURRENT_CATALOG CURRENT_DATE
-%token <str>   CURRENT_ROLE CURRENT_TIME CURRENT_TIMESTAMP
-%token <str>   CURRENT_USER CYCLE
-
-%token <str>   DATA DATABASE DATABASES DATE DAY DEC DECIMAL DEFAULT
-%token <str>   DEALLOCATE DEFERRABLE DELETE DESC
-%token <str>   DISTINCT DO DOUBLE DROP
-
-%token <str>   ELSE ENCODING END ESCAPE EXCEPT
-%token <str>   EXISTS EXECUTE EXPLAIN EXTRACT EXTRACT_DURATION
-
-%token <str>   FALSE FAMILY FETCH FILTER FIRST FLOAT FLOORDIV FOLLOWING FOR
-%token <str>   FORCE_INDEX FOREIGN FROM FULL
-
-%token <str>   GRANT GRANTS GREATEST GROUP GROUPING
-
-%token <str>   HAVING HELP HIGH HOUR
-
-%token <str>   INCREMENTAL IF IFNULL ILIKE IN INTERLEAVE
-%token <str>   INDEX INDEXES INITIALLY
-%token <str>   INNER INSERT INT INT8 INT64 INTEGER
-%token <str>   INTERSECT INTERVAL INTO IS ISOLATION
-
-%token <str>   JOIN
-
-%token <str>   KEY KEYS
-
-%token <str>   LATERAL LC_CTYPE LC_COLLATE
-%token <str>   LEADING LEAST LEFT LEVEL LIKE LIMIT LOCAL
-%token <str>   LOCALTIME LOCALTIMESTAMP LOW LSHIFT
-
-%token <str>   MATCH MINUTE MONTH
-
-%token <str>   NAME NAMES NATURAL NEXT NO NO_INDEX_JOIN NORMAL
-%token <str>   NOT NOTHING NULL NULLIF
-%token <str>   NULLS NUMERIC
-
-%token <str>   OF OFF OFFSET OID ON ONLY OR
-%token <str>   ORDER ORDINALITY OUT OUTER OVER OVERLAPS OVERLAY
-
-%token <str>   PARENT PARTIAL PARTITION PASSWORD PLACING POSITION
-%token <str>   PRECEDING PRECISION PREPARE PRIMARY PRIORITY
-
-%token <str>   RANGE READ REAL RECURSIVE REF REFERENCES
-%token <str>   REGCLASS REGPROC REGPROCEDURE REGNAMESPACE REGTYPE
-%token <str>   RENAME REPEATABLE
-%token <str>   RELEASE RESTORE RESTRICT RETURNING REVOKE RIGHT ROLLBACK ROLLUP
-%token <str>   ROW ROWS RSHIFT
-
-%token <str>   STATUS SAVEPOINT SEARCH SECOND SELECT
-%token <str>   SERIAL SERIALIZABLE SESSION SESSION_USER SET SHOW
-%token <str>   SIMILAR SIMPLE SMALLINT SMALLSERIAL SNAPSHOT SOME SPLIT SQL
-%token <str>   START STDIN STRICT STRING STORING SUBSTRING
-%token <str>   SYMMETRIC SYSTEM
-
-%token <str>   TABLE TABLES TEMPLATE TEXT THEN
-%token <str>   TIME TIMESTAMP TIMESTAMPTZ TO TRAILING TRANSACTION TREAT TRIM TRUE
-%token <str>   TRUNCATE TYPE
-
-%token <str>   UNBOUNDED UNCOMMITTED UNION UNIQUE UNKNOWN
-%token <str>   UPDATE UPSERT USER USERS USING
-
-%token <str>   VALID VALIDATE VALUE VALUES VARCHAR VARIADIC VIEW VARYING
-
-%token <str>   WHEN WHERE WINDOW WITH WITHIN WITHOUT
-
-%token <str>   YEAR
-
-%token <str>   ZONE
-
-// The grammar thinks these are keywords, but they are not in the kwlist.h list
-// and so can never be entered directly. The filter in parser.c creates these
-// tokens when required (based on looking one token ahead).
-//
-// NOT_LA exists so that productions such as NOT LIKE can be given the same
-// precedence as LIKE; otherwise they'd effectively have the same precedence as
-// NOT, at least with respect to their left-hand subexpression. WITH_LA is
-// needed to make the grammar LALR(1).
-%token     NOT_LA WITH_LA AS_LA
 
 // Precedence: lowest to highest
 %nonassoc  VALUES              // see value_clause
@@ -685,7 +801,7 @@ func (u *sqlSymUnion) cmpOp() ComparisonOperator {
 %right     NOT
 %nonassoc  IS                  // IS sets precedence for IS NULL, etc
 %nonassoc  '<' '>' '=' LESS_EQUALS GREATER_EQUALS NOT_EQUALS
-%nonassoc  BETWEEN IN LIKE ILIKE SIMILAR NOT_REGMATCH REGIMATCH NOT_REGIMATCH NOT_LA
+%nonassoc  '~' BETWEEN IN LIKE ILIKE SIMILAR NOT_REGMATCH REGIMATCH NOT_REGIMATCH NOT_LA
 %nonassoc  ESCAPE              // ESCAPE must be just above LIKE/ILIKE/SIMILAR
 %nonassoc  OVERLAPS
 %left      POSTFIXOP           // dummy for postfix OP rules
@@ -716,16 +832,16 @@ func (u *sqlSymUnion) cmpOp() ComparisonOperator {
 %nonassoc  IDENT NULL PARTITION RANGE ROWS PRECEDING FOLLOWING CUBE ROLLUP
 %left      CONCAT       // multi-character ops
 %left      '|'
-%left      '^' '#'
+%left      '#'
 %left      '&'
 %left      LSHIFT RSHIFT
 %left      '+' '-'
 %left      '*' '/' FLOORDIV '%'
+%left      '^'
 // Unary Operators
 %left      AT                // sets precedence for AT TIME ZONE
 %left      COLLATE
 %right     UMINUS
-%left      '~'
 %left      '[' ']'
 %left      '(' ')'
 %left      TYPEANNOTATE
@@ -737,6 +853,7 @@ func (u *sqlSymUnion) cmpOp() ComparisonOperator {
 // They wouldn't be given a precedence at all, were it not that we need
 // left-associativity among the JOIN rules themselves.
 %left      JOIN CROSS LEFT FULL RIGHT INNER NATURAL
+%right     HELPTOKEN
 
 %%
 
@@ -763,39 +880,132 @@ stmt_list:
   }
 
 stmt:
-  alter_table_stmt
-| backup_stmt
+  alter_stmt      // help texts in sub-rule
+| backup_stmt     // EXTEND WITH HELP: BACKUP
+| cancel_stmt     // help texts in sub-rule
 | copy_from_stmt
-| create_stmt
-| delete_stmt
-| drop_stmt
-| explain_stmt
+| create_stmt     // help texts in sub-rule
+| deallocate_stmt // EXTEND WITH HELP: DEALLOCATE
+| delete_stmt     // EXTEND WITH HELP: DELETE
+| discard_stmt    // EXTEND WITH HELP: DISCARD
+| drop_stmt       // help texts in sub-rule
+| execute_stmt    // EXTEND WITH HELP: EXECUTE
+| explain_stmt    // EXTEND WITH HELP: EXPLAIN
+| grant_stmt      // EXTEND WITH HELP: GRANT
 | help_stmt
-| prepare_stmt
-| execute_stmt
-| deallocate_stmt
-| grant_stmt
-| insert_stmt
-| rename_stmt
-| revoke_stmt
-| savepoint_stmt
-| select_stmt
+| insert_stmt     // EXTEND WITH HELP: INSERT
+| import_stmt     // EXTEND WITH HELP: IMPORT
+| pause_stmt      // EXTEND WITH HELP: PAUSE JOB
+| prepare_stmt    // EXTEND WITH HELP: PREPARE
+| restore_stmt    // EXTEND WITH HELP: RESTORE
+| resume_stmt     // EXTEND WITH HELP: RESUME JOB
+| revoke_stmt     // EXTEND WITH HELP: REVOKE
+| savepoint_stmt  // EXTEND WITH HELP: SAVEPOINT
+| select_stmt     // help texts in sub-rule
   {
     $$.val = $1.slct()
   }
-| set_stmt
-| show_stmt
-| split_stmt
-| transaction_stmt
-| release_stmt
-| truncate_stmt
-| update_stmt
+| release_stmt     // EXTEND WITH HELP: RELEASE
+| reset_stmt       // EXTEND WITH HELP: RESET
+| set_stmt         // help texts in sub-rule
+| show_stmt        // help texts in sub-rule
+| transaction_stmt // help texts in sub-rule
+| truncate_stmt    // EXTEND WITH HELP: TRUNCATE
+| update_stmt      // EXTEND WITH HELP: UPDATE
+| upsert_stmt      // EXTEND WITH HELP: UPSERT
 | /* EMPTY */
   {
     $$.val = Statement(nil)
   }
 
+// %Help: ALTER
+// %Category: Group
+// %Text: ALTER TABLE, ALTER INDEX, ALTER VIEW, ALTER DATABASE
+alter_stmt:
+  alter_table_stmt    // EXTEND WITH HELP: ALTER TABLE
+| alter_index_stmt    // EXTEND WITH HELP: ALTER INDEX
+| alter_view_stmt     // EXTEND WITH HELP: ALTER VIEW
+| alter_database_stmt // EXTEND WITH HELP: ALTER DATABASE
+| ALTER error         // SHOW HELP: ALTER
+
+// %Help: ALTER TABLE - change the definition of a table
+// %Category: DDL
+// %Text:
+// ALTER TABLE [IF EXISTS] <tablename> <command> [, ...]
+//
+// Commands:
+//   ALTER TABLE ... ADD [COLUMN] [IF NOT EXISTS] <colname> <type> [<qualifiers...>]
+//   ALTER TABLE ... ADD <constraint>
+//   ALTER TABLE ... DROP [COLUMN] [IF EXISTS] <colname> [RESTRICT | CASCADE]
+//   ALTER TABLE ... DROP CONSTRAINT [IF EXISTS] <constraintname> [RESTRICT | CASCADE]
+//   ALTER TABLE ... ALTER [COLUMN] <colname> {SET DEFAULT <expr> | DROP DEFAULT}
+//   ALTER TABLE ... ALTER [COLUMN] <colname> DROP NOT NULL
+//   ALTER TABLE ... RENAME TO <newname>
+//   ALTER TABLE ... RENAME [COLUMN] <colname> TO <newname>
+//   ALTER TABLE ... VALIDATE CONSTRAINT <constraintname>
+//   ALTER TABLE ... SPLIT AT <selectclause>
+//   ALTER TABLE ... SCATTER [ FROM ( <exprs...> ) TO ( <exprs...> ) ]
+//
+// Column qualifiers:
+//   [CONSTRAINT <constraintname>] {NULL | NOT NULL | UNIQUE | PRIMARY KEY | CHECK (<expr>) | DEFAULT <expr>}
+//   FAMILY <familyname>, CREATE [IF NOT EXISTS] FAMILY [<familyname>]
+//   REFERENCES <tablename> [( <colnames...> )]
+//   COLLATE <collationname>
+//
+// %SeeAlso: https://www.cockroachlabs.com/docs/alter-table.html
 alter_table_stmt:
+  alter_onetable_stmt
+| alter_split_stmt
+| alter_testing_relocate_stmt
+| alter_scatter_stmt
+| alter_rename_table_stmt
+// ALTER TABLE has its error help token here because the ALTER TABLE
+// prefix is spread over multiple non-terminals.
+| ALTER TABLE error // SHOW HELP: ALTER TABLE
+
+// %Help: ALTER VIEW - change the definition of a view
+// %Category: DDL
+// %Text:
+// ALTER VIEW [IF EXISTS] <name> RENAME TO <newname>
+// %SeeAlso: https://www.cockroachlabs.com/docs/alter-view.html
+alter_view_stmt:
+  alter_rename_view_stmt
+// ALTER VIEW has its error help token here because the ALTER VIEW
+// prefix is spread over multiple non-terminals.
+| ALTER VIEW error // SHOW HELP: ALTER VIEW
+
+// %Help: ALTER DATABASE - change the definition of a database
+// %Category: DDL
+// %Text:
+// ALTER DATABASE <name> RENAME TO <newname>
+// %SeeAlso: https://www.cockroachlabs.com/docs/alter-database.html
+alter_database_stmt:
+  alter_rename_database_stmt
+// ALTER DATABASE has its error help token here because the ALTER DATABASE
+// prefix is spread over multiple non-terminals.
+| ALTER DATABASE error // SHOW HELP: ALTER DATABASE
+
+// %Help: ALTER INDEX - change the definition of an index
+// %Category: DDL
+// %Text:
+// ALTER INDEX [IF EXISTS] <idxname> <command>
+//
+// Commands:
+//   ALTER INDEX ... RENAME TO <newname>
+//   ALTER INDEX ... SPLIT AT <selectclause>
+//   ALTER INDEX ... SCATTER [ FROM ( <exprs...> ) TO ( <exprs...> ) ]
+//
+// %SeeAlso: https://www.cockroachlabs.com/docs/alter-index.html
+alter_index_stmt:
+  alter_split_index_stmt
+| alter_testing_relocate_index_stmt
+| alter_scatter_index_stmt
+| alter_rename_index_stmt
+// ALTER INDEX has its error help token here because the ALTER INDEX
+// prefix is spread over multiple non-terminals.
+| ALTER INDEX error // SHOW HELP: ALTER INDEX
+
+alter_onetable_stmt:
   ALTER TABLE relation_expr alter_table_cmds
   {
     $$.val = &AlterTable{Table: $3.normalizableTableName(), IfExists: false, Cmds: $4.alterTableCmds()}
@@ -803,6 +1013,58 @@ alter_table_stmt:
 | ALTER TABLE IF EXISTS relation_expr alter_table_cmds
   {
     $$.val = &AlterTable{Table: $5.normalizableTableName(), IfExists: true, Cmds: $6.alterTableCmds()}
+  }
+
+alter_split_stmt:
+  ALTER TABLE qualified_name SPLIT AT select_stmt
+  {
+    /* SKIP DOC */
+    $$.val = &Split{Table: $3.newNormalizableTableName(), Rows: $6.slct()}
+  }
+
+alter_split_index_stmt:
+  ALTER INDEX table_name_with_index SPLIT AT select_stmt
+  {
+    /* SKIP DOC */
+    $$.val = &Split{Index: $3.tableWithIdx(), Rows: $6.slct()}
+  }
+
+alter_testing_relocate_stmt:
+  ALTER TABLE qualified_name TESTING_RELOCATE select_stmt
+  {
+    /* SKIP DOC */
+    $$.val = &TestingRelocate{Table: $3.newNormalizableTableName(), Rows: $5.slct()}
+  }
+
+alter_testing_relocate_index_stmt:
+  ALTER INDEX table_name_with_index TESTING_RELOCATE select_stmt
+  {
+    /* SKIP DOC */
+    $$.val = &TestingRelocate{Index: $3.tableWithIdx(), Rows: $5.slct()}
+  }
+
+alter_scatter_stmt:
+  ALTER TABLE qualified_name SCATTER
+  {
+    /* SKIP DOC */
+    $$.val = &Scatter{Table: $3.newNormalizableTableName()}
+  }
+| ALTER TABLE qualified_name SCATTER FROM '(' expr_list ')' TO '(' expr_list ')'
+  {
+    /* SKIP DOC */
+    $$.val = &Scatter{Table: $3.newNormalizableTableName(), From: $7.exprs(), To: $11.exprs()}
+  }
+
+alter_scatter_index_stmt:
+  ALTER INDEX table_name_with_index SCATTER
+  {
+    /* SKIP DOC */
+    $$.val = &Scatter{Index: $3.tableWithIdx()}
+  }
+| ALTER INDEX table_name_with_index SCATTER FROM '(' expr_list ')' TO '(' expr_list ')'
+  {
+    /* SKIP DOC */
+    $$.val = &Scatter{Index: $3.tableWithIdx(), From: $7.exprs(), To: $11.exprs()}
   }
 
 alter_table_cmds:
@@ -847,7 +1109,7 @@ alter_table_cmd:
     $$.val = &AlterTableDropNotNull{columnKeyword: $2.bool(), Column: Name($3)}
   }
   // ALTER TABLE <name> ALTER [COLUMN] <colname> SET NOT NULL
-| ALTER opt_column name SET NOT NULL { return unimplemented(sqllex) }
+| ALTER opt_column name SET NOT NULL { return unimplemented(sqllex, "alter set non null") }
   // ALTER TABLE <name> DROP [COLUMN] IF EXISTS <colname> [RESTRICT|CASCADE]
 | DROP opt_column IF EXISTS name opt_drop_behavior
   {
@@ -870,7 +1132,7 @@ alter_table_cmd:
   }
   // ALTER TABLE <name> ALTER [COLUMN] <colname> [SET DATA] TYPE <typename>
   //     [ USING <expression> ]
-| ALTER opt_column name opt_set_data TYPE typename opt_collate_clause alter_using { return unimplemented(sqllex) }
+| ALTER opt_column name opt_set_data TYPE typename opt_collate_clause alter_using { return unimplemented(sqllex, "alter set type") }
   // ALTER TABLE <name> ADD CONSTRAINT ...
 | ADD table_constraint opt_validate_behavior
   {
@@ -880,7 +1142,7 @@ alter_table_cmd:
     }
   }
   // ALTER TABLE <name> ALTER CONSTRAINT ...
-| ALTER CONSTRAINT name { return unimplemented(sqllex) }
+| ALTER CONSTRAINT name { return unimplemented(sqllex, "alter constraint") }
   // ALTER TABLE <name> VALIDATE CONSTRAINT ...
 | VALIDATE CONSTRAINT name
   {
@@ -942,33 +1204,174 @@ opt_validate_behavior:
   }
 
 opt_collate_clause:
-  COLLATE any_name { return unimplementedWithIssue(sqllex, 2473) }
+  COLLATE unrestricted_name { return unimplementedWithIssue(sqllex, 9851) }
 | /* EMPTY */ {}
 
 alter_using:
-  USING a_expr { return unimplemented(sqllex) }
+  USING a_expr { return unimplemented(sqllex, "alter using") }
 | /* EMPTY */ {}
 
-/* TODO(dan): backup/restore all databases, only certain tables, etc */
+// %Help: BACKUP - back up data to external storage
+// %Category: CCL
+// %Text:
+// BACKUP <targets...> TO <location...>
+//        [ AS OF SYSTEM TIME <expr> ]
+//        [ INCREMENTAL FROM <location...> ]
+//        [ WITH <option> [= <value>] [, ...] ]
+//
+// Targets:
+//    TABLE <pattern> [, ...]
+//    DATABASE <databasename> [, ...]
+//
+// Location:
+//    "[scheme]://[host]/[path to backup]?[parameters]"
+//
+// Options:
+//    INTO_DB
+//    SKIP_MISSING_FOREIGN_KEYS
+//
+// %SeeAlso: RESTORE, https://www.cockroachlabs.com/docs/backup.html
 backup_stmt:
-  BACKUP DATABASE name TO SCONST opt_incremental
+  BACKUP targets TO string_or_placeholder opt_as_of_clause opt_incremental opt_with_options
   {
-    /* SKIP DOC */
-    $$.val = &Backup{Database: Name($3), To: &StrVal{s: $5}, IncrementalFrom: $6.strVal()}
+    $$.val = &Backup{Targets: $2.targetList(), To: $4.expr(), IncrementalFrom: $6.exprs(), AsOf: $5.asOfClause(), Options: $7.kvOptions()}
   }
-| RESTORE DATABASE name FROM SCONST
+| BACKUP error // SHOW HELP: BACKUP
+
+// %Help: RESTORE - restore data from external storage
+// %Category: CCL
+// %Text:
+// RESTORE <targets...> FROM <location...>
+//         [ AS OF SYSTEM TIME <expr> ]
+//         [ WITH <option> [= <value>] [, ...] ]
+//
+// Targets:
+//    TABLE <pattern> [, ...]
+//    DATABASE <databasename> [, ...]
+//
+// Locations:
+//    "[scheme]://[host]/[path to backup]?[parameters]"
+//
+// Options:
+//    INTO_DB
+//    SKIP_MISSING_FOREIGN_KEYS
+//
+// %SeeAlso: BACKUP, https://www.cockroachlabs.com/docs/restore.html
+restore_stmt:
+  RESTORE targets FROM string_or_placeholder_list opt_as_of_clause opt_with_options
+  {
+    $$.val = &Restore{Targets: $2.targetList(), From: $4.exprs(), AsOf: $5.asOfClause(), Options: $6.kvOptions()}
+  }
+| RESTORE error // SHOW HELP: RESTORE
+
+import_data_format:
+  CSV
+  {
+    $$ = "CSV"
+  }
+
+// %Help: IMPORT - load data from file in a distributed manner
+// %Category: CCL
+// %Text:
+// IMPORT TABLE <tablename>
+//        { ( <elements> ) | CREATE USING <schemafile> }
+//        <format>
+//        DATA ( <datafile> [, ...] )
+//        [ WITH <option> [= <value>] [, ...] ]
+//
+// Formats:
+//    CSV
+//
+// Options:
+//    distributed = '...'
+//    sstsize = '...'
+//    temp = '...'
+//    comma = '...'          [CSV-specific]
+//    comment = '...'        [CSV-specific]
+//    nullif = '...'         [CSV-specific]
+//
+// %SeeAlso: CREATE TABLE
+import_stmt:
+  IMPORT TABLE any_name CREATE USING string_or_placeholder import_data_format DATA '(' string_or_placeholder_list ')' opt_with_options
   {
     /* SKIP DOC */
-    $$.val = &Restore{Database: Name($3), From: &StrVal{s: $5}}
+    $$.val = &Import{Table: $3.unresolvedName(), CreateFile: $6.expr(), FileFormat: $7, Files: $10.exprs(), Options: $12.kvOptions()}
+  }
+| IMPORT TABLE any_name '(' table_elem_list ')' import_data_format DATA '(' string_or_placeholder_list ')' opt_with_options
+  {
+    /* SKIP DOC */
+    $$.val = &Import{Table: $3.unresolvedName(), CreateDefs: $5.tblDefs(), FileFormat: $7, Files: $10.exprs(), Options: $12.kvOptions()}
+  }
+| IMPORT error // SHOW HELP: IMPORT
+
+string_or_placeholder:
+  non_reserved_word_or_sconst
+  {
+    $$.val = &StrVal{s: $1}
+  }
+| PLACEHOLDER
+  {
+    $$.val = NewPlaceholder($1)
+  }
+
+string_or_placeholder_list:
+  string_or_placeholder
+  {
+    $$.val = Exprs{$1.expr()}
+  }
+| string_or_placeholder_list ',' string_or_placeholder
+  {
+    $$.val = append($1.exprs(), $3.expr())
   }
 
 opt_incremental:
-  INCREMENTAL FROM SCONST
+  INCREMENTAL FROM string_or_placeholder_list
   {
-    $$.val = &StrVal{s: $3}
+    $$.val = $3.exprs()
+  }
+| /* EMPTY */
+  {
+    $$.val = Exprs(nil)
+  }
+
+kv_option:
+  name '=' string_or_placeholder
+  {
+    $$.val = KVOption{Key: Name($1), Value: $3.expr()}
+  }
+|  name
+  {
+    $$.val = KVOption{Key: Name($1)}
+  }
+|  SCONST '=' string_or_placeholder
+  {
+    $$.val = KVOption{Key: Name($1), Value: $3.expr()}
+  }
+|  SCONST
+  {
+    $$.val = KVOption{Key: Name($1)}
+  }
+
+kv_option_list:
+  kv_option
+  {
+    $$.val = []KVOption{$1.kvOption()}
+  }
+|  kv_option_list ',' kv_option
+  {
+    $$.val = append($1.kvOptions(), $3.kvOption())
+  }
+
+opt_with_options:
+  WITH kv_option_list
+  {
+    $$.val = $2.kvOptions()
+  }
+| WITH OPTIONS '(' kv_option_list ')'
+  {
+    $$.val = $4.kvOptions()
   }
 | /* EMPTY */ {}
-
 
 copy_from_stmt:
   COPY qualified_name FROM STDIN
@@ -984,33 +1387,126 @@ copy_from_stmt:
     $$.val = &CopyFrom{Table: $2.normalizableTableName(), Columns: $4.unresolvedNames(), Stdin: true}
   }
 
-// CREATE [DATABASE|INDEX|TABLE|TABLE AS|VIEW]
-create_stmt:
-  create_database_stmt
-| create_index_stmt
-| create_table_stmt
-| create_table_as_stmt
-| create_user_stmt
-| create_view_stmt
+// %Help: CANCEL
+// %Category: Group
+// %Text: CANCEL JOB, CANCEL QUERY
+cancel_stmt:
+  cancel_job_stmt   // EXTEND WITH HELP: CANCEL JOB
+| cancel_query_stmt // EXTEND WITH HELP: CANCEL QUERY
+| CANCEL error      // SHOW HELP: CANCEL
 
-// DELETE FROM query
+// %Help: CANCEL JOB - cancel a background job
+// %Category: Misc
+// %Text: CANCEL JOB <jobid>
+// %SeeAlso: SHOW JOBS, PAUSE JOBS, RESUME JOB
+cancel_job_stmt:
+  CANCEL JOB a_expr
+  {
+    /* SKIP DOC */
+    $$.val = &CancelJob{ID: $3.expr()}
+  }
+| CANCEL JOB error // SHOW HELP: CANCEL JOB
+
+// %Help: CANCEL QUERY - cancel a running query
+// %Category: Misc
+// %Text: CANCEL QUERY <queryid>
+// %SeeAlso: SHOW QUERIES
+cancel_query_stmt:
+  CANCEL QUERY a_expr
+  {
+    /* SKIP DOC */
+    $$.val = &CancelQuery{ID: $3.expr()}
+  }
+| CANCEL QUERY error // SHOW HELP: CANCEL QUERY
+
+// %Help: CREATE
+// %Category: Group
+// %Text:
+// CREATE DATABASE, CREATE TABLE, CREATE INDEX, CREATE TABLE AS,
+// CREATE USER, CREATE VIEW
+create_stmt:
+  create_database_stmt // EXTEND WITH HELP: CREATE DATABASE
+| create_index_stmt    // EXTEND WITH HELP: CREATE INDEX
+| create_table_stmt    // EXTEND WITH HELP: CREATE TABLE
+| create_table_as_stmt // EXTEND WITH HELP: CREATE TABLE
+// Error case for both CREATE TABLE and CREATE TABLE ... AS in one
+| CREATE TABLE error   // SHOW HELP: CREATE TABLE
+| create_user_stmt     // EXTEND WITH HELP: CREATE USER
+| create_view_stmt     // EXTEND WITH HELP: CREATE VIEW
+| CREATE error         // SHOW HELP: CREATE
+
+// %Help: DELETE - delete rows from a table
+// %Category: DML
+// %Text: DELETE FROM <tablename> [WHERE <expr>] [RETURNING <exprs...>]
+// %SeeAlso: https://www.cockroachlabs.com/docs/delete.html
 delete_stmt:
   opt_with_clause DELETE FROM relation_expr_opt_alias where_clause returning_clause
   {
-    $$.val = &Delete{Table: $4.tblExpr(), Where: newWhere(astWhere, $5.expr()), Returning: $6.retExprs()}
+    $$.val = &Delete{Table: $4.tblExpr(), Where: newWhere(astWhere, $5.expr()), Returning: $6.retClause()}
   }
+| opt_with_clause DELETE error // SHOW HELP: DELETE
 
-// DROP itemtype [ IF EXISTS ] itemname [, itemname ...] [ RESTRICT | CASCADE ]
+// %Help: DISCARD - reset the session to its initial state
+// %Category: Cfg
+// %Text: DISCARD ALL
+discard_stmt:
+  DISCARD ALL
+  {
+    $$.val = &Discard{Mode: DiscardModeAll}
+  }
+| DISCARD PLANS { return unimplemented(sqllex, "discard plans") }
+| DISCARD SEQUENCES { return unimplemented(sqllex, "discard sequences") }
+| DISCARD TEMP { return unimplemented(sqllex, "discard temp") }
+| DISCARD TEMPORARY { return unimplemented(sqllex, "discard temporary") }
+| DISCARD error // SHOW HELP: DISCARD
+
+// %Help: DROP
+// %Category: Group
+// %Text: DROP DATABASE, DROP INDEX, DROP TABLE, DROP VIEW, DROP USER
 drop_stmt:
-  DROP DATABASE name
+  drop_database_stmt // EXTEND WITH HELP: DROP DATABASE
+| drop_index_stmt    // EXTEND WITH HELP: DROP INDEX
+| drop_table_stmt    // EXTEND WITH HELP: DROP TABLE
+| drop_view_stmt     // EXTEND WITH HELP: DROP VIEW
+| drop_user_stmt     // EXTEND WITH HELP: DROP USER
+| DROP error         // SHOW HELP: DROP
+
+// %Help: DROP VIEW - remove a view
+// %Category: DDL
+// %Text: DROP VIEW [IF EXISTS] <tablename> [, ...] [CASCADE | RESTRICT]
+// %SeeAlso: https://www.cockroachlabs.com/docs/drop-index.html
+drop_view_stmt:
+  DROP VIEW table_name_list opt_drop_behavior
   {
-    $$.val = &DropDatabase{Name: Name($3), IfExists: false}
+    $$.val = &DropView{Names: $3.tableNameReferences(), IfExists: false, DropBehavior: $4.dropBehavior()}
   }
-| DROP DATABASE IF EXISTS name
+| DROP VIEW IF EXISTS table_name_list opt_drop_behavior
   {
-    $$.val = &DropDatabase{Name: Name($5), IfExists: true}
+    $$.val = &DropView{Names: $5.tableNameReferences(), IfExists: true, DropBehavior: $6.dropBehavior()}
   }
-| DROP INDEX table_name_with_index_list opt_drop_behavior
+| DROP VIEW error // SHOW HELP: DROP VIEW
+
+// %Help: DROP TABLE - remove a table
+// %Category: DDL
+// %Text: DROP TABLE [IF EXISTS] <tablename> [, ...] [CASCADE | RESTRICT]
+// %SeeAlso: https://www.cockroachlabs.com/docs/drop-table.html
+drop_table_stmt:
+  DROP TABLE table_name_list opt_drop_behavior
+  {
+    $$.val = &DropTable{Names: $3.tableNameReferences(), IfExists: false, DropBehavior: $4.dropBehavior()}
+  }
+| DROP TABLE IF EXISTS table_name_list opt_drop_behavior
+  {
+    $$.val = &DropTable{Names: $5.tableNameReferences(), IfExists: true, DropBehavior: $6.dropBehavior()}
+  }
+| DROP TABLE error // SHOW HELP: DROP TABLE
+
+// %Help: DROP INDEX - remove an index
+// %Category: DDL
+// %Text: DROP INDEX [IF EXISTS] <idxname> [, ...] [CASCADE | RESTRICT]
+// %SeeAlso: https://www.cockroachlabs.com/docs/drop-index.html
+drop_index_stmt:
+  DROP INDEX table_name_with_index_list opt_drop_behavior
   {
     $$.val = &DropIndex{
       IndexList: $3.tableWithIdxList(),
@@ -1026,22 +1522,37 @@ drop_stmt:
       DropBehavior: $6.dropBehavior(),
     }
   }
-| DROP TABLE table_name_list opt_drop_behavior
+| DROP INDEX error // SHOW HELP: DROP INDEX
+
+// %Help: DROP DATABASE - remove a database
+// %Category: DDL
+// %Text: DROP DATABASE [IF EXISTS] <databasename>
+// %SeeAlso: https://www.cockroachlabs.com/docs/drop-database.html
+drop_database_stmt:
+  DROP DATABASE name
   {
-    $$.val = &DropTable{Names: $3.tableNameReferences(), IfExists: false, DropBehavior: $4.dropBehavior()}
+    $$.val = &DropDatabase{Name: Name($3), IfExists: false}
   }
-| DROP TABLE IF EXISTS table_name_list opt_drop_behavior
+| DROP DATABASE IF EXISTS name
   {
-    $$.val = &DropTable{Names: $5.tableNameReferences(), IfExists: true, DropBehavior: $6.dropBehavior()}
+    $$.val = &DropDatabase{Name: Name($5), IfExists: true}
   }
-| DROP VIEW table_name_list opt_drop_behavior
+| DROP DATABASE error // SHOW HELP: DROP DATABASE
+
+// %Help: DROP USER - remove a user
+// %Category: Priv
+// %Text: DROP USER [IF EXISTS] <user> [, ...]
+// %SeeAlso: CREATE USER, SHOW USERS
+drop_user_stmt:
+  DROP USER name_list
   {
-    $$.val = &DropView{Names: $3.tableNameReferences(), IfExists: false, DropBehavior: $4.dropBehavior()}
+    $$.val = &DropUser{Names: $3.nameList(), IfExists: false}
   }
-| DROP VIEW IF EXISTS table_name_list opt_drop_behavior
+| DROP USER IF EXISTS name_list
   {
-    $$.val = &DropView{Names: $5.tableNameReferences(), IfExists: true, DropBehavior: $6.dropBehavior()}
+    $$.val = &DropUser{Names: $5.nameList(), IfExists: true}
   }
+| DROP USER error // SHOW HELP: DROP USER
 
 table_name_list:
   any_name
@@ -1073,32 +1584,55 @@ attrs:
     $$.val = append($1.unresolvedName(), Name($3))
   }
 
-// EXPLAIN (options) query
+// %Help: EXPLAIN - show the logical plan of a query
+// %Category: Misc
+// %Text:
+// EXPLAIN <statement>
+// EXPLAIN [( [PLAN ,] <planoptions...> )] <statement>
+//
+// Explainable statements:
+//     SELECT, CREATE, DROP, ALTER, INSERT, UPSERT, UPDATE, DELETE,
+//     SHOW, HELP, EXPLAIN, EXECUTE
+//
+// Plan options:
+//     TYPES, EXPRS, METADATA, QUALIFY, INDENT, VERBOSE, DIST_SQL
+//
+// %SeeAlso: https://www.cockroachlabs.com/docs/explain.html
 explain_stmt:
   EXPLAIN explainable_stmt
   {
     $$.val = &Explain{Statement: $2.stmt()}
   }
+| EXPLAIN error // SHOW HELP: EXPLAIN
 | EXPLAIN '(' explain_option_list ')' explainable_stmt
   {
     $$.val = &Explain{Options: $3.strs(), Statement: $5.stmt()}
   }
+// This second error rule is necessary, because otherwise
+// explainable_stmt also provides "selectclause := '(' error ..."  and
+// cause a help text for the select clause, which will be confusing in
+// the context of EXPLAIN.
+| EXPLAIN '(' error // SHOW HELP: EXPLAIN
 
-explainable_stmt:
-  select_stmt
+preparable_stmt:
+  select_stmt // help texts in sub-rule
   {
     $$.val = $1.slct()
   }
-| create_stmt
-| drop_stmt
-| alter_table_stmt
-| insert_stmt
-| update_stmt
-| delete_stmt
-| show_stmt
-| help_stmt
-| split_stmt
+| show_stmt   // help texts in sub-rule
+| delete_stmt // EXTEND WITH HELP: DELETE
+| insert_stmt // EXTEND WITH HELP: INSERT
+| update_stmt // EXTEND WITH HELP: UPDATE
+| upsert_stmt // EXTEND WITH HELP: UPSERT
+
+explainable_stmt:
+  preparable_stmt
+| alter_stmt   // help texts in sub-rule
+| create_stmt  // help texts in sub-rule
+| drop_stmt    // help texts in sub-rule
+| execute_stmt // EXTEND WITH HELP: EXECUTE
 | explain_stmt { /* SKIP DOC */ }
+| help_stmt
 
 explain_option_list:
   explain_option_name
@@ -1113,7 +1647,10 @@ explain_option_list:
 explain_option_name:
   non_reserved_word
 
-// PREPARE <plan_name> [(args, ...)] AS <query>
+// %Help: PREPARE - prepare a statement for later execution
+// %Category: Misc
+// %Text: PREPARE <name> [ ( <types...> ) ] AS <query>
+// %SeeAlso: EXECUTE, DEALLOCATE, DISCARD
 prepare_stmt:
   PREPARE name prep_type_clause AS preparable_stmt
   {
@@ -1123,6 +1660,7 @@ prepare_stmt:
       Statement: $5.stmt(),
     }
   }
+| PREPARE error // SHOW HELP: PREPARE
 
 prep_type_clause:
   '(' type_list ')'
@@ -1134,17 +1672,11 @@ prep_type_clause:
     $$.val = []ColumnType(nil)
   }
 
-preparable_stmt:
-  select_stmt
-  {
-    $$.val = $1.slct()
-  }
-| insert_stmt
-| update_stmt
-| delete_stmt
-
+// %Help: EXECUTE - execute a statement prepared previously
+// %Category: Misc
+// %Text: EXECUTE <name> [ ( <exprs...> ) ]
+// %SeeAlso: PREPARE, DEALLOCATE, DISCARD
 execute_stmt:
-  // EXECUTE <plan_name> [(params, ...)]
   EXECUTE name execute_param_clause
   {
     $$.val = &Execute{
@@ -1152,7 +1684,8 @@ execute_stmt:
       Params: $3.exprs(),
     }
   }
-  // CREATE TABLE <name> AS EXECUTE <plan_name> [(params, ...)]
+| EXECUTE error // SHOW HELP: EXECUTE
+//   CREATE TABLE <name> AS EXECUTE <plan_name> [(params, ...)]
 // | CREATE opt_temp TABLE create_as_target AS EXECUTE name execute_param_clause opt_with_data { return unimplemented(sqllex) }
 
 execute_param_clause:
@@ -1165,19 +1698,18 @@ execute_param_clause:
     $$.val = Exprs(nil)
   }
 
-// DEALLOCATE [PREPARE] <plan_name>
+// %Help: DEALLOCATE - remove a prepared statement
+// %Category: Misc
+// %Text: DEALLOCATE [PREPARE] { <name> | ALL }
+// %SeeAlso: PREPARE, EXECUTE, DISCARD
 deallocate_stmt:
   DEALLOCATE name
   {
-    $$.val = &Deallocate{
-      Name: Name($2),
-    }
+    $$.val = &Deallocate{Name: Name($2)}
   }
 | DEALLOCATE PREPARE name
   {
-    $$.val = &Deallocate{
-      Name: Name($3),
-    }
+    $$.val = &Deallocate{Name: Name($3)}
   }
 | DEALLOCATE ALL
   {
@@ -1187,23 +1719,49 @@ deallocate_stmt:
   {
     $$.val = &Deallocate{}
   }
+| DEALLOCATE error // SHOW HELP: DEALLOCATE
 
-// GRANT privileges ON privilege_target TO grantee_list
+// %Help: GRANT - define access privileges
+// %Category: Priv
+// %Text:
+// GRANT {ALL | <privileges...> } ON <targets...> TO <grantees...>
+//
+// Privileges:
+//   CREATE, DROP, GRANT, SELECT, INSERT, DELETE, UPDATE
+//
+// Targets:
+//   DATABASE <databasename> [, ...]
+//   [TABLE] [<databasename> .] { <tablename> | * } [, ...]
+//
+// %SeeAlso: REVOKE, https://www.cockroachlabs.com/docs/grant.html
 grant_stmt:
-  GRANT privileges ON privilege_target TO grantee_list
+  GRANT privileges ON targets TO grantee_list
   {
     $$.val = &Grant{Privileges: $2.privilegeList(), Grantees: $6.nameList(), Targets: $4.targetList()}
   }
+| GRANT error // SHOW HELP: GRANT
 
-// REVOKE privileges ON privilege_target FROM grantee_list
+// %Help: REVOKE - remove access privileges
+// %Category: Priv
+// %Text:
+// REVOKE {ALL | <privileges...> } ON <targets...> FROM <grantees...>
+//
+// Privileges:
+//   CREATE, DROP, GRANT, SELECT, INSERT, DELETE, UPDATE
+//
+// Targets:
+//   DATABASE <databasename> [, <databasename>]...
+//   [TABLE] [<databasename> .] { <tablename> | * } [, ...]
+//
+// %SeeAlso: GRANT, https://www.cockroachlabs.com/docs/revoke.html
 revoke_stmt:
-  REVOKE privileges ON privilege_target FROM grantee_list
+  REVOKE privileges ON targets FROM grantee_list
   {
     $$.val = &Revoke{Privileges: $2.privilegeList(), Grantees: $6.nameList(), Targets: $4.targetList()}
   }
+| REVOKE error // SHOW HELP: REVOKE
 
-
-privilege_target:
+targets:
   table_pattern_list
   {
     $$.val = TargetList{Tables: $1.tablePatterns()}
@@ -1278,23 +1836,51 @@ grantee_list:
     $$.val = append($1.nameList(), Name($3))
   }
 
-// SET name TO 'var_value'
-// SET TIME ZONE 'var_value'
+// %Help: RESET - reset a session variable to its default value
+// %Category: Cfg
+// %Text: RESET [SESSION] <var>
+// %SeeAlso: https://www.cockroachlabs.com/docs/set-vars.html
+reset_stmt:
+  RESET session_var
+  {
+    $$.val = &Set{Name: UnresolvedName{Name($2)}, SetMode: SetModeReset}
+  }
+| RESET SESSION session_var
+  {
+    $$.val = &Set{Name: UnresolvedName{Name($3)}, SetMode: SetModeReset}
+  }
+| RESET error { return helpWith(sqllex, "RESET" ) }
+
+// USE is the MSSQL/MySQL equivalent of SET DATABASE. Alias it for convenience.
+use_stmt:
+  USE var_value
+  {
+    /* SKIP DOC */
+    $$.val = &Set{Name: UnresolvedName{Name("database")}, Values: Exprs{$2.expr()}}
+  }
+| USE error // SHOW HELP: SET SESSION
+
+// SET SESSION / SET CLUSTER SETTING / SET TRANSACTION
 set_stmt:
-  SET set_rest
+  set_session_stmt     // EXTEND WITH HELP: SET SESSION
+| set_csetting_stmt    // EXTEND WITH HELP: SET CLUSTER SETTING
+| set_transaction_stmt // EXTEND WITH HELP: SET TRANSACTION
+| set_exprs_internal   { /* SKIP DOC */ }
+| use_stmt             { /* SKIP DOC */ }
+| SET LOCAL error { return unimplemented(sqllex, "set local") }
+
+// %Help: SET CLUSTER SETTING - change a cluster setting
+// %Category: Cfg
+// %Text: SET CLUSTER SETTING <var> { TO | = } <value>
+// %SeeAlso: SHOW CLUSTER SETTING, SET SESSION,
+// https://www.cockroachlabs.com/docs/cluster-settings.html
+set_csetting_stmt:
+  SET CLUSTER SETTING generic_set
   {
-    $$.val = $2.stmt()
+    $$.val = $4.stmt()
+    $$.val.(*Set).SetMode = SetModeClusterSetting
   }
-| SET LOCAL set_rest { return unimplemented(sqllex) }
-| SET SESSION CHARACTERISTICS AS TRANSACTION transaction_iso_level
-  {
-    $$.val = &SetDefaultIsolation{Isolation: $6.isoLevel()}
-  }
-| SET SESSION set_rest
-  {
-    $$.val = $3.stmt()
-  }
-| set_exprs_internal { /* SKIP DOC */ }
+| SET CLUSTER error // SHOW HELP: SET CLUSTER SETTING
 
 set_exprs_internal:
   /* SET ROW serves to accelerate parser.parseExprs().
@@ -1304,37 +1890,52 @@ set_exprs_internal:
     $$.val = &Set{Values: $4.exprs()}
   }
 
-set_rest:
-  TRANSACTION transaction_mode_list
+// %Help: SET SESSION - change a session variable
+// %Category: Cfg
+// %Text:
+// SET [SESSION] <var> { TO | = } <values...>
+// SET [SESSION] TIME ZONE <tz>
+// SET [SESSION] CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL { SNAPSHOT | SERIALIZABLE }
+//
+// %SeeAlso: SHOW SESSION, RESET, DISCARD, SHOW, SET CLUSTER SETTING, SET TRANSACTION,
+// https://www.cockroachlabs.com/docs/set-vars.html
+set_session_stmt:
+  SET SESSION set_rest_more
+  {
+    $$.val = $3.stmt()
+  }
+| SET set_rest_more
   {
     $$.val = $2.stmt()
   }
-| set_rest_more
-
-transaction_mode_list:
-  transaction_iso_level
+// Special form for pg compatibility:
+| SET SESSION CHARACTERISTICS AS TRANSACTION transaction_iso_level
   {
-    $$.val = &SetTransaction{Isolation: $1.isoLevel(), UserPriority: UnspecifiedUserPriority}
-  }
-| transaction_user_priority
-  {
-    $$.val = &SetTransaction{Isolation: UnspecifiedIsolation, UserPriority: $1.userPriority()}
-  }
-| transaction_iso_level ',' transaction_user_priority
-  {
-    $$.val = &SetTransaction{Isolation: $1.isoLevel(), UserPriority: $3.userPriority()}
-  }
-| transaction_user_priority ',' transaction_iso_level
-  {
-    $$.val = &SetTransaction{Isolation: $3.isoLevel(), UserPriority: $1.userPriority()}
+    $$.val = &SetDefaultIsolation{Isolation: $6.isoLevel()}
   }
 
-
-transaction_user_priority:
-  PRIORITY user_priority
+// %Help: SET TRANSACTION - configure the transaction settings
+// %Category: Txn
+// %Text:
+// SET [SESSION] TRANSACTION <txnparameters...>
+//
+// Transaction parameters:
+//    ISOLATION LEVEL { SNAPSHOT | SERIALIZABLE }
+//    PRIORITY { LOW | NORMAL | HIGH }
+//
+// %SeeAlso: SHOW TRANSACTION, SET SESSION,
+// https://www.cockroachlabs.com/docs/set-transaction.html
+set_transaction_stmt:
+  SET TRANSACTION transaction_mode_list
   {
-    $$.val = $2.userPriority()
+    $$.val = &SetTransaction{Modes: $3.transactionModes()}
   }
+| SET TRANSACTION error // SHOW HELP: SET TRANSACTION
+| SET SESSION TRANSACTION transaction_mode_list
+  {
+    $$.val = &SetTransaction{Modes: $4.transactionModes()}
+  }
+| SET SESSION TRANSACTION error // SHOW HELP: SET TRANSACTION
 
 generic_set:
   var_name TO var_list
@@ -1355,15 +1956,37 @@ generic_set:
   }
 
 set_rest_more:
-  // Generic SET syntaxes:
-  generic_set
-| var_name FROM CURRENT { return unimplemented(sqllex) }
-  // Special syntaxes mandated by SQL standard:
+// Generic SET syntaxes:
+   generic_set
+// Special syntaxes mandated by SQL standard:
 | TIME ZONE zone_value
   {
-    $$.val = &SetTimeZone{Value: $3.expr()}
+    /* SKIP DOC */
+    $$.val = &Set{Name: UnresolvedName{Name("time zone")}, Values: Exprs{$3.expr()}}
   }
-| NAMES opt_encoding { return unimplemented(sqllex) }
+| var_name FROM CURRENT { return unimplemented(sqllex, "set from current") }
+| set_names
+| error // SHOW HELP: SET SESSION
+
+// SET NAMES is the SQL standard syntax for SET client_encoding.
+// See https://www.postgresql.org/docs/9.6/static/multibyte.html#AEN39236
+set_names:
+  NAMES var_value
+  {
+    /* SKIP DOC */
+    $$.val = &Set{Name: UnresolvedName{Name("client_encoding")}, Values: Exprs{$2.expr()}}
+  }
+| NAMES opt_default
+  {
+    /* SKIP DOC */
+    $$.val = &Set{Name: UnresolvedName{Name("client_encoding")}, SetMode: SetModeReset}
+  }
+
+opt_default:
+  DEFAULT
+  { }
+| /* EMPTY */
+  { }
 
 var_name:
   any_name
@@ -1439,6 +2062,9 @@ opt_boolean_or_string:
   // non_reserved_word rule. The action for booleans and strings is the same,
   // so we don't need to distinguish them here.
 | non_reserved_word_or_sconst
+  {
+    $$.val = &StrVal{s: $1}
+  }
 
 // Timezone values can be:
 // - a string such as 'pst8pdt'
@@ -1454,14 +2080,9 @@ zone_value:
   {
     $$.val = &StrVal{s: $1}
   }
-| const_interval SCONST opt_interval
+| interval
   {
-    d, err := ParseDInterval($2)
-    if err != nil {
-      sqllex.Error(err.Error())
-      return 1
-    }
-    $$.val = d
+    $$.val = $1.expr()
   }
 | numeric_only
 | DEFAULT
@@ -1473,67 +2094,244 @@ zone_value:
     $$.val = &StrVal{s: $1}
   }
 
-opt_encoding:
-  SCONST { return unimplemented(sqllex) }
-| DEFAULT { return unimplemented(sqllex) }
-| /* EMPTY */ {}
-
 non_reserved_word_or_sconst:
   non_reserved_word
-  {
-    $$.val = &StrVal{s: $1}
-  }
 | SCONST
-  {
-    $$.val = &StrVal{s: $1}
-  }
 
+// %Help: SHOW
+// %Category: Group
+// %Text:
+// SHOW SESSION, SHOW CLUSTER SETTING, SHOW DATABASES, SHOW TABLES, SHOW COLUMNS, SHOW INDEXES,
+// SHOW CONSTRAINTS, SHOW CREATE TABLE, SHOW CREATE VIEW, SHOW USERS, SHOW TRANSACTION, SHOW BACKUP,
+// SHOW JOBS, SHOW QUERIES, SHOW SESSIONS, SHOW TRACE
 show_stmt:
-  SHOW IDENT
+  show_backup_stmt       // EXTEND WITH HELP: SHOW BACKUP
+| show_columns_stmt      // EXTEND WITH HELP: SHOW COLUMNS
+| show_constraints_stmt  // EXTEND WITH HELP: SHOW CONSTRAINTS
+| show_create_table_stmt // EXTEND WITH HELP: SHOW CREATE TABLE
+| show_create_view_stmt  // EXTEND WITH HELP: SHOW CREATE VIEW
+| show_csettings_stmt    // EXTEND WITH HELP: SHOW CLUSTER SETTING
+| show_databases_stmt    // EXTEND WITH HELP: SHOW DATABASES
+| show_grants_stmt       // EXTEND WITH HELP: SHOW GRANTS
+| show_indexes_stmt      // EXTEND WITH HELP: SHOW INDEXES
+| show_jobs_stmt         // EXTEND WITH HELP: SHOW JOBS
+| show_queries_stmt      // EXTEND WITH HELP: SHOW QUERIES
+| show_session_stmt      // EXTEND WITH HELP: SHOW SESSION
+| show_sessions_stmt     // EXTEND WITH HELP: SHOW SESSIONS
+| show_tables_stmt       // EXTEND WITH HELP: SHOW TABLES
+| show_testing_stmt
+| show_trace_stmt        // EXTEND WITH HELP: SHOW TRACE
+| show_transaction_stmt  // EXTEND WITH HELP: SHOW TRANSACTION
+| show_users_stmt        // EXTEND WITH HELP: SHOW USERS
+| SHOW error             // SHOW HELP: SHOW
+
+// %Help: SHOW SESSION - display session variables
+// %Category: Cfg
+// %Text: SHOW [SESSION] { <var> | ALL }
+// %SeeAlso: https://www.cockroachlabs.com/docs/show-vars.html
+show_session_stmt:
+  SHOW session_var         { $$.val = &Show{Name: $2} }
+| SHOW SESSION session_var { $$.val = &Show{Name: $3} }
+| SHOW SESSION error // SHOW HELP: SHOW SESSION
+
+session_var:
+  IDENT
+// Although ALL, SESSION_USER and DATABASE are identifiers for the
+// purpose of SHOW, they lex as separate token types, so they need
+// separate rules.
+| ALL
+| DATABASE
+// SET NAMES is standard SQL for SET client_encoding.
+// See https://www.postgresql.org/docs/9.6/static/multibyte.html#AEN39236
+| NAMES { $$ = "client_encoding" }
+| SESSION_USER
+// TIME ZONE is special: it is two tokens, but is really the identifier "TIME ZONE".
+| TIME ZONE { $$ = "TIME ZONE" }
+| TIME error // SHOW HELP: SHOW SESSION
+
+// %Help: SHOW BACKUP - list backup contents
+// %Category: CCL
+// %Text: SHOW BACKUP <location>
+// %SeeAlso: https://www.cockroachlabs.com/docs/show-backup.html
+show_backup_stmt:
+  SHOW BACKUP string_or_placeholder
   {
-    $$.val = &Show{Name: $2}
+    $$.val = &ShowBackup{Path: $3.expr()}
   }
-| SHOW ALL
+| SHOW BACKUP error // SHOW HELP: SHOW BACKUP
+
+// %Help: SHOW CLUSTER SETTING - display cluster settings
+// %Category: Cfg
+// %Text:
+// SHOW CLUSTER SETTING <var>
+// SHOW ALL CLUSTER SETTINGS
+// %SeeAlso: https://www.cockroachlabs.com/docs/cluster-settings.html
+show_csettings_stmt:
+  SHOW CLUSTER SETTING any_name
   {
-    $$.val = &Show{Name: $2}
+    $$.val = &Show{Name: AsStringWithFlags($4.unresolvedName(), FmtBareIdentifiers), ClusterSetting: true}
   }
-| SHOW DATABASE
+| SHOW CLUSTER SETTING ALL
   {
-    $$.val = &Show{Name: $2}
+    $$.val = &Show{Name: "all", ClusterSetting: true}
   }
-| SHOW COLUMNS FROM var_name
+| SHOW CLUSTER error // SHOW HELP: SHOW CLUSTER SETTING
+| SHOW ALL CLUSTER SETTINGS
+  {
+    $$.val = &Show{Name: "all", ClusterSetting: true}
+  }
+| SHOW ALL CLUSTER error // SHOW HELP: SHOW CLUSTER SETTING
+
+// %Help: SHOW COLUMNS - list columns in relation
+// %Category: DDL
+// %Text: SHOW COLUMNS FROM <tablename>
+// %SeeAlso: https://www.cockroachlabs.com/docs/show-columns.html
+show_columns_stmt:
+  SHOW COLUMNS FROM var_name
   {
     $$.val = &ShowColumns{Table: $4.normalizableTableName()}
   }
-| SHOW DATABASES
+| SHOW COLUMNS error // SHOW HELP: SHOW COLUMNS
+
+// %Help: SHOW DATABASES - list databases
+// %Category: DDL
+// %Text: SHOW DATABASES
+// %SeeAlso: https://www.cockroachlabs.com/docs/show-databases.html
+show_databases_stmt:
+  SHOW DATABASES
   {
     $$.val = &ShowDatabases{}
   }
-| SHOW GRANTS on_privilege_target_clause for_grantee_clause
+| SHOW DATABASES error // SHOW HELP: SHOW DATABASES
+
+// %Help: SHOW GRANTS - list grants
+// %Category: Priv
+// %Text: SHOW GRANTS [ON <targets...>] [FOR <users...>]
+// %SeeAlso: https://www.cockroachlabs.com/docs/show-grants.html
+show_grants_stmt:
+  SHOW GRANTS on_privilege_target_clause for_grantee_clause
   {
     $$.val = &ShowGrants{Targets: $3.targetListPtr(), Grantees: $4.nameList()}
   }
-| SHOW INDEX FROM var_name
+| SHOW GRANTS error // SHOW HELP: SHOW GRANTS
+
+// %Help: SHOW INDEXES - list indexes
+// %Category: DDL
+// %Text: SHOW INDEXES FROM <tablename>
+// %SeeAlso: https://www.cockroachlabs.com/docs/show-indexes.html
+show_indexes_stmt:
+  SHOW INDEX FROM var_name
   {
     $$.val = &ShowIndex{Table: $4.normalizableTableName()}
   }
+| SHOW INDEX error // SHOW HELP: SHOW INDEXES
 | SHOW INDEXES FROM var_name
   {
     $$.val = &ShowIndex{Table: $4.normalizableTableName()}
   }
-| SHOW CONSTRAINT FROM var_name
-  {
-    $$.val = &ShowConstraints{Table: $4.normalizableTableName()}
-  }
-| SHOW CONSTRAINTS FROM var_name
-  {
-    $$.val = &ShowConstraints{Table: $4.normalizableTableName()}
-  }
+| SHOW INDEXES error // SHOW HELP: SHOW INDEXES
 | SHOW KEYS FROM var_name
   {
     $$.val = &ShowIndex{Table: $4.normalizableTableName()}
   }
-| SHOW TABLES FROM name
+| SHOW KEYS error // SHOW HELP: SHOW INDEXES
+
+// %Help: SHOW CONSTRAINTS - list constraints
+// %Category: DDL
+// %Text: SHOW CONSTRAINTS FROM <tablename>
+// %SeeAlso: https://www.cockroachlabs.com/docs/show-constraints.html
+show_constraints_stmt:
+  SHOW CONSTRAINT FROM var_name
+  {
+    $$.val = &ShowConstraints{Table: $4.normalizableTableName()}
+  }
+| SHOW CONSTRAINT error // SHOW HELP: SHOW CONSTRAINTS
+| SHOW CONSTRAINTS FROM var_name
+  {
+    $$.val = &ShowConstraints{Table: $4.normalizableTableName()}
+  }
+| SHOW CONSTRAINTS error // SHOW HELP: SHOW CONSTRAINTS
+
+// %Help: SHOW QUERIES - list running queries
+// %Category: Misc
+// %Text: SHOW [CLUSTER | LOCAL] QUERIES
+// %SeeAlso: CANCEL QUERY
+show_queries_stmt:
+  SHOW QUERIES
+  {
+    $$.val = &ShowQueries{Cluster: true}
+  }
+| SHOW QUERIES error // SHOW HELP: SHOW QUERIES
+| SHOW CLUSTER QUERIES
+  {
+    $$.val = &ShowQueries{Cluster: true}
+  }
+| SHOW LOCAL QUERIES
+  {
+    $$.val = &ShowQueries{Cluster: false}
+  }
+
+// %Help: SHOW JOBS - list background jobs
+// %Category: Misc
+// %Text: SHOW JOBS
+// %SeeAlso: CANCEL JOB, PAUSE JOB, RESUME JOB
+show_jobs_stmt:
+  SHOW JOBS
+  {
+    $$.val = &ShowJobs{}
+  }
+| SHOW JOBS error // SHOW HELP: SHOW JOBS
+
+// %Help: SHOW TRACE - display an execution trace
+// %Category: Misc
+// %Text:
+// SHOW [KV] TRACE FOR SESSION
+// SHOW [KV] TRACE FOR <statement>
+// %SeeAlso: EXPLAIN
+show_trace_stmt:
+  SHOW TRACE FOR SESSION
+  {
+    $$.val = &ShowTrace{Statement: nil}
+  }
+| SHOW TRACE error // SHOW HELP: SHOW TRACE
+| SHOW KV TRACE FOR SESSION
+  {
+    $$.val = &ShowTrace{Statement: nil, OnlyKVTrace: true}
+  }
+| SHOW KV error // SHOW HELP: SHOW TRACE
+| SHOW TRACE FOR explainable_stmt
+  {
+    $$.val = &ShowTrace{Statement: $4.stmt()}
+  }
+| SHOW KV TRACE FOR explainable_stmt
+  {
+    $$.val = &ShowTrace{Statement: $5.stmt(), OnlyKVTrace: true }
+  }
+
+// %Help: SHOW SESSIONS - list open client sessions
+// %Category: Misc
+// %Text: SHOW [CLUSTER | LOCAL] SESSIONS
+show_sessions_stmt:
+  SHOW SESSIONS
+  {
+    $$.val = &ShowSessions{Cluster: true}
+  }
+| SHOW SESSIONS error // SHOW HELP: SHOW SESSIONS
+| SHOW CLUSTER SESSIONS
+  {
+    $$.val = &ShowSessions{Cluster: true}
+  }
+| SHOW LOCAL SESSIONS
+  {
+    $$.val = &ShowSessions{Cluster: false}
+  }
+
+// %Help: SHOW TABLES - list tables
+// %Category: DDL
+// %Text: SHOW TABLES [FROM <databasename>]
+// %SeeAlso: https://www.cockroachlabs.com/docs/show-tables.html
+show_tables_stmt:
+  SHOW TABLES FROM name
   {
     $$.val = &ShowTables{Database: Name($4)}
   }
@@ -1541,33 +2339,78 @@ show_stmt:
   {
     $$.val = &ShowTables{}
   }
-| SHOW TIME ZONE
+| SHOW TABLES error // SHOW HELP: SHOW TABLES
+
+// %Help: SHOW TRANSACTION - display current transaction properties
+// %Category: Cfg
+// %Text: SHOW TRANSACTION {ISOLATION LEVEL | PRIORITY | STATUS}
+// %SeeAlso: https://www.cockroachlabs.com/docs/show-transaction.html
+show_transaction_stmt:
+  SHOW TRANSACTION ISOLATION LEVEL
   {
-    $$.val = &Show{Name: "TIME ZONE"}
-  }
-| SHOW TRANSACTION ISOLATION LEVEL
-  {
+    /* SKIP DOC */
     $$.val = &Show{Name: "TRANSACTION ISOLATION LEVEL"}
   }
 | SHOW TRANSACTION PRIORITY
   {
+    /* SKIP DOC */
     $$.val = &Show{Name: "TRANSACTION PRIORITY"}
   }
 | SHOW TRANSACTION STATUS
   {
+    /* SKIP DOC */
     $$.val = &ShowTransactionStatus{}
   }
-| SHOW CREATE TABLE var_name
+| SHOW TRANSACTION error // SHOW HELP: SHOW TRANSACTION
+
+// %Help: SHOW CREATE TABLE - display the CREATE TABLE statement for a table
+// %Category: DDL
+// %Text: SHOW CREATE TABLE <tablename>
+// %SeeAlso: https://www.cockroachlabs.com/docs/show-create-table.html
+show_create_table_stmt:
+  SHOW CREATE TABLE var_name
   {
     $$.val = &ShowCreateTable{Table: $4.normalizableTableName()}
   }
-| SHOW CREATE VIEW var_name
+| SHOW CREATE TABLE error // SHOW HELP: SHOW CREATE TABLE
+
+// %Help: SHOW CREATE VIEW - display the CREATE VIEW statement for a view
+// %Category: DDL
+// %Text: SHOW CREATE VIEW <viewname>
+// %SeeAlso: https://www.cockroachlabs.com/docs/show-create-view.html
+show_create_view_stmt:
+  SHOW CREATE VIEW var_name
   {
     $$.val = &ShowCreateView{View: $4.normalizableTableName()}
   }
-| SHOW USERS
+| SHOW CREATE VIEW error // SHOW HELP: SHOW CREATE VIEW
+
+// %Help: SHOW USERS - list defined users
+// %Category: Priv
+// %Text: SHOW USERS
+// %SeeAlso: CREATE USER, DROP USER, https://www.cockroachlabs.com/docs/show-users.html
+show_users_stmt:
+  SHOW USERS
   {
     $$.val = &ShowUsers{}
+  }
+| SHOW USERS error // SHOW HELP: SHOW USERS
+
+show_testing_stmt:
+  SHOW TESTING_RANGES FROM TABLE qualified_name
+  {
+    /* SKIP DOC */
+    $$.val = &ShowRanges{Table: $5.newNormalizableTableName()}
+  }
+| SHOW TESTING_RANGES FROM INDEX table_name_with_index
+  {
+    /* SKIP DOC */
+    $$.val = &ShowRanges{Index: $5.tableWithIdx()}
+  }
+| SHOW EXPERIMENTAL_FINGERPRINTS FROM TABLE qualified_name opt_as_of_clause
+  {
+    /* SKIP DOC */
+    $$.val = &ShowFingerprints{Table: $5.newNormalizableTableName(), AsOf: $6.asOfClause()}
   }
 
 help_stmt:
@@ -1577,7 +2420,7 @@ help_stmt:
   }
 
 on_privilege_target_clause:
-  ON privilege_target
+  ON targets
   {
     tmp := $2.targetList()
     $$.val = &tmp
@@ -1597,17 +2440,49 @@ for_grantee_clause:
     $$.val = NameList(nil)
   }
 
-split_stmt:
-  ALTER TABLE qualified_name SPLIT AT '(' expr_list ')'
+// %Help: PAUSE JOB - pause a background job
+// %Category: Misc
+// %Text: PAUSE JOB <jobid>
+// %SeeAlso: SHOW JOBS, CANCEL JOB, RESUME JOB
+pause_stmt:
+  PAUSE JOB a_expr
   {
-    $$.val = &Split{Table: $3.normalizableTableName(), Exprs: $7.exprs()}
+    /* SKIP DOC */
+    $$.val = &PauseJob{ID: $3.expr()}
   }
-| ALTER INDEX table_name_with_index SPLIT AT '(' expr_list ')'
-  {
-    $$.val = &Split{Index: $3.tableWithIdx(), Exprs: $7.exprs()}
-  }
+| PAUSE error // SHOW HELP: PAUSE JOB
 
-// CREATE TABLE relname
+// %Help: CREATE TABLE - create a new table
+// %Category: DDL
+// %Text:
+// CREATE TABLE [IF NOT EXISTS] <tablename> ( <elements...> ) [<interleave>]
+// CREATE TABLE [IF NOT EXISTS] <tablename> [( <colnames...> )] AS <source>
+//
+// Table elements:
+//    <name> <type> [<qualifiers...>]
+//    [UNIQUE] INDEX [<name>] ( <colname> [ASC | DESC] [, ...] )
+//                            [STORING ( <colnames...> )] [<interleave>]
+//    FAMILY [<name>] ( <colnames...> )
+//    [CONSTRAINT <name>] <constraint>
+//
+// Table constraints:
+//    PRIMARY KEY ( <colnames...> )
+//    FOREIGN KEY ( <colnames...> ) REFERENCES <tablename> [( <colnames...> )]
+//    UNIQUE ( <colnames... ) [STORING ( <colnames...> )] [<interleave>]
+//    CHECK ( <expr> )
+//
+// Column qualifiers:
+//   [CONSTRAINT <constraintname>] {NULL | NOT NULL | UNIQUE | PRIMARY KEY | CHECK (<expr>) | DEFAULT <expr>}
+//   FAMILY <familyname>, CREATE [IF NOT EXISTS] FAMILY [<familyname>]
+//   REFERENCES <tablename> [( <colnames...> )]
+//   COLLATE <collationname>
+//
+// Interleave clause:
+//    INTERLEAVE IN PARENT <tablename> ( <colnames...> ) [CASCADE | RESTRICT]
+//
+// %SeeAlso: SHOW TABLES, CREATE VIEW, SHOW CREATE TABLE,
+// https://www.cockroachlabs.com/docs/create-table.html
+// https://www.cockroachlabs.com/docs/create-table-as.html
 create_table_stmt:
   CREATE TABLE any_name '(' opt_table_elem_list ')' opt_interleave
   {
@@ -1658,10 +2533,10 @@ table_elem:
   }
 
 opt_interleave:
-  INTERLEAVE IN PARENT name '(' name_list ')' opt_interleave_drop_behavior
+  INTERLEAVE IN PARENT qualified_name '(' name_list ')' opt_interleave_drop_behavior
   {
     $$.val = &InterleaveDef{
-               Parent: NormalizableTableName{UnresolvedName{Name($4)}},
+               Parent: $4.newNormalizableTableName(),
                Fields: $6.nameList(),
                DropBehavior: $8.dropBehavior(),
     }
@@ -1718,7 +2593,10 @@ col_qualification:
   {
     $$.val = NamedColumnQualification{Qualification: $1.colQualElem()}
   }
-| COLLATE any_name { return unimplemented(sqllex) }
+| COLLATE unrestricted_name
+  {
+    $$.val = NamedColumnQualification{Qualification: ColumnCollation($2)}
+  }
 | FAMILY name
   {
     $$.val = NamedColumnQualification{Qualification: &ColumnFamilyConstraint{Family: Name($2)}}
@@ -1829,21 +2707,21 @@ constraint_elem:
       Expr: $3.expr(),
     }
   }
-| UNIQUE '(' name_list ')' opt_storing opt_interleave
+| UNIQUE '(' index_params ')' opt_storing opt_interleave
   {
     $$.val = &UniqueConstraintTableDef{
       IndexTableDef: IndexTableDef{
-        Columns: NameListToIndexElems($3.nameList()),
+        Columns: $3.idxElems(),
         Storing: $5.nameList(),
         Interleave: $6.interleave(),
       },
     }
   }
-| PRIMARY KEY '(' name_list ')'
+| PRIMARY KEY '(' index_params ')'
   {
     $$.val = &UniqueConstraintTableDef{
       IndexTableDef: IndexTableDef{
-        Columns: NameListToIndexElems($4.nameList()),
+        Columns: $4.idxElems(),
       },
       PrimaryKey:    true,
     }
@@ -1892,34 +2770,35 @@ opt_column_list:
   }
 
 key_match:
-  MATCH FULL { return unimplemented(sqllex) }
-| MATCH PARTIAL { return unimplemented(sqllex) }
-| MATCH SIMPLE { return unimplemented(sqllex) }
+  MATCH FULL { return unimplemented(sqllex, "match full") }
+| MATCH PARTIAL { return unimplemented(sqllex, "match partial") }
+| MATCH SIMPLE { return unimplemented(sqllex, "match simple") }
 | /* EMPTY */ {}
 
 // We combine the update and delete actions into one value temporarily for
 // simplicity of parsing, and then break them down again in the calling
-// production. update is in the left 8 bits, delete in the right. Note that
-// NOACTION is the default.
+// production.
 key_actions:
-  key_update { return unimplemented(sqllex) }
-| key_delete { return unimplemented(sqllex) }
-| key_update key_delete { return unimplemented(sqllex) }
-| key_delete key_update { return unimplemented(sqllex) }
+  key_update {}
+| key_delete {}
+| key_update key_delete {}
+| key_delete key_update {}
 | /* EMPTY */ {}
 
 key_update:
-  ON UPDATE key_action { return unimplemented(sqllex) }
+  ON UPDATE key_action {}
 
 key_delete:
-  ON DELETE key_action { return unimplemented(sqllex) }
+  ON DELETE key_action {}
 
 key_action:
-  NO ACTION { return unimplemented(sqllex) }
-| RESTRICT { return unimplemented(sqllex) }
-| CASCADE { return unimplemented(sqllex) }
-| SET NULL { return unimplemented(sqllex) }
-| SET DEFAULT { return unimplemented(sqllex) }
+  NO ACTION { return unimplemented(sqllex, "no action") }
+// RESTRICT is currently the default and only supported ON DELETE/UPDATE
+// behavior and thus needs no special handling.
+| RESTRICT {}
+| CASCADE { return unimplemented(sqllex, "action cascade") }
+| SET NULL { return unimplemented(sqllex, "action set null") }
+| SET DEFAULT { return unimplemented(sqllex, "action set default") }
 
 numeric_only:
   FCONST
@@ -1935,30 +2814,42 @@ numeric_only:
     $$.val = $1.numVal()
   }
 
-// TRUNCATE table relname1, relname2, ...
+// %Help: TRUNCATE - empty one or more tables
+// %Category: DML
+// %Text: TRUNCATE [TABLE] <tablename> [, ...] [CASCADE | RESTRICT]
+// %SeeAlso: https://www.cockroachlabs.com/docs/truncate.html
 truncate_stmt:
   TRUNCATE opt_table relation_expr_list opt_drop_behavior
   {
     $$.val = &Truncate{Tables: $3.tableNameReferences(), DropBehavior: $4.dropBehavior()}
   }
+| TRUNCATE error // SHOW HELP: TRUNCATE
 
-// CREATE USER
+// %Help: CREATE USER - define a new user
+// %Category: Priv
+// %Text: CREATE USER <name> [ [WITH] PASSWORD <passwd> ]
+// %SeeAlso: DROP USER, SHOW USERS, https://www.cockroachlabs.com/docs/create-user.html
 create_user_stmt:
-  CREATE USER name opt_with opt_password
+  CREATE USER name opt_password
   {
-    $$.val = &CreateUser{Name: Name($3), Password: $5.strVal()}
+    $$.val = &CreateUser{Name: Name($3), Password: $4.strPtr()}
   }
+| CREATE USER error // SHOW HELP: CREATE USER
 
 opt_password:
-  PASSWORD SCONST
+  opt_with PASSWORD SCONST
   {
-    $$.val = &StrVal{s: $2}
+    pwd := $3
+    $$.val = &pwd
   }
 | /* EMPTY */ {
-    $$.val = (*StrVal)(nil)
+    $$.val = (*string)(nil)
   }
 
-// CREATE VIEW relname
+// %Help: CREATE VIEW - create a new view
+// %Category: DDL
+// %Text: CREATE VIEW <viewname> [( <colnames...> )] AS <source>
+// %SeeAlso: CREATE TABLE, SHOW CREATE VIEW, https://www.cockroachlabs.com/docs/create-view.html
 create_view_stmt:
   CREATE VIEW any_name opt_column_list AS select_stmt
   {
@@ -1968,10 +2859,22 @@ create_view_stmt:
       AsSource: $6.slct(),
     }
   }
+| CREATE VIEW error // SHOW HELP: CREATE VIEW
 
 // TODO(a-robinson): CREATE OR REPLACE VIEW support (#2971).
 
-// CREATE INDEX
+// %Help: CREATE INDEX - create a new index
+// %Category: DDL
+// %Text:
+// CREATE [UNIQUE] INDEX [IF NOT EXISTS] [<idxname>]
+//        ON <tablename> ( <colname> [ASC | DESC] [, ...] )
+//        [STORING ( <colnames...> )] [<interleave>]
+//
+// Interleave clause:
+//    INTERLEAVE IN PARENT <tablename> ( <colnames...> ) [CASCADE | RESTRICT]
+//
+// %SeeAlso: CREATE TABLE, SHOW INDEXES, SHOW CREATE INDEX,
+// https://www.cockroachlabs.com/docs/create-index.html
 create_index_stmt:
   CREATE opt_unique INDEX opt_name ON qualified_name '(' index_params ')' opt_storing opt_interleave
   {
@@ -1996,6 +2899,7 @@ create_index_stmt:
       Interleave: $14.interleave(),
     }
   }
+| CREATE opt_unique INDEX error // SHOW HELP: CREATE INDEX
 
 opt_unique:
   UNIQUE
@@ -2025,11 +2929,11 @@ index_elem:
   {
     $$.val = IndexElem{Column: Name($1), Direction: $3.dir()}
   }
-| func_expr_windowless opt_collate opt_asc_desc { return unimplemented(sqllex) }
-| '(' a_expr ')' opt_collate opt_asc_desc { return unimplemented(sqllex) }
+| func_expr_windowless opt_collate opt_asc_desc { return unimplemented(sqllex, "index_elem func expr") }
+| '(' a_expr ')' opt_collate opt_asc_desc { return unimplemented(sqllex, "index_elem a_expr") }
 
 opt_collate:
-  COLLATE any_name { return unimplemented(sqllex) }
+  COLLATE unrestricted_name { return unimplementedWithIssue(sqllex, 16619) }
 | /* EMPTY */ {}
 
 opt_asc_desc:
@@ -2046,35 +2950,20 @@ opt_asc_desc:
     $$.val = DefaultDirection
   }
 
-// ALTER THING name RENAME TO newname
-rename_stmt:
+alter_rename_database_stmt:
   ALTER DATABASE name RENAME TO name
   {
     $$.val = &RenameDatabase{Name: Name($3), NewName: Name($6)}
   }
-| ALTER TABLE relation_expr RENAME TO qualified_name
+
+alter_rename_table_stmt:
+  ALTER TABLE relation_expr RENAME TO qualified_name
   {
     $$.val = &RenameTable{Name: $3.normalizableTableName(), NewName: $6.normalizableTableName(), IfExists: false, IsView: false}
   }
 | ALTER TABLE IF EXISTS relation_expr RENAME TO qualified_name
   {
     $$.val = &RenameTable{Name: $5.normalizableTableName(), NewName: $8.normalizableTableName(), IfExists: true, IsView: false}
-  }
-| ALTER VIEW relation_expr RENAME TO qualified_name
-  {
-    $$.val = &RenameTable{Name: $3.normalizableTableName(), NewName: $6.normalizableTableName(), IfExists: false, IsView: true}
-  }
-| ALTER VIEW IF EXISTS relation_expr RENAME TO qualified_name
-  {
-    $$.val = &RenameTable{Name: $5.normalizableTableName(), NewName: $8.normalizableTableName(), IfExists: true, IsView: true}
-  }
-| ALTER INDEX table_name_with_index RENAME TO name
-  {
-    $$.val = &RenameIndex{Index: $3.tableWithIdx(), NewName: Name($6), IfExists: false}
-  }
-| ALTER INDEX IF EXISTS table_name_with_index RENAME TO name
-  {
-    $$.val = &RenameIndex{Index: $5.tableWithIdx(), NewName: Name($8), IfExists: true}
   }
 | ALTER TABLE relation_expr RENAME opt_column name TO name
   {
@@ -2084,8 +2973,30 @@ rename_stmt:
   {
     $$.val = &RenameColumn{Table: $5.normalizableTableName(), Name: Name($8), NewName: Name($10), IfExists: true}
   }
-| ALTER TABLE relation_expr RENAME CONSTRAINT name TO name { return unimplemented(sqllex) }
-| ALTER TABLE IF EXISTS relation_expr RENAME CONSTRAINT name TO name { return unimplemented(sqllex) }
+| ALTER TABLE relation_expr RENAME CONSTRAINT name TO name
+  { return unimplemented(sqllex, "alter table rename constraint") }
+| ALTER TABLE IF EXISTS relation_expr RENAME CONSTRAINT name TO name
+  { return unimplemented(sqllex, "alter table rename constraint") }
+
+alter_rename_view_stmt:
+  ALTER VIEW relation_expr RENAME TO qualified_name
+  {
+    $$.val = &RenameTable{Name: $3.normalizableTableName(), NewName: $6.normalizableTableName(), IfExists: false, IsView: true}
+  }
+| ALTER VIEW IF EXISTS relation_expr RENAME TO qualified_name
+  {
+    $$.val = &RenameTable{Name: $5.normalizableTableName(), NewName: $8.normalizableTableName(), IfExists: true, IsView: true}
+  }
+
+alter_rename_index_stmt:
+  ALTER INDEX table_name_with_index RENAME TO name
+  {
+    $$.val = &RenameIndex{Index: $3.tableWithIdx(), NewName: Name($6), IfExists: false}
+  }
+| ALTER INDEX IF EXISTS table_name_with_index RENAME TO name
+  {
+    $$.val = &RenameIndex{Index: $5.tableWithIdx(), NewName: Name($8), IfExists: true}
+  }
 
 opt_column:
   COLUMN
@@ -2101,37 +3012,93 @@ opt_set_data:
   SET DATA {}
 | /* EMPTY */ {}
 
+// %Help: RELEASE - complete a retryable block
+// %Category: Txn
+// %Text: RELEASE [SAVEPOINT] cockroach_restart
+// %SeeAlso: SAVEPOINT, https://www.cockroachlabs.com/docs/savepoint.html
 release_stmt:
- RELEASE savepoint_name
- {
-  $$.val = &ReleaseSavepoint{Savepoint: $2}
- }
+  RELEASE savepoint_name
+  {
+    $$.val = &ReleaseSavepoint{Savepoint: $2}
+  }
+| RELEASE error // SHOW HELP: RELEASE
 
+// %Help: RESUME JOB - resume a background job
+// %Category: Misc
+// %Text: RESUME JOB <jobid>
+// %SeeAlso: SHOW JOBS, CANCEL JOB, PAUSE JOB
+resume_stmt:
+  RESUME JOB a_expr
+  {
+    /* SKIP DOC */
+    $$.val = &ResumeJob{ID: $3.expr()}
+  }
+| RESUME error // SHOW HELP: RESUME JOB
+
+// %Help: SAVEPOINT - start a retryable block
+// %Category: Txn
+// %Text: SAVEPOINT cockroach_restart
+// %SeeAlso: RELEASE, https://www.cockroachlabs.com/docs/savepoint.html
 savepoint_stmt:
- SAVEPOINT savepoint_name
- {
-  $$.val = &Savepoint{Name: $2}
- }
+  SAVEPOINT name
+  {
+    $$.val = &Savepoint{Name: $2}
+  }
+| SAVEPOINT error // SHOW HELP: SAVEPOINT
 
 // BEGIN / START / COMMIT / END / ROLLBACK / ...
 transaction_stmt:
-  BEGIN opt_transaction opt_transaction_mode_list
+  begin_stmt    // EXTEND WITH HELP: BEGIN
+| commit_stmt   // EXTEND WITH HELP: COMMIT
+| rollback_stmt // EXTEND WITH HELP: ROLLBACK
+
+// %Help: BEGIN - start a transaction
+// %Category: Txn
+// %Text:
+// BEGIN [TRANSACTION] [ <txnparameter> [, ...] ]
+// START TRANSACTION [ <txnparameter> [, ...] ]
+//
+// Transaction parameters:
+//    ISOLATION LEVEL { SNAPSHOT | SERIALIZABLE }
+//    PRIORITY { LOW | NORMAL | HIGH }
+//
+// %SeeAlso: COMMIT, ROLLBACK, https://www.cockroachlabs.com/docs/begin-transaction.html
+begin_stmt:
+  BEGIN opt_transaction begin_transaction
   {
     $$.val = $3.stmt()
   }
-| START TRANSACTION opt_transaction_mode_list
+| BEGIN error // SHOW HELP: BEGIN
+| START TRANSACTION begin_transaction
   {
     $$.val = $3.stmt()
   }
-| COMMIT opt_transaction
+| START error // SHOW HELP: BEGIN
+
+// %Help: COMMIT - commit the current transaction
+// %Category: Txn
+// %Text:
+// COMMIT [TRANSACTION]
+// END [TRANSACTION]
+// %SeeAlso: BEGIN, ROLLBACK, https://www.cockroachlabs.com/docs/commit-transaction.html
+commit_stmt:
+  COMMIT opt_transaction
   {
     $$.val = &CommitTransaction{}
   }
+| COMMIT error // SHOW HELP: COMMIT
 | END opt_transaction
   {
     $$.val = &CommitTransaction{}
   }
-| ROLLBACK opt_to_savepoint
+| END error // SHOW HELP: COMMIT
+
+// %Help: ROLLBACK - abort the current transaction
+// %Category: Txn
+// %Text: ROLLBACK [TRANSACTION] [TO [SAVEPOINT] cockroach_restart]
+// %SeeAlso: BEGIN, COMMIT, SAVEPOINT, https://www.cockroachlabs.com/docs/rollback-transaction.html
+rollback_stmt:
+  ROLLBACK opt_to_savepoint
   {
     if $2 != "" {
       $$.val = &RollbackToSavepoint{Savepoint: $2}
@@ -2139,6 +3106,7 @@ transaction_stmt:
       $$.val = &RollbackTransaction{}
     }
   }
+| ROLLBACK error // SHOW HELP: ROLLBACK
 
 opt_transaction:
   TRANSACTION {}
@@ -2172,26 +3140,48 @@ savepoint_name:
     $$ = $1
   }
 
-opt_transaction_mode_list:
-  transaction_iso_level
+begin_transaction:
+  transaction_mode_list
   {
-    $$.val = &BeginTransaction{Isolation: $1.isoLevel(), UserPriority: UnspecifiedUserPriority}
-  }
-| transaction_user_priority
-  {
-    $$.val = &BeginTransaction{Isolation: UnspecifiedIsolation, UserPriority: $1.userPriority()}
-  }
-| transaction_iso_level ',' transaction_user_priority
-  {
-    $$.val = &BeginTransaction{Isolation: $1.isoLevel(), UserPriority: $3.userPriority()}
-  }
-| transaction_user_priority ',' transaction_iso_level
-  {
-    $$.val = &BeginTransaction{Isolation: $3.isoLevel(), UserPriority: $1.userPriority()}
+    $$.val = &BeginTransaction{Modes: $1.transactionModes()}
   }
 | /* EMPTY */
   {
-    $$.val = &BeginTransaction{Isolation: UnspecifiedIsolation, UserPriority: UnspecifiedUserPriority}
+    $$.val = &BeginTransaction{}
+  }
+
+transaction_mode_list:
+  transaction_mode
+  {
+    $$.val = $1.transactionModes()
+  }
+| transaction_mode_list ',' transaction_mode
+  {
+    a := $1.transactionModes()
+    b := $3.transactionModes()
+    err := a.merge(b)
+    if err != nil { sqllex.Error(err.Error()); return 1}
+    $$.val = a
+  }
+
+transaction_mode:
+  transaction_iso_level
+  {
+    $$.val = TransactionModes{Isolation: $1.isoLevel()}
+  }
+| transaction_user_priority
+  {
+    $$.val = TransactionModes{UserPriority: $1.userPriority()}
+  }
+| transaction_read_mode
+  {
+    $$.val = TransactionModes{ReadWriteMode: $1.readWriteMode()}
+  }
+
+transaction_user_priority:
+  PRIORITY user_priority
+  {
+    $$.val = $2.userPriority()
   }
 
 transaction_iso_level:
@@ -2200,15 +3190,29 @@ transaction_iso_level:
     $$.val = $3.isoLevel()
   }
 
+transaction_read_mode:
+  READ ONLY
+  {
+    $$.val = ReadOnly
+  }
+| READ WRITE
+  {
+    $$.val = ReadWrite
+  }
+
+// %Help: CREATE DATABASE - create a new database
+// %Category: DDL
+// %Text: CREATE DATABASE [IF NOT EXISTS] <name>
+// %SeeAlso: https://www.cockroachlabs.com/docs/create-database.html
 create_database_stmt:
   CREATE DATABASE name opt_with opt_template_clause opt_encoding_clause opt_lc_collate_clause opt_lc_ctype_clause
   {
     $$.val = &CreateDatabase{
       Name: Name($3),
-      Template: $5.strVal(),
-      Encoding: $6.strVal(),
-      Collate: $7.strVal(),
-      CType: $8.strVal(),
+      Template: $5,
+      Encoding: $6,
+      Collate: $7,
+      CType: $8,
     }
   }
 | CREATE DATABASE IF NOT EXISTS name opt_with opt_template_clause opt_encoding_clause opt_lc_collate_clause opt_lc_ctype_clause
@@ -2216,92 +3220,108 @@ create_database_stmt:
     $$.val = &CreateDatabase{
       IfNotExists: true,
       Name: Name($6),
-      Template: $8.strVal(),
-      Encoding: $9.strVal(),
-      Collate: $10.strVal(),
-      CType: $11.strVal(),
+      Template: $8,
+      Encoding: $9,
+      Collate: $10,
+      CType: $11,
     }
-  }
+   }
+| CREATE DATABASE error // SHOW HELP: CREATE DATABASE
 
 opt_template_clause:
-  TEMPLATE opt_equal IDENT
+  TEMPLATE opt_equal non_reserved_word_or_sconst
   {
-    $$.val = &StrVal{s: $3}
+    $$ = $3
   }
 | /* EMPTY */
   {
-    $$.val = (*StrVal)(nil)
+    $$ = ""
   }
 
 opt_encoding_clause:
-  ENCODING opt_equal SCONST
+  ENCODING opt_equal non_reserved_word_or_sconst
   {
-    $$.val = &StrVal{s: $3}
+    $$ = $3
   }
 | /* EMPTY */
   {
-    $$.val = (*StrVal)(nil)
+    $$ = ""
   }
 
 opt_lc_collate_clause:
-  LC_COLLATE opt_equal SCONST
+  LC_COLLATE opt_equal non_reserved_word_or_sconst
   {
-    $$.val = &StrVal{s: $3}
+    $$ = $3
   }
 | /* EMPTY */
   {
-    $$.val = (*StrVal)(nil)
+    $$ = ""
   }
 
 opt_lc_ctype_clause:
-  LC_CTYPE opt_equal SCONST
+  LC_CTYPE opt_equal non_reserved_word_or_sconst
   {
-    $$.val = &StrVal{s: $3}
+    $$ = $3
   }
 | /* EMPTY */
   {
-    $$.val = (*StrVal)(nil)
+    $$ = ""
   }
 
 opt_equal:
   '=' {}
 | /* EMPTY */ {}
 
-// TODO(dan): While RETURNING is not supported with UPSERT and ON CONFLICT
-// (#6637), we do some gymnastics with the grammar to make the diagrams in the
-// docs only show the supported combinations. This simplifies once #6637 is
-// resolved.
+// %Help: INSERT - create new rows in a table
+// %Category: DML
+// %Text:
+// INSERT INTO <tablename> [[AS] <name>] [( <colnames...> )]
+//        <selectclause>
+//        [ON CONFLICT [( <colnames...> )] {DO UPDATE SET ... [WHERE <expr>] | DO NOTHING}]
+//        [RETURNING <exprs...>]
+// %SeeAlso: UPSERT, UPDATE, DELETE, https://www.cockroachlabs.com/docs/insert.html
 insert_stmt:
   opt_with_clause INSERT INTO insert_target insert_rest returning_clause
   {
     $$.val = $5.stmt()
     $$.val.(*Insert).Table = $4.tblExpr()
-    $$.val.(*Insert).Returning = $6.retExprs()
+    $$.val.(*Insert).Returning = $6.retClause()
   }
-| opt_with_clause INSERT INTO insert_target insert_rest on_conflict
+| opt_with_clause INSERT INTO insert_target insert_rest on_conflict returning_clause
   {
     $$.val = $5.stmt()
     $$.val.(*Insert).Table = $4.tblExpr()
     $$.val.(*Insert).OnConflict = $6.onConflict()
+    $$.val.(*Insert).Returning = $7.retClause()
   }
-| opt_with_clause INSERT INTO insert_target insert_rest on_conflict RETURNING target_list { return unimplementedWithIssue(sqllex, 6637) }
-| opt_with_clause UPSERT INTO insert_target insert_rest
+| opt_with_clause INSERT error // SHOW HELP: INSERT
+
+// %Help: UPSERT - create or replace rows in a table
+// %Category: DML
+// %Text:
+// UPSERT INTO <tablename> [AS <name>] [( <colnames...> )]
+//        <selectclause>
+//        [RETURNING <exprs...>]
+// %SeeAlso: INSERT, UPDATE, DELETE, https://www.cockroachlabs.com/docs/upsert.html
+upsert_stmt:
+  opt_with_clause UPSERT INTO insert_target insert_rest returning_clause
   {
     $$.val = $5.stmt()
     $$.val.(*Insert).Table = $4.tblExpr()
     $$.val.(*Insert).OnConflict = &OnConflict{}
+    $$.val.(*Insert).Returning = $6.retClause()
   }
-| opt_with_clause UPSERT INTO insert_target insert_rest RETURNING target_list { return unimplementedWithIssue(sqllex, 6637) }
+| opt_with_clause UPSERT error // SHOW HELP: UPSERT
 
-// Can't easily make AS optional here, because VALUES in insert_rest would have
-// a shift/reduce conflict with VALUES as an optional alias. We could easily
-// allow unreserved_keywords as optional aliases, but that'd be an odd
-// divergence from other places. So just require AS for now.
 insert_target:
   qualified_name
   {
     $$.val = $1.newNormalizableTableName()
   }
+// Can't easily make AS optional here, because VALUES in insert_rest would have
+// a shift/reduce conflict with VALUES as an optional alias. We could easily
+// allow unreserved_keywords as optional aliases, but that'd be an odd
+// divergence from other places. So just require AS for now.
 | qualified_name AS name
   {
     $$.val = &AliasedTableExpr{Expr: $1.newNormalizableTableName(), As: AliasClause{Alias: Name($3)}}
@@ -2337,7 +3357,7 @@ opt_conf_expr:
     // TODO(dan): Support the where_clause.
     $$.val = $2.nameList()
   }
-| ON CONSTRAINT name { return unimplemented(sqllex) }
+| ON CONSTRAINT name { return unimplemented(sqllex, "on conflict on constraint") }
 | /* EMPTY */
   {
     $$.val = NameList(nil)
@@ -2346,19 +3366,29 @@ opt_conf_expr:
 returning_clause:
   RETURNING target_list
   {
-    $$.val = $2.selExprs()
+    ret := ReturningExprs($2.selExprs())
+    $$.val = &ret
+  }
+| RETURNING NOTHING
+  {
+    $$.val = returningNothingClause
   }
 | /* EMPTY */
   {
-    $$.val = SelectExprs(nil)
+    $$.val = AbsentReturningClause
   }
 
+// %Help: UPDATE - update rows of a table
+// %Category: DML
+// %Text: UPDATE <tablename> [[AS] <name>] SET ... [WHERE <expr>] [RETURNING <exprs...>]
+// %SeeAlso: INSERT, UPSERT, DELETE, https://www.cockroachlabs.com/docs/update.html
 update_stmt:
   opt_with_clause UPDATE relation_expr_opt_alias
     SET set_clause_list update_from_clause where_clause returning_clause
   {
-    $$.val = &Update{Table: $3.tblExpr(), Exprs: $5.updateExprs(), Where: newWhere(astWhere, $7.expr()), Returning: $8.retExprs()}
+    $$.val = &Update{Table: $3.tblExpr(), Exprs: $5.updateExprs(), Where: newWhere(astWhere, $7.expr()), Returning: $8.retClause()}
   }
+| opt_with_clause UPDATE error // SHOW HELP: UPDATE
 
 // Mark this as unimplemented until the normal from_clause is supported here.
 update_from_clause:
@@ -2437,7 +3467,6 @@ multiple_set_clause:
 //
 // In non-expression contexts, we use select_stmt which can represent a SELECT
 // with or without outer parentheses.
-
 select_stmt:
   select_no_parens %prec UMINUS
 | select_with_parens %prec UMINUS
@@ -2491,7 +3520,10 @@ select_no_parens:
   }
 
 select_clause:
-  simple_select
+// We only provide help if an open parenthesis is provided, because
+// otherwise the rule is ambiguous with the top-level statement list.
+  '(' error // SHOW HELP: <SELECTCLAUSE>
+| simple_select
 | select_with_parens
 
 // This rule parses SELECT statements that can appear within set operations,
@@ -2516,7 +3548,36 @@ select_clause:
 //
 // NOTE: only the leftmost component select_stmt should have INTO. However,
 // this is not checked by the grammar; parse analysis must check it.
+//
+// %Help: <SELECTCLAUSE> - access tabular data
+// %Category: DML
+// %Text:
+// Select clause:
+//   TABLE <tablename>
+//   VALUES ( <exprs...> ) [ , ... ]
+//   SELECT ... [ { INTERSECT | UNION | EXCEPT } [ ALL | DISTINCT ] <selectclause> ]
 simple_select:
+  simple_select_clause // EXTEND WITH HELP: SELECT
+| values_clause        // EXTEND WITH HELP: VALUES
+| table_clause         // EXTEND WITH HELP: TABLE
+| set_operation
+
+// %Help: SELECT - retrieve rows from a data source and compute a result
+// %Category: DML
+// %Text:
+// SELECT [DISTINCT]
+//        { <expr> [[AS] <name>] | [ [<dbname>.] <tablename>. ] * } [, ...]
+//        [ FROM <source> ]
+//        [ WHERE <expr> ]
+//        [ GROUP BY <expr> [ , ... ] ]
+//        [ HAVING <expr> ]
+//        [ WINDOW <name> AS ( <definition> ) ]
+//        [ { UNION | INTERSECT | EXCEPT } [ ALL | DISTINCT ] <selectclause> ]
+//        [ ORDER BY <expr> [ ASC | DESC ] [, ...] ]
+//        [ LIMIT { <expr> | ALL } ]
+//        [ OFFSET <expr> [ ROW | ROWS ] ]
+// %SeeAlso: https://www.cockroachlabs.com/docs/select.html
+simple_select_clause:
   SELECT opt_all_clause target_list
     from_clause where_clause
     group_clause having_clause window_clause
@@ -2544,16 +3605,10 @@ simple_select:
       Window:   $8.window(),
     }
   }
-| values_clause
-| TABLE relation_expr
-  {
-    $$.val = &SelectClause{
-      Exprs:       SelectExprs{starSelectExpr()},
-      From:        &From{Tables: TableExprs{$2.newNormalizableTableName()}},
-      tableSelect: true,
-    }
-  }
-| select_clause UNION all_or_distinct select_clause
+| SELECT error // SHOW HELP: SELECT
+
+set_operation:
+  select_clause UNION all_or_distinct select_clause
   {
     $$.val = &UnionClause{
       Type:  UnionOp,
@@ -2581,32 +3636,47 @@ simple_select:
     }
   }
 
+// %Help: TABLE - select an entire table
+// %Category: DML
+// %Text: TABLE <tablename>
+// %SeeAlso: SELECT, VALUES, https://www.cockroachlabs.com/docs/table-expressions.html
+table_clause:
+  TABLE table_ref
+  {
+    $$.val = &SelectClause{
+      Exprs:       SelectExprs{starSelectExpr()},
+      From:        &From{Tables: TableExprs{$2.tblExpr()}},
+      tableSelect: true,
+    }
+  }
+| TABLE error // SHOW HELP: TABLE
+
 // SQL standard WITH clause looks like:
 //
-// WITH [ RECURSIVE ] <query name> [ (<column>,...) ]
+// WITH [ RECURSIVE ] <query name> [ (<column> [, ...]) ]
 //        AS (query) [ SEARCH or CYCLE clause ]
 //
 // We don't currently support the SEARCH or CYCLE clause.
 //
 // Recognizing WITH_LA here allows a CTE to be named TIME or ORDINALITY.
 with_clause:
-WITH cte_list { return unimplemented(sqllex) }
-| WITH_LA cte_list { return unimplemented(sqllex) }
-| WITH RECURSIVE cte_list { return unimplemented(sqllex) }
+  WITH cte_list { return unimplemented(sqllex, "with cte_list") }
+| WITH_LA cte_list { return unimplemented(sqllex, "with cte_list") }
+| WITH RECURSIVE cte_list { return unimplemented(sqllex, "with cte_list") }
 
 cte_list:
-  common_table_expr { return unimplemented(sqllex) }
-| cte_list ',' common_table_expr { return unimplemented(sqllex) }
+  common_table_expr { return unimplemented(sqllex, "cte_list") }
+| cte_list ',' common_table_expr { return unimplemented(sqllex, "cte_list") }
 
 common_table_expr:
-  name opt_name_list AS '(' preparable_stmt ')' { return unimplemented(sqllex) }
+  name opt_name_list AS '(' preparable_stmt ')' { return unimplemented(sqllex, "cte") }
 
 opt_with:
   WITH {}
 | /* EMPTY */ {}
 
 opt_with_clause:
-  with_clause { return unimplemented(sqllex) }
+  with_clause { return unimplemented(sqllex, "with_clause") }
 | /* EMPTY */ {}
 
 opt_table:
@@ -2666,8 +3736,17 @@ sortby_list:
 sortby:
   a_expr opt_asc_desc
   {
-    $$.val = &Order{Expr: $1.expr(), Direction: $2.dir()}
+    $$.val = &Order{OrderType: OrderByColumn, Expr: $1.expr(), Direction: $2.dir()}
   }
+| PRIMARY KEY qualified_name opt_asc_desc
+  {
+    $$.val = &Order{OrderType: OrderByIndex, Direction: $4.dir(), Table: $3.normalizableTableName()}
+  }
+| INDEX qualified_name '@' unrestricted_name opt_asc_desc
+  {
+    $$.val = &Order{OrderType: OrderByIndex, Direction: $5.dir(), Table: $2.normalizableTableName(), Index: Name($4) }
+  }
+
 // TODO(pmattis): Support ordering using arbitrary math ops?
 // | a_expr USING math_op {}
 
@@ -2701,8 +3780,10 @@ limit_clause:
     }
   }
 // SQL:2008 syntax
-// TODO(pmattis): Should we support this?
-// | FETCH first_or_next opt_select_fetch_first_value row_or_rows ONLY { return unimplemented(sqllex) }
+| FETCH first_or_next opt_select_fetch_first_value row_or_rows ONLY
+  {
+    $$.val = &Limit{Count: $3.expr()}
+  }
 
 offset_clause:
   OFFSET a_expr
@@ -2727,19 +3808,28 @@ select_limit_value:
 // Allowing full expressions without parentheses causes various parsing
 // problems with the trailing ROW/ROWS key words. SQL only calls for constants,
 // so we allow the rest only with parentheses. If omitted, default to 1.
-// opt_select_fetch_first_value:
-//   signed_iconst { return unimplemented(sqllex) }
-// | '(' a_expr ')' { return unimplemented(sqllex) }
-// | /* EMPTY */ {}
+ opt_select_fetch_first_value:
+   signed_iconst
+   {
+     $$.val = $1.expr()
+   }
+ | '(' a_expr ')'
+   {
+     $$.val = $2.expr()
+   }
+ | /* EMPTY */
+   {
+     $$.val = &NumVal{Value: constant.MakeInt64(1)}
+   }
 
 // noise words
 row_or_rows:
   ROW {}
 | ROWS {}
 
-// first_or_next:
-//   FIRST { return unimplemented(sqllex) }
-// | NEXT { return unimplemented(sqllex) }
+first_or_next:
+  FIRST {}
+| NEXT {}
 
 // This syntax for group_clause tries to follow the spec quite closely.
 // However, the spec allows only column references, not expressions,
@@ -2787,11 +3877,17 @@ having_clause:
 // production a higher precedence than the VALUES token has, causing
 // the parser to prefer to reduce, in effect assuming that the VALUES
 // is not a function name.
+//
+// %Help: VALUES - select a given set of values
+// %Category: DML
+// %Text: VALUES ( <exprs...> ) [, ...]
+// %SeeAlso: SELECT, TABLE, https://www.cockroachlabs.com/docs/table-expressions.html
 values_clause:
   VALUES ctext_row %prec UMINUS
   {
     $$.val = &ValuesClause{[]*Tuple{{Exprs: $2.exprs()}}}
   }
+| VALUES error // SHOW HELP: VALUES
 | values_clause ',' ctext_row
   {
     valNode := $1.selectStmt().(*ValuesClause)
@@ -2808,6 +3904,7 @@ from_clause:
   {
     $$.val = &From{Tables: $2.tblExprs(), AsOf: $3.asOfClause()}
   }
+| FROM error // SHOW HELP: <SOURCE>
 | /* EMPTY */
   {
     $$.val = &From{}
@@ -2828,6 +3925,13 @@ index_hints_param:
   {
      $$.val = &IndexHints{Index: Name($3)}
   }
+| FORCE_INDEX '=' '[' ICONST ']'
+  {
+    /* SKIP DOC */
+    id, err := $4.numVal().AsInt64()
+    if err != nil { sqllex.Error(err.Error()); return 1 }
+    $$.val = &IndexHints{IndexID: IndexID(id)}
+  }
 |
   NO_INDEX_JOIN
   {
@@ -2844,25 +3948,34 @@ index_hints_param_list:
   {
     a := $1.indexHints()
     b := $3.indexHints()
-    index := a.Index
-    if index == "" {
-       index = b.Index
-    } else if b.Index != "" {
-       sqllex.Error("FORCE_INDEX specified multiple times")
-       return 1
-    }
     if a.NoIndexJoin && b.NoIndexJoin {
        sqllex.Error("NO_INDEX_JOIN specified multiple times")
        return 1
     }
-    noIndexJoin := a.NoIndexJoin || b.NoIndexJoin
-    $$.val = &IndexHints{Index: index, NoIndexJoin: noIndexJoin}
+    if (a.Index != "" || a.IndexID != 0) && (b.Index != "" || b.IndexID != 0) {
+       sqllex.Error("FORCE_INDEX specified multiple times")
+       return 1
+    }
+    // At this point either a or b contains "no information"
+    // (the empty string for Index and the value 0 for IndexID).
+    // Using the addition operator automatically selects the non-zero
+    // value, avoiding a conditional branch.
+    a.Index = a.Index + b.Index
+    a.IndexID = a.IndexID + b.IndexID
+    a.NoIndexJoin = a.NoIndexJoin || b.NoIndexJoin
+    $$.val = a
   }
 
 opt_index_hints:
   '@' unrestricted_name
   {
     $$.val = &IndexHints{Index: Name($2)}
+  }
+| '@' '[' ICONST ']'
+  {
+    id, err := $3.numVal().AsInt64()
+    if err != nil { sqllex.Error(err.Error()); return 1 }
+    $$.val = &IndexHints{IndexID: IndexID(id)}
   }
 | '@' '{' index_hints_param_list '}'
   {
@@ -2873,9 +3986,48 @@ opt_index_hints:
     $$.val = (*IndexHints)(nil)
   }
 
-// table_ref is where an alias clause can be attached.
+// %Help: <SOURCE> - define a data source for SELECT
+// %Category: DML
+// %Text:
+// Data sources:
+//   <tablename> [ @ { <idxname> | <indexhint> } ]
+//   <tablefunc> ( <exprs...> )
+//   ( { <selectclause> | <source> } )
+//   <source> [AS] <alias> [( <colnames...> )]
+//   <source> { [INNER] | { LEFT | RIGHT } [OUTER] } JOIN <source> ON <expr>
+//   <source> { [INNER] | { LEFT | RIGHT } [OUTER] } JOIN <source> USING ( <colnames...> )
+//   <source> NATURAL { [INNER] | { LEFT | RIGHT } [OUTER] } JOIN <source>
+//   <source> CROSS JOIN <source>
+//   <source> WITH ORDINALITY
+//   '[' EXPLAIN ... ']'
+//   '[' SHOW ... ']'
+//
+// Index hints:
+//   '{' FORCE_INDEX = <idxname> [, ...] '}'
+//   '{' NO_INDEX_JOIN [, ...] '}'
+//
+// %SeeAlso: https://www.cockroachlabs.com/docs/table-expressions.html
 table_ref:
-  relation_expr opt_index_hints opt_ordinality opt_alias_clause
+  '[' ICONST opt_tableref_col_list alias_clause ']' opt_index_hints opt_ordinality opt_alias_clause
+  {
+    /* SKIP DOC */
+    id, err := $2.numVal().AsInt64()
+    if err != nil {
+      sqllex.Error(err.Error())
+      return 1
+    }
+    $$.val = &AliasedTableExpr{
+                 Expr: &TableRef{
+                    TableID: id,
+                    Columns: $3.tableRefCols(),
+		    As: $4.aliasClause(),
+                 },
+                 Hints: $6.indexHints(),
+                 Ordinality: $7.bool(),
+                 As: $8.aliasClause(),
+             }
+  }
+| relation_expr opt_index_hints opt_ordinality opt_alias_clause
   {
     $$.val = &AliasedTableExpr{Expr: $1.newNormalizableTableName(), Hints: $2.indexHints(), Ordinality: $3.bool(), As: $4.aliasClause() }
   }
@@ -2883,6 +4035,7 @@ table_ref:
   {
     $$.val = &AliasedTableExpr{Expr: &FuncExpr{Func: $1.resolvableFunctionReference(), Exprs: $3.exprs()}, Ordinality: $5.bool(), As: $6.aliasClause() }
   }
+| qualified_name '(' error { return helpWithFunction(sqllex, $1.resolvableFunctionReference()) }
 | select_with_parens opt_ordinality opt_alias_clause
   {
     $$.val = &AliasedTableExpr{Expr: &Subquery{Select: $1.selectStmt()}, Ordinality: $2.bool(), As: $3.aliasClause() }
@@ -2893,7 +4046,46 @@ table_ref:
   }
 | '(' joined_table ')' opt_ordinality alias_clause
   {
-    $$.val = &AliasedTableExpr{Expr: $2.tblExpr(), Ordinality: $4.bool(), As: $5.aliasClause() }
+    $$.val = &AliasedTableExpr{Expr: &ParenTableExpr{$2.tblExpr()}, Ordinality: $4.bool(), As: $5.aliasClause()}
+  }
+
+// The following syntax is a CockroachDB extension:
+//     SELECT ... FROM [ EXPLAIN .... ] WHERE ...
+//     SELECT ... FROM [ SHOW .... ] WHERE ...
+//     SELECT ... FROM [ INSERT ... RETURNING ... ] WHERE ...
+// A statement within square brackets can be used as a table expression (data source).
+// We use square brackets for two reasons:
+// - the grammar would be terribly ambiguous if we used simple
+//   parentheses or no parentheses at all.
+// - it carries visual semantic information, by marking the table
+//   expression as radically different from the other things.
+//   If a user does not know this and encounters this syntax, they
+//   will know from the unusual choice that something rather different
+//   is going on and may be pushed by the unusual syntax to
+//   investigate further in the docs.
+
+| '[' explainable_stmt ']' opt_ordinality opt_alias_clause
+  {
+    $$.val = &AliasedTableExpr{Expr: &StatementSource{ Statement: $2.stmt() }, Ordinality: $4.bool(), As: $5.aliasClause() }
+  }
+
+opt_tableref_col_list:
+  /* EMPTY */               { $$.val = nil }
+| '(' ')'                   { $$.val = []ColumnID{} }
+| '(' tableref_col_list ')' { $$.val = $2.tableRefCols() }
+
+tableref_col_list:
+  ICONST
+  {
+    id, err := $1.numVal().AsInt64()
+    if err != nil { sqllex.Error(err.Error()); return 1 }
+    $$.val = []ColumnID{ColumnID(id)}
+  }
+| tableref_col_list ',' ICONST
+  {
+    id, err := $3.numVal().AsInt64()
+    if err != nil { sqllex.Error(err.Error()); return 1 }
+    $$.val = append($1.tableRefCols(), ColumnID(id))
   }
 
 opt_ordinality:
@@ -3115,8 +4307,10 @@ cast_target:
   }
 
 opt_array_bounds:
-  opt_array_bounds '[' ']' { $$.val = Exprs{NewDInt(DInt(-1))} }
-| opt_array_bounds '[' ICONST ']' { return unimplementedWithIssue(sqllex, 2115) }
+  // TODO(justin): reintroduce multiple array bounds
+  // opt_array_bounds '[' ']' { $$.val = Exprs{NewDInt(DInt(-1))} }
+  '[' ']' { $$.val = Exprs{NewDInt(DInt(-1))} }
+| '[' ICONST ']' { return unimplementedWithIssue(sqllex, 17156) }
 | /* EMPTY */ { $$.val = Exprs(nil) }
 
 simple_typename:
@@ -3125,7 +4319,7 @@ simple_typename:
 | character
 | const_datetime
 | const_interval opt_interval // TODO(pmattis): Support opt_interval?
-| const_interval '(' ICONST ')' { return unimplemented(sqllex) }
+| const_interval '(' ICONST ')' { return unimplemented(sqllex, "simple_type const_interval") }
 | BLOB
   {
     $$.val = bytesColTypeBlob
@@ -3142,6 +4336,10 @@ simple_typename:
   {
     $$.val = stringColTypeText
   }
+| NAME
+  {
+    $$.val = nameColTypeName
+  }
 | SERIAL
   {
     $$.val = intColTypeSerial
@@ -3150,9 +4348,21 @@ simple_typename:
   {
     $$.val = intColTypeSmallSerial
   }
+| UUID
+  {
+    $$.val = uuidColTypeUUID
+  }
 | BIGSERIAL
   {
     $$.val = intColTypeBigSerial
+  }
+| OID
+  {
+    $$.val = oidColTypeOid
+  }
+| INT2VECTOR
+  {
+    $$.val = int2vectorColType
   }
 
 // We have a separate const_typename to allow defaulting fixed-length types
@@ -3205,6 +4415,14 @@ numeric:
   {
     $$.val = intColTypeInt
   }
+| INT2
+    {
+      $$.val = intColTypeInt2
+    }
+| INT4
+  {
+    $$.val = intColTypeInt4
+  }
 | INT8
   {
     $$.val = intColTypeInt8
@@ -3229,14 +4447,23 @@ numeric:
   {
     $$.val = floatColTypeReal
   }
+| FLOAT4
+    {
+      $$.val = floatColTypeFloat4
+    }
+| FLOAT8
+    {
+      $$.val = floatColTypeFloat8
+    }
 | FLOAT opt_float
   {
-    prec, err := $2.numVal().AsInt64()
+    nv := $2.numVal()
+    prec, err := nv.AsInt64()
     if err != nil {
       sqllex.Error(err.Error())
       return 1
     }
-    $$.val = newFloatColType(int(prec))
+    $$.val = NewFloatColType(int(prec), len(nv.OrigString) > 0)
   }
 | DOUBLE PRECISION
   {
@@ -3280,29 +4507,25 @@ numeric:
 
 // Postgres OID pseudo-types. See https://www.postgresql.org/docs/9.4/static/datatype-oid.html.
 postgres_oid:
-  OID
+  REGPROC
   {
-    $$.val = oidPseudoTypeOid
-  }
-| REGPROC
-  {
-    $$.val = oidPseudoTypeRegProc
+    $$.val = oidColTypeRegProc
   }
 | REGPROCEDURE
   {
-    $$.val = oidPseudoTypeRegProc
+    $$.val = oidColTypeRegProcedure
   }
 | REGCLASS
   {
-    $$.val = oidPseudoTypeRegClass
+    $$.val = oidColTypeRegClass
   }
 | REGTYPE
   {
-    $$.val = oidPseudoTypeRegType
+    $$.val = oidColTypeRegType
   }
 | REGNAMESPACE
   {
-    $$.val = oidPseudoTypeRegNamespace
+    $$.val = oidColTypeRegNamespace
   }
 
 opt_float:
@@ -3432,24 +4655,71 @@ const_interval:
   }
 
 opt_interval:
-  YEAR { return unimplemented(sqllex) }
-| MONTH { return unimplemented(sqllex) }
-| DAY { return unimplemented(sqllex) }
-| HOUR { return unimplemented(sqllex) }
-| MINUTE { return unimplemented(sqllex) }
-| interval_second { return unimplemented(sqllex) }
-| YEAR TO MONTH { return unimplemented(sqllex) }
-| DAY TO HOUR { return unimplemented(sqllex) }
-| DAY TO MINUTE { return unimplemented(sqllex) }
-| DAY TO interval_second { return unimplemented(sqllex) }
-| HOUR TO MINUTE { return unimplemented(sqllex) }
-| HOUR TO interval_second { return unimplemented(sqllex) }
-| MINUTE TO interval_second { return unimplemented(sqllex) }
-| /* EMPTY */ {}
+  YEAR
+  {
+    $$.val = year
+  }
+| MONTH
+  {
+    $$.val = month
+  }
+| DAY
+  {
+    $$.val = day
+  }
+| HOUR
+  {
+    $$.val = hour
+  }
+| MINUTE
+  {
+    $$.val = minute
+  }
+| interval_second
+  {
+    $$.val = $1.durationField()
+  }
+// Like Postgres, we ignore the left duration field. See explanation:
+// https://www.postgresql.org/message-id/20110510040219.GD5617%40tornado.gateway.2wire.net
+| YEAR TO MONTH
+  {
+    $$.val = month
+  }
+| DAY TO HOUR
+  {
+    $$.val = hour
+  }
+| DAY TO MINUTE
+  {
+    $$.val = minute
+  }
+| DAY TO interval_second
+  {
+    $$.val = $3.durationField()
+  }
+| HOUR TO MINUTE
+  {
+    $$.val = minute
+  }
+| HOUR TO interval_second
+  {
+    $$.val = $3.durationField()
+  }
+| MINUTE TO interval_second
+  {
+    $$.val = $3.durationField()
+  }
+| /* EMPTY */
+  {
+    $$.val = nil
+  }
 
 interval_second:
-  SECOND { return unimplemented(sqllex) }
-| SECOND '(' ICONST ')' { return unimplemented(sqllex) }
+  SECOND
+  {
+    $$.val = second
+  }
+| SECOND '(' ICONST ')' { return unimplemented(sqllex, "interval_second") }
 
 // General expressions. This is the heart of the expression syntax.
 //
@@ -3480,11 +4750,11 @@ a_expr:
   {
     $$.val = &AnnotateTypeExpr{Expr: $1.expr(), Type: $3.colType(), syntaxMode: annotateShort}
   }
-| a_expr COLLATE any_name
+| a_expr COLLATE unrestricted_name
   {
-    $$.val = &CollateExpr{Expr: $1.expr(), Locale: $3.unresolvedName().String()}
+    $$.val = &CollateExpr{Expr: $1.expr(), Locale: $3}
   }
-| a_expr AT TIME ZONE a_expr %prec AT { return unimplemented(sqllex) }
+| a_expr AT TIME ZONE a_expr %prec AT { return unimplemented(sqllex, "at tz") }
   // These operators must be called out explicitly in order to make use of
   // bison's automatic operator-precedence handling. All other operator names
   // are handled by the generic productions using "OP", below; and all those
@@ -3530,7 +4800,7 @@ a_expr:
   }
 | a_expr '^' a_expr
   {
-    $$.val = &BinaryExpr{Operator: Bitxor, Left: $1.expr(), Right: $3.expr()}
+    $$.val = &BinaryExpr{Operator: Pow, Left: $1.expr(), Right: $3.expr()}
   }
 | a_expr '#' a_expr
   {
@@ -3636,6 +4906,14 @@ a_expr:
   {
     $$.val = &ComparisonExpr{Operator: NotRegIMatch, Left: $1.expr(), Right: $3.expr()}
   }
+| a_expr IS NAN %prec IS
+  {
+    $$.val = &FuncExpr{Func: wrapFunction("ISNAN"), Exprs: Exprs{$1.expr()}}
+  }
+| a_expr IS NOT NAN %prec IS
+  {
+    $$.val = &NotExpr{Expr: &FuncExpr{Func: wrapFunction("ISNAN"), Exprs: Exprs{$1.expr()}}}
+  }
 | a_expr IS NULL %prec IS
   {
     $$.val = &ComparisonExpr{Operator: Is, Left: $1.expr(), Right: DNull}
@@ -3644,7 +4922,7 @@ a_expr:
   {
     $$.val = &ComparisonExpr{Operator: IsNot, Left: $1.expr(), Right: DNull}
   }
-| row OVERLAPS row { return unimplemented(sqllex) }
+| row OVERLAPS row { return unimplemented(sqllex, "overlaps") }
 | a_expr IS TRUE %prec IS
   {
     $$.val = &ComparisonExpr{Operator: Is, Left: $1.expr(), Right: MakeDBool(true)}
@@ -3720,9 +4998,9 @@ a_expr:
       return 1
     }
     $$.val = &ComparisonExpr{
-      Operator: op, 
+      Operator: op,
       SubOperator: subOpCmp,
-      Left: $1.expr(), 
+      Left: $1.expr(),
       Right: $4.expr(),
     }
   }
@@ -3783,7 +5061,7 @@ b_expr:
   }
 | b_expr '^' b_expr
   {
-    $$.val = &BinaryExpr{Operator: Bitxor, Left: $1.expr(), Right: $3.expr()}
+    $$.val = &BinaryExpr{Operator: Pow, Left: $1.expr(), Right: $3.expr()}
   }
 | b_expr '#' b_expr
   {
@@ -3858,11 +5136,11 @@ b_expr:
 // the b_expr syntax.
 c_expr:
   d_expr
-| d_expr indirection
+| d_expr array_subscripts
   {
     $$.val = &IndirectionExpr{
       Expr: $1.expr(),
-      Indirection: $2.unresolvedName(),
+      Indirection: $2.arraySubscripts(),
     }
   }
 | case_expr
@@ -3884,6 +5162,7 @@ d_expr:
 | a_expr_const
 | '@' ICONST
   {
+    /* SKIP DOC */
     colNum, err := $2.numVal().AsInt64()
     if err != nil {
       sqllex.Error(err.Error())
@@ -3936,8 +5215,8 @@ func_application:
   {
     $$.val = &FuncExpr{Func: $1.resolvableFunctionReference(), Exprs: $3.exprs()}
   }
-| func_name '(' VARIADIC a_expr opt_sort_clause ')' { return unimplemented(sqllex) }
-| func_name '(' expr_list ',' VARIADIC a_expr opt_sort_clause ')' { return unimplemented(sqllex) }
+| func_name '(' VARIADIC a_expr opt_sort_clause ')' { return unimplemented(sqllex, "variadic") }
+| func_name '(' expr_list ',' VARIADIC a_expr opt_sort_clause ')' { return unimplemented(sqllex, "variadic") }
 | func_name '(' ALL expr_list opt_sort_clause ')'
   {
     $$.val = &FuncExpr{Func: $1.resolvableFunctionReference(), Type: AllFuncType, Exprs: $4.exprs()}
@@ -3950,6 +5229,7 @@ func_application:
   {
     $$.val = &FuncExpr{Func: $1.resolvableFunctionReference(), Exprs: Exprs{StarExpr()}}
   }
+| func_name '(' error { return helpWithFunction(sqllex, $1.resolvableFunctionReference()) }
 
 // func_expr and its cousin func_expr_windowless are split out from c_expr just
 // so that we have classifications for "everything that is a function call or
@@ -3962,6 +5242,7 @@ func_expr:
   func_application within_group_clause filter_clause over_clause
   {
     f := $1.expr().(*FuncExpr)
+    f.Filter = $3.expr()
     f.WindowDef = $4.windowDef()
     $$.val = f
   }
@@ -3975,12 +5256,12 @@ func_expr:
 // expressions are not allowed, where needed to disambiguate the grammar
 // (e.g. in CREATE INDEX).
 func_expr_windowless:
-  func_application { return unimplemented(sqllex) }
-| func_expr_common_subexpr { return unimplemented(sqllex) }
+  func_application { return unimplemented(sqllex, "func_application") }
+| func_expr_common_subexpr { return unimplemented(sqllex, "func_expr_common_subexpr") }
 
 // Special expressions that are considered to be functions.
 func_expr_common_subexpr:
-  COLLATION FOR '(' a_expr ')' { return unimplemented(sqllex) }
+  COLLATION FOR '(' a_expr ')' { return unimplemented(sqllex, "func_expr_common_subexpr collation") }
 | CURRENT_DATE
   {
     $$.val = &FuncExpr{Func: wrapFunction($1)}
@@ -3989,6 +5270,16 @@ func_expr_common_subexpr:
   {
     $$.val = &FuncExpr{Func: wrapFunction($1)}
   }
+| CURRENT_DATE '(' error { return helpWithFunction(sqllex, ResolvableFunctionReference{UnresolvedName{Name($1)}}) }
+| CURRENT_SCHEMA
+  {
+    $$.val = &FuncExpr{Func: wrapFunction($1)}
+  }
+| CURRENT_SCHEMA '(' ')'
+  {
+    $$.val = &FuncExpr{Func: wrapFunction($1)}
+  }
+| CURRENT_SCHEMA '(' error { return helpWithFunction(sqllex, ResolvableFunctionReference{UnresolvedName{Name($1)}}) }
 | CURRENT_TIMESTAMP
   {
     $$.val = &FuncExpr{Func: wrapFunction($1)}
@@ -3997,10 +5288,11 @@ func_expr_common_subexpr:
   {
     $$.val = &FuncExpr{Func: wrapFunction($1)}
   }
-| CURRENT_ROLE { return unimplemented(sqllex) }
-| CURRENT_USER { return unimplemented(sqllex) }
-| SESSION_USER { return unimplemented(sqllex) }
-| USER { return unimplemented(sqllex) }
+| CURRENT_TIMESTAMP '(' error { return helpWithFunction(sqllex, ResolvableFunctionReference{UnresolvedName{Name($1)}}) }
+| CURRENT_ROLE { return unimplemented(sqllex, "current role") }
+| CURRENT_USER { return unimplemented(sqllex, "current user") }
+| SESSION_USER { return unimplemented(sqllex, "session user") }
+| USER { return unimplemented(sqllex, "user") }
 | CAST '(' a_expr AS cast_target ')'
   {
     $$.val = &CastExpr{Expr: $3.expr(), Type: $5.castTargetType(), syntaxMode: castExplicit}
@@ -4013,14 +5305,17 @@ func_expr_common_subexpr:
   {
     $$.val = &FuncExpr{Func: wrapFunction($1), Exprs: $3.exprs()}
   }
+| EXTRACT '(' error { return helpWithFunction(sqllex, ResolvableFunctionReference{UnresolvedName{Name($1)}}) }
 | EXTRACT_DURATION '(' extract_list ')'
   {
     $$.val = &FuncExpr{Func: wrapFunction($1), Exprs: $3.exprs()}
   }
+| EXTRACT_DURATION '(' error { return helpWithFunction(sqllex, ResolvableFunctionReference{UnresolvedName{Name($1)}}) }
 | OVERLAY '(' overlay_list ')'
   {
     $$.val = &FuncExpr{Func: wrapFunction($1), Exprs: $3.exprs()}
   }
+| OVERLAY '(' error { return helpWithFunction(sqllex, ResolvableFunctionReference{UnresolvedName{Name($1)}}) }
 | POSITION '(' position_list ')'
   {
     $$.val = &FuncExpr{Func: wrapFunction("STRPOS"), Exprs: $3.exprs()}
@@ -4029,7 +5324,8 @@ func_expr_common_subexpr:
   {
     $$.val = &FuncExpr{Func: wrapFunction($1), Exprs: $3.exprs()}
   }
-| TREAT '(' a_expr AS typename ')' { return unimplemented(sqllex) }
+| SUBSTRING '(' error { return helpWithFunction(sqllex, ResolvableFunctionReference{UnresolvedName{Name($1)}}) }
+| TREAT '(' a_expr AS typename ')' { return unimplemented(sqllex, "treat") }
 | TRIM '(' BOTH trim_list ')'
   {
     $$.val = &FuncExpr{Func: wrapFunction("BTRIM"), Exprs: $4.exprs()}
@@ -4066,19 +5362,27 @@ func_expr_common_subexpr:
   {
     $$.val = &FuncExpr{Func: wrapFunction($1), Exprs: $3.exprs()}
   }
+| GREATEST '(' error { return helpWithFunction(sqllex, ResolvableFunctionReference{UnresolvedName{Name($1)}}) }
 | LEAST '(' expr_list ')'
   {
     $$.val = &FuncExpr{Func: wrapFunction($1), Exprs: $3.exprs()}
   }
+| LEAST '(' error { return helpWithFunction(sqllex, ResolvableFunctionReference{UnresolvedName{Name($1)}}) }
 
 // Aggregate decoration clauses
 within_group_clause:
-WITHIN GROUP '(' sort_clause ')' { return unimplemented(sqllex) }
+WITHIN GROUP '(' sort_clause ')' { return unimplemented(sqllex, "within group") }
 | /* EMPTY */ {}
 
 filter_clause:
-  FILTER '(' WHERE a_expr ')' { return unimplemented(sqllex) }
-| /* EMPTY */ {}
+  FILTER '(' WHERE a_expr ')'
+  {
+    $$.val = $4.expr()
+  }
+| /* EMPTY */
+  {
+    $$.val = Expr(nil)
+  }
 
 // Window Definitions
 window_clause:
@@ -4165,23 +5469,23 @@ opt_partition_clause:
 // This is only a subset of the full SQL:2008 frame_clause grammar. We don't
 // support <window frame exclusion> yet.
 opt_frame_clause:
-  RANGE frame_extent { return unimplemented(sqllex) }
-| ROWS frame_extent { return unimplemented(sqllex) }
+  RANGE frame_extent { return unimplemented(sqllex, "frame range") }
+| ROWS frame_extent { return unimplemented(sqllex, "frame rows") }
 | /* EMPTY */ {}
 
 frame_extent:
-  frame_bound { return unimplemented(sqllex) }
-| BETWEEN frame_bound AND frame_bound { return unimplemented(sqllex) }
+  frame_bound { return unimplemented(sqllex, "frame_extent") }
+| BETWEEN frame_bound AND frame_bound { return unimplemented(sqllex, "frame_extent") }
 
 // This is used for both frame start and frame end, with output set up on the
 // assumption it's frame start; the frame_extent productions must reject
 // invalid cases.
 frame_bound:
-  UNBOUNDED PRECEDING { return unimplemented(sqllex) }
-| UNBOUNDED FOLLOWING { return unimplemented(sqllex) }
-| CURRENT ROW { return unimplemented(sqllex) }
-| a_expr PRECEDING { return unimplemented(sqllex) }
-| a_expr FOLLOWING { return unimplemented(sqllex) }
+  UNBOUNDED PRECEDING { return unimplemented(sqllex, "frame_bound") }
+| UNBOUNDED FOLLOWING { return unimplemented(sqllex, "frame_bound") }
+| CURRENT ROW { return unimplemented(sqllex, "frame_bound") }
+| a_expr PRECEDING { return unimplemented(sqllex, "frame_bound") }
+| a_expr FOLLOWING { return unimplemented(sqllex, "frame_bound") }
 
 // Supporting nonterminals for expressions.
 
@@ -4243,7 +5547,7 @@ math_op:
 | '%' { $$.val = Mod    }
 | '&' { $$.val = Bitand }
 | '|' { $$.val = Bitor  }
-| '^' { $$.val = Bitxor }
+| '^' { $$.val = Pow }
 | '#' { $$.val = Bitxor }
 | '<' { $$.val = LT }
 | '>' { $$.val = GT }
@@ -4485,7 +5789,7 @@ case_arg:
     $$.val = Expr(nil)
   }
 
-indirection_elem:
+array_subscript:
   '[' a_expr ']'
   {
     $$.val = &ArraySubscript{Begin: $2.expr()}
@@ -4534,24 +5838,14 @@ qname_indirection:
     $$.val = append($1.unresolvedName(), $2.namePart())
   }
 
-indirection:
-  indirection_elem
+array_subscripts:
+  array_subscript
   {
-    $$.val = UnresolvedName{$1.namePart()}
+    $$.val = ArraySubscripts{$1.arraySubscript()}
   }
-| indirection indirection_elem
+| array_subscripts array_subscript
   {
-    $$.val = append($1.unresolvedName(), $2.namePart())
-  }
-
-opt_indirection:
-  /* EMPTY */
-  {
-    $$.val = UnresolvedName(nil)
-  }
-| opt_indirection indirection_elem
-  {
-    $$.val = append($1.unresolvedName(), $2.namePart())
+    $$.val = append($1.arraySubscripts(), $2.arraySubscript())
   }
 
 opt_asymmetric:
@@ -4669,12 +5963,14 @@ qualified_name:
   }
 
 table_name_with_index:
-  qualified_name '@' name
+  qualified_name '@' unrestricted_name
   {
     $$.val = &TableNameWithIndex{Table: $1.normalizableTableName(), Index: Name($3)}
   }
 | qualified_name
   {
+    // This case allows specifying just an index name (potentially schema-qualified).
+    // We temporarily store the index name in Table (see TableNameWithIndex).
     $$.val = &TableNameWithIndex{Table: $1.normalizableTableName(), SearchTable: true}
   }
 
@@ -4752,19 +6048,16 @@ a_expr_const:
   {
     $$.val = &StrVal{s: $1, bytesEsc: true}
   }
-| func_name '(' expr_list opt_sort_clause ')' SCONST { return unimplemented(sqllex) }
+| func_name '(' expr_list opt_sort_clause ')' SCONST { return unimplemented(sqllex, "func const") }
 | const_typename SCONST
   {
-    $$.val = &CastExpr{Expr: &StrVal{s: $2}, Type: $1.colType(), syntaxMode: castPrefix}
+    $$.val = &CastExpr{Expr: &StrVal{s: $2}, Type: $1.colType(), syntaxMode: castPrepend}
   }
-| const_interval SCONST opt_interval
+| interval
   {
-    $$.val = &CastExpr{Expr: &StrVal{s: $2}, Type: $1.colType(), syntaxMode: castPrefix}
+    $$.val = $1.expr()
   }
-| const_interval '(' ICONST ')' SCONST
-  {
-    $$.val = &CastExpr{Expr: &StrVal{s: $5}, Type: $1.colType(), syntaxMode: castPrefixParens}
-  }
+| const_interval '(' ICONST ')' SCONST { return unimplemented(sqllex, "expr_const const_interval") }
 | TRUE
   {
     $$.val = MakeDBool(true)
@@ -4787,6 +6080,25 @@ signed_iconst:
 | '-' ICONST
   {
     $$.val = &NumVal{Value: constant.UnaryOp(token.SUB, $2.numVal().Value, 0)}
+  }
+
+interval:
+  const_interval SCONST opt_interval
+  {
+    // We don't carry opt_interval information into the column type, so we need
+    // to parse the interval directly.
+    var err error
+    var d Datum
+    if $3.val == nil {
+      d, err = ParseDInterval($2)
+    } else {
+      d, err = ParseDIntervalWithField($2, $3.durationField())
+    }
+    if err != nil {
+      sqllex.Error(err.Error())
+      return 1
+    }
+    $$.val = d
   }
 
 // Name classification hierarchy.
@@ -4850,10 +6162,6 @@ unrestricted_name:
 // shift or reduce conflicts. The earlier lists define "less reserved"
 // categories of keywords.
 //
-// Make sure that each keyword's category in kwlist.h matches where it is
-// listed here. (Someday we may be able to generate these lists and kwlist.h's
-// table from a common master list.)
-//
 // "Unreserved" keywords --- available for use as any kind of name.
 unreserved_keyword:
   ACTION
@@ -4864,7 +6172,9 @@ unreserved_keyword:
 | BEGIN
 | BLOB
 | BY
+| CANCEL
 | CASCADE
+| CLUSTER
 | COLUMNS
 | COMMIT
 | COMMITTED
@@ -4872,6 +6182,7 @@ unreserved_keyword:
 | CONSTRAINTS
 | COPY
 | COVERING
+| CSV
 | CUBE
 | CURRENT
 | CYCLE
@@ -4881,10 +6192,12 @@ unreserved_keyword:
 | DAY
 | DEALLOCATE
 | DELETE
+| DISCARD
 | DOUBLE
 | DROP
 | ENCODING
 | EXECUTE
+| EXPERIMENTAL_FINGERPRINTS
 | EXPLAIN
 | FILTER
 | FIRST
@@ -4894,13 +6207,18 @@ unreserved_keyword:
 | HELP
 | HIGH
 | HOUR
+| IMPORT
 | INCREMENTAL
 | INDEXES
 | INSERT
+| INT2VECTOR
 | INTERLEAVE
 | ISOLATION
+| JOB
+| JOBS
 | KEY
 | KEYS
+| KV
 | LC_COLLATE
 | LC_CTYPE
 | LEVEL
@@ -4909,26 +6227,30 @@ unreserved_keyword:
 | MATCH
 | MINUTE
 | MONTH
-| NAME
 | NAMES
+| NAN
 | NEXT
 | NO
 | NORMAL
-| NOTHING
 | NO_INDEX_JOIN
 | NULLS
 | OF
 | OFF
 | OID
+| OPTIONS
 | ORDINALITY
 | OVER
 | PARENT
 | PARTIAL
 | PARTITION
 | PASSWORD
+| PAUSE
+| PLANS
 | PRECEDING
 | PREPARE
 | PRIORITY
+| QUERIES
+| QUERY
 | RANGE
 | READ
 | RECURSIVE
@@ -4941,18 +6263,25 @@ unreserved_keyword:
 | RELEASE
 | RENAME
 | REPEATABLE
+| RESET
 | RESTORE
 | RESTRICT
+| RESUME
 | REVOKE
 | ROLLBACK
 | ROLLUP
 | ROWS
+| SETTING
+| SETTINGS
 | STATUS
 | SAVEPOINT
+| SCATTER
 | SEARCH
 | SECOND
 | SERIALIZABLE
+| SEQUENCES
 | SESSION
+| SESSIONS
 | SET
 | SHOW
 | SIMPLE
@@ -4960,13 +6289,19 @@ unreserved_keyword:
 | SQL
 | START
 | STDIN
+| STORE
 | STORING
 | STRICT
 | SPLIT
 | SYSTEM
 | TABLES
+| TEMP
 | TEMPLATE
+| TEMPORARY
+| TESTING_RANGES
+| TESTING_RELOCATE
 | TEXT
+| TRACE
 | TRANSACTION
 | TRUNCATE
 | TYPE
@@ -4975,6 +6310,7 @@ unreserved_keyword:
 | UNKNOWN
 | UPDATE
 | UPSERT
+| USE
 | USERS
 | VALID
 | VALIDATE
@@ -4982,6 +6318,7 @@ unreserved_keyword:
 | VARYING
 | WITHIN
 | WITHOUT
+| WRITE
 | YEAR
 | ZONE
 
@@ -5015,16 +6352,21 @@ col_name_keyword:
 | EXTRACT
 | EXTRACT_DURATION
 | FLOAT
+| FLOAT4
+| FLOAT8
 | GREATEST
 | GROUPING
 | IF
 | IFNULL
 | INT
+| INT2
+| INT4
 | INT8
 | INT64
 | INTEGER
 | INTERVAL
 | LEAST
+| NAME
 | NULLIF
 | NUMERIC
 | OUT
@@ -5043,6 +6385,7 @@ col_name_keyword:
 | TIMESTAMPTZ
 | TREAT
 | TRIM
+| UUID
 | VALUES
 | VARCHAR
 
@@ -5096,6 +6439,7 @@ reserved_keyword:
 | CURRENT_CATALOG
 | CURRENT_DATE
 | CURRENT_ROLE
+| CURRENT_SCHEMA
 | CURRENT_TIME
 | CURRENT_TIMESTAMP
 | CURRENT_USER
@@ -5127,6 +6471,7 @@ reserved_keyword:
 | LOCALTIME
 | LOCALTIMESTAMP
 | NOT
+| NOTHING
 | NULL
 | OFFSET
 | ON

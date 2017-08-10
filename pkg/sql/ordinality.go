@@ -11,14 +11,15 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Raphael 'kena' Poss (knz@cockroachlabs.com)
 
 package sql
 
 import (
+	"golang.org/x/net/context"
+
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
 )
 
@@ -31,7 +32,7 @@ import (
 // specification. In particular, applying a filter before or after
 // an intermediate ordinalityNode will produce different results.
 //
-// It is inserted in the logical plan between the selectNode and its
+// It is inserted in the logical plan between the renderNode and its
 // source node, thus earlier than the WHERE filters.
 //
 // In other words, *ordinalityNode establishes a barrier to many
@@ -40,27 +41,27 @@ import (
 type ordinalityNode struct {
 	source   planNode
 	ordering orderingInfo
-	columns  ResultColumns
-	row      parser.DTuple
+	columns  sqlbase.ResultColumns
+	row      parser.Datums
 	curCnt   int64
 }
 
 func (p *planner) wrapOrdinality(ds planDataSource) planDataSource {
 	src := ds.plan
-	srcColumns := src.Columns()
+	srcColumns := planColumns(src)
 
 	res := &ordinalityNode{
 		source:   src,
-		ordering: src.Ordering(),
-		row:      make(parser.DTuple, len(srcColumns)+1),
+		ordering: planOrdering(src),
+		row:      make(parser.Datums, len(srcColumns)+1),
 		curCnt:   1,
 	}
 
 	// Allocate an extra column for the ordinality values.
-	res.columns = make(ResultColumns, len(srcColumns)+1)
+	res.columns = make(sqlbase.ResultColumns, len(srcColumns)+1)
 	copy(res.columns, srcColumns)
 	newColIdx := len(res.columns) - 1
-	res.columns[newColIdx] = ResultColumn{
+	res.columns[newColIdx] = sqlbase.ResultColumn{
 		Name: "ordinality",
 		Typ:  parser.TypeInt,
 	}
@@ -83,41 +84,8 @@ func (p *planner) wrapOrdinality(ds planDataSource) planDataSource {
 	return ds
 }
 
-func (o *ordinalityNode) expandPlan() error {
-	if err := o.source.expandPlan(); err != nil {
-		return err
-	}
-
-	// We are going to "optimize" the ordering. We had an ordering
-	// initially from the source, but expandPlan() may have caused it to
-	// change. So here retrieve the ordering of the source again.
-	origOrdering := o.source.Ordering()
-
-	if len(origOrdering.ordering) > 0 {
-		// TODO(knz/radu) we basically have two simultaneous orderings.
-		// What we really want is something that orderingInfo cannot
-		// currently express: that the rows are ordered by a set of
-		// columns AND at the same time they are also ordered by a
-		// different set of columns. However since ordinalityNode is
-		// currently the only case where this happens we consider it's not
-		// worth the hassle and just use the source ordering.
-		o.ordering = origOrdering
-	} else {
-		// No ordering defined in the source, so create a new one.
-		o.ordering.exactMatchCols = origOrdering.exactMatchCols
-		o.ordering.ordering = sqlbase.ColumnOrdering{
-			sqlbase.ColumnOrderInfo{
-				ColIdx:    len(o.columns) - 1,
-				Direction: encoding.Ascending,
-			},
-		}
-		o.ordering.unique = true
-	}
-	return nil
-}
-
-func (o *ordinalityNode) Next() (bool, error) {
-	hasNext, err := o.source.Next()
+func (o *ordinalityNode) Next(params runParams) (bool, error) {
+	hasNext, err := o.source.Next(params)
 	if !hasNext || err != nil {
 		return hasNext, err
 	}
@@ -129,17 +97,51 @@ func (o *ordinalityNode) Next() (bool, error) {
 	return true, nil
 }
 
-func (o *ordinalityNode) ExplainPlan(_ bool) (string, string, []planNode) {
-	return "ordinality", "", []planNode{o.source}
+func (o *ordinalityNode) Values() parser.Datums        { return o.row }
+func (o *ordinalityNode) Start(params runParams) error { return o.source.Start(params) }
+func (o *ordinalityNode) Close(ctx context.Context)    { o.source.Close(ctx) }
+
+// restrictOrdering transforms an ordering requirement on the output
+// of an ordinalityNode into an ordering requirement on its input.
+func (o *ordinalityNode) restrictOrdering(
+	desiredOrdering sqlbase.ColumnOrdering,
+) sqlbase.ColumnOrdering {
+	// If there's a desired ordering on the ordinality column, drop it and every
+	// column after that.
+	if len(desiredOrdering) > 0 {
+		for i, ordInfo := range desiredOrdering {
+			if ordInfo.ColIdx == len(o.columns)-1 {
+				return desiredOrdering[:i]
+			}
+		}
+	}
+	return desiredOrdering
 }
 
-func (o *ordinalityNode) Ordering() orderingInfo                { return o.ordering }
-func (o *ordinalityNode) Values() parser.DTuple                 { return o.row }
-func (o *ordinalityNode) DebugValues() debugValues              { return o.source.DebugValues() }
-func (o *ordinalityNode) MarkDebug(mode explainMode)            { o.source.MarkDebug(mode) }
-func (o *ordinalityNode) Columns() ResultColumns                { return o.columns }
-func (o *ordinalityNode) Start() error                          { return o.source.Start() }
-func (o *ordinalityNode) Close()                                { o.source.Close() }
-func (o *ordinalityNode) ExplainTypes(_ func(string, string))   {}
-func (o *ordinalityNode) SetLimitHint(numRows int64, soft bool) { o.source.SetLimitHint(numRows, soft) }
-func (o *ordinalityNode) setNeededColumns(_ []bool)             {}
+// optimizeOrdering updates the ordinalityNode's ordering based on a
+// potentially new ordering information from its source.
+func (o *ordinalityNode) optimizeOrdering() {
+	// We are going to "optimize" the ordering. We had an ordering
+	// initially from the source, but expand() may have caused it to
+	// change. So here retrieve the ordering of the source again.
+	origOrdering := planOrdering(o.source)
+
+	if len(origOrdering.ordering) > 0 {
+		// TODO(knz/radu): we basically have two simultaneous orderings.
+		// What we really want is something that orderingInfo cannot
+		// currently express: that the rows are ordered by a set of
+		// columns AND at the same time they are also ordered by a
+		// different set of columns. However since ordinalityNode is
+		// currently the only case where this happens we consider it's not
+		// worth the hassle and just use the source ordering.
+		o.ordering = origOrdering.copy()
+	} else {
+		// No ordering defined in the source, so create a new one.
+		o.ordering.constantCols = origOrdering.constantCols.Copy()
+		o.ordering.ordering = []orderingColumnGroup{{
+			cols: util.MakeFastIntSet(uint32(len(o.columns) - 1)),
+			dir:  encoding.Ascending,
+		}}
+		o.ordering.isKey = true
+	}
+}

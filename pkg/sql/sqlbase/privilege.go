@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Marc Berhault (marc@cockroachlabs.com)
 
 package sqlbase
 
@@ -168,32 +166,33 @@ func (p *PrivilegeDescriptor) Revoke(user string, privList privilege.List) {
 // it belongs to a system descriptor, in which case the maximum
 // set of allowed privileges is looked up and applied.
 func (p PrivilegeDescriptor) Validate(id ID) error {
-	userPriv, ok := p.findUser(security.RootUser)
+	rootPriv, ok := p.findUser(security.RootUser)
 	if !ok {
 		return fmt.Errorf("user %s does not have privileges", security.RootUser)
 	}
-	if IsSystemConfigID(id) {
+	if IsReservedID(id) {
 		// System databases and tables have custom maximum allowed privileges.
-		objectPrivileges, ok := SystemConfigAllowedPrivileges[id]
+		allowedPrivileges, ok := SystemAllowedPrivileges[id]
 		if !ok {
 			return fmt.Errorf("no allowed privileges found for system object with ID=%d", id)
 		}
 
-		// The root user must have all the allowed privileges.
-		allowedPrivileges := objectPrivileges.ToBitField()
-		if userPriv.Privileges&allowedPrivileges != allowedPrivileges {
-			return fmt.Errorf("user %s must have %s privileges on system objects",
-				security.RootUser, privilege.ListFromBitField(allowedPrivileges))
+		// The root user must match one of the allowed privilege sets exactly.
+		if !allowedPrivileges.Contains(rootPriv.Privileges) {
+			return fmt.Errorf("user %s must have exactly %s privileges on this system object",
+				security.RootUser, allowedPrivileges)
 		}
 
-		// For all users (root included), no other privileges must be granted.
-		for _, u := range p.Users {
-			if remaining := u.Privileges &^ allowedPrivileges; remaining != 0 {
-				return fmt.Errorf("user %s must not have %s privileges on system objects",
-					u.User, privilege.ListFromBitField(remaining))
+		// For all users, no other privileges must be granted.
+		if !isPrivilegeSet(rootPriv.Privileges, privilege.ALL) {
+			for _, u := range p.Users {
+				if remaining := u.Privileges &^ rootPriv.Privileges; remaining != 0 {
+					return fmt.Errorf("user %s must not have %s privileges on this system object",
+						u.User, privilege.ListFromBitField(remaining))
+				}
 			}
 		}
-	} else if !isPrivilegeSet(userPriv.Privileges, privilege.ALL) {
+	} else if !isPrivilegeSet(rootPriv.Privileges, privilege.ALL) {
 		// Non-system databases and tables must preserve ALL
 		// privileges for the root user.
 		return fmt.Errorf("user %s does not have ALL privileges", security.RootUser)
@@ -230,7 +229,8 @@ func (p PrivilegeDescriptor) Show() []UserPrivilegeString {
 func (p PrivilegeDescriptor) CheckPrivilege(user string, priv privilege.Kind) bool {
 	userPriv, ok := p.findUser(user)
 	if !ok {
-		return false
+		// User "node" has all privileges.
+		return user == security.NodeUser
 	}
 	// ALL is always good.
 	if isPrivilegeSet(userPriv.Privileges, privilege.ALL) {

@@ -25,17 +25,13 @@ import "cockroach/pkg/util/hlc/timestamp.proto";
 
 import "gogoproto/gogo.proto";
 
-// TODO(bdarnell): could do away with Merge and ChangeReplicas and use their
-// roachpb counterparts directly. See how this turns out as the protos here
-// stabilize: the original intention is being more flexible with future
-// additions to the local proto without having to touch the roachpb one, but
-// that may not be required.
-
 // Split is emitted when a Replica commits a split trigger. It signals that the
 // Replica has prepared the on-disk state for both the left and right hand
 // sides of the split, and that the left hand side Replica should be updated as
 // well as the right hand side created.
 message Split {
+  option (gogoproto.equal) = true;
+
   optional roachpb.SplitTrigger trigger = 1 [(gogoproto.nullable) = false, (gogoproto.embed) = true];
   // RHSDelta holds the statistics for what was written to what is now the
   // right-hand side of the split during the batch which executed it.
@@ -48,6 +44,8 @@ message Split {
 // Merge is emitted by a Replica which commits a transaction with
 // a MergeTrigger (i.e. absorbs its right neighbor).
 message Merge {
+  option (gogoproto.equal) = true;
+
   optional roachpb.MergeTrigger trigger = 1 [(gogoproto.nullable) = false,
     (gogoproto.embed) = true];
 }
@@ -55,6 +53,10 @@ message Merge {
 // ChangeReplicas is emitted by a Replica which commits a transaction with
 // a ChangeReplicasTrigger.
 message ChangeReplicas {
+  option (gogoproto.equal) = true;
+
+  option (gogoproto.goproto_stringer) = false;
+
   optional roachpb.ChangeReplicasTrigger trigger = 1 [(gogoproto.nullable) = false,
     (gogoproto.embed) = true];
 }
@@ -65,33 +67,54 @@ message ChangeReplicas {
 // trivial; only changes to the metadata state (splits, merges, rebalances,
 // leases, log truncation, ...) of the Replica or certain special commands must
 // sideline information here based on which all Replicas must take action.
-//
-// TODO(tschottdorf): We may need to add a lease identifier to allow the
-// followers to reliably produce errors for proposals which apply after a
-// lease change.
 message ReplicatedEvalResult {
+  option (gogoproto.equal) = true;
+
+  optional bytes start_key = 14 [(gogoproto.casttype) = "github.com/cockroachdb/cockroach/pkg/roachpb.RKey"];
+  optional bytes end_key = 15 [(gogoproto.casttype) = "github.com/cockroachdb/cockroach/pkg/roachpb.RKey"];
   // Whether to block concurrent readers while processing the proposal data.
-  optional bool block_reads = 10001 [(gogoproto.nullable) = false];
+  optional bool block_reads = 1 [(gogoproto.nullable) = false];
   // Updates to the Replica's ReplicaState. By convention and as outlined on
   // the comment on the ReplicaState message, this field is sparsely populated
   // and any field set overwrites the corresponding field in the state, perhaps
   // which additional side effects (for instance on a descriptor update).
-  optional storage.storagebase.ReplicaState state = 10002 [(gogoproto.nullable) = false];
-  optional Split split = 10003;
-  optional Merge merge = 10004;
-  // TODO(tschottdorf): trim this down; we shouldn't need the whole request.
-  optional roachpb.ComputeChecksumRequest compute_checksum = 10005;
-  optional bool is_lease_request = 10006 [(gogoproto.nullable) = false];
-  optional bool is_freeze = 10007 [(gogoproto.nullable) = false];
-  // Denormalizes BatchRequest.Timestamp during the transition period for
-  // proposer-evaluated KV. Only used to verify lease coverage.
-  optional util.hlc.Timestamp timestamp = 10008 [(gogoproto.nullable) = false];
-  optional bool is_consistency_related = 10009 [(gogoproto.nullable) = false];
+  optional storage.storagebase.ReplicaState state = 2 [(gogoproto.nullable) = false];
+  optional Split split = 3;
+  optional Merge merge = 4;
+  optional roachpb.ComputeChecksumRequest compute_checksum = 5;
+  optional bool is_lease_request = 6 [(gogoproto.nullable) = false];
+  optional bool is_freeze = 7 [(gogoproto.nullable) = false];
+  // Duplicates BatchRequest.Timestamp for proposer-evaluated KV. Used
+  // to verify the validity of the command (for lease coverage and GC
+  // threshold).
+  optional util.hlc.Timestamp timestamp = 8 [(gogoproto.nullable) = false];
+  optional bool is_consistency_related = 9 [(gogoproto.nullable) = false];
   // The stats delta corresponding to the data in this WriteBatch. On
   // a split, contains only the contributions to the left-hand side.
-  optional storage.engine.enginepb.MVCCStats delta = 10010 [(gogoproto.nullable) = false];
-  optional ChangeReplicas change_replicas = 10012;
-  optional int64 raft_log_delta = 10013;
+  optional storage.engine.enginepb.MVCCStats delta = 10 [(gogoproto.nullable) = false];
+  optional ChangeReplicas change_replicas = 12;
+  optional int64 raft_log_delta = 13;
+
+  // AddSSTable is a side effect that must execute before the Raft application
+  // is committed. It must be idempotent to account for an ill-timed crash after
+  // applying the side effect, but before committing the batch.
+  //
+  // TODO(tschottdorf): additionally, after the crash, the node must not serve
+  // traffic until the persisted committed log has fully applied. Otherwise, we
+  // risk exposing data created through such a side effect whose corresponding
+  // Raft command hasn't committed yet. This isn't so much an issue with AddSSTable
+  // since these Ranges are not user-visible, but it is a general concern assuming
+  // other such side effects are added.
+  message AddSSTable {
+    option (gogoproto.equal) = true;
+
+    optional bytes data = 1;
+    optional uint32 crc32 = 2 [(gogoproto.nullable) = false, (gogoproto.customname) = "CRC32"];
+  }
+  reserved 16;
+  optional AddSSTable add_sstable = 17 [(gogoproto.customname) = "AddSSTable"];
+
+  reserved 10001 to 10013;
 }
 
 // WriteBatch is the serialized representation of a RocksDB write
@@ -112,27 +135,40 @@ message RaftCommand {
   // top-level instead of being grouped in a sub-message for
   // backwards-compatibility.
 
-  // origin_replica is the replica which proposed this command, to be
+  // proposer_replica is the replica which proposed this command, to be
   // used for lease validation.
-  optional roachpb.ReplicaDescriptor origin_replica = 2 [(gogoproto.nullable) = false];
+  optional roachpb.ReplicaDescriptor proposer_replica = 2 [(gogoproto.nullable) = false];
 
-  // origin_lease is provided to verify at raft command apply-time that
+  // proposer_lease is provided to verify at raft command apply-time that
   // the lease under which the command was proposed remains in effect.
-  // If the command was proposed prior to the introduction of epoch leases,
-  // origin_lease will be nil, but the combination of origin_replica and
-  // the request timestamp are used to verify an expiration-based lease.
-  optional roachpb.Lease origin_lease = 5;
+  //
+  // To see why lease verification downstream of Raft is required, consider the
+  // following example:
+  // - replica 1 receives a client request for a write
+  // - replica 1 checks the lease; the write is permitted
+  // - replica 1 proposes the command
+  // - time passes, replica 2 commits a new lease
+  // - the command applies on replica 1
+  // - replica 2 serves anomalous reads which don't see the write
+  // - the command applies on replica 2
+  optional roachpb.Lease proposer_lease = 5 [(gogoproto.nullable) = false];
 
   // When the command is applied, its result is an error if the lease log
   // counter has already reached (or exceeded) max_lease_index.
   //
-  // The lease index is a replay protection mechanism. Similar to the Raft
-  // applied index, it is strictly increasing, but may have gaps. A command
-  // will only apply successfully if its max_lease_index has not been surpassed
-  // by the Range's applied lease index (in which case the command may need
-  // to be retried, that is, regenerated with a higher max_lease_index).
-  // When the command applies, the new lease index will increase to
-  // max_lease_index (so a potential later replay will fail).
+  // The lease index is a reorder protection mechanism - we don't want Raft
+  // commands (proposed by a single node, the one with proposer_lease) executing
+  // in a different order than the one in which the corresponding KV requests
+  // were evaluated and the commands were proposed. This is important because
+  // the CommandQueue does not fully serialize commands - mostly when it comes
+  // to updates to the internal state of the range (this should be re-evaluated
+  // once proposer-evaluated KV is completed - see #10413).
+  // Similar to the Raft applied index, it is strictly increasing, but may have
+  // gaps. A command will only apply successfully if its max_lease_index has not
+  // been surpassed by the Range's applied lease index (in which case the
+  // command may need to be retried, that is, regenerated with a higher
+  // max_lease_index). When the command applies, the new lease index will
+  // increase to max_lease_index (so a potential later replay will fail).
   //
   // This mechanism was introduced as a simpler alternative to using the Raft
   // applied index, which is fraught with complexity due to the need to predict
@@ -151,25 +187,17 @@ message RaftCommand {
   // well as that uproots whatever ordering was originally envisioned.
   optional uint64 max_lease_index = 4 [(gogoproto.nullable) = false];
 
-  // Legacy mode (post-raft evaluation):
-
-  // batch_request is the KV command to apply.
-  // TODO(bdarnell): Should not be set when propEvalKV is used, but is currently
-  // required to support test filters.
-  optional roachpb.BatchRequest batch_request = 3;
+  // testing_batch_request is the KV request that generated this Raft command.
+  //
+  // TODO(bdarnell): This used to be a pre-proposer-evaluated-kv field; we're
+  // now exclusively proposer-evaluated, but it is still needed by certain tests
+  // that use TestingEvalFilter. See #10493.
+  optional roachpb.BatchRequest testing_batch_request = 3;
 
   // Proposer-evaluated KV mode.
-  // These are not stable. While general proto compatibility rules
-  // apply, these are intentionally kept at high tag numbers for now so that
-  // a stabilized version can be inserted at low tag numbers in the future.
-  // These fields are only populated if proposer-evaluated KV was in effect when
-  // the command was proposed.
 
-  optional ReplicatedEvalResult replicated_eval_result = 10013;
-  // TODO(tschottdorf): using an extra message here (and not just `bytes`) to
-  // allow the generated RaftCommand to be compared directly. If
-  // this costs an extra large allocation, we need to do something different.
-  optional WriteBatch write_batch = 10014;
+  optional ReplicatedEvalResult replicated_eval_result = 13 [(gogoproto.nullable) = false];
+  optional WriteBatch write_batch = 14;
 
-  reserved 1, 10001 to 10012;
+  reserved 1, 10001 to 10014;
 }

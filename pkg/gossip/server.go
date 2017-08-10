@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Spencer Kimball (spencer.kimball@gmail.com)
 
 package gossip
 
@@ -35,6 +33,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
+	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 )
 
 type serverInfo struct {
@@ -53,9 +52,10 @@ type server struct {
 
 	mu struct {
 		syncutil.Mutex
-		is       *infoStore                         // The backing infostore
-		incoming nodeSet                            // Incoming client node IDs
-		nodeMap  map[util.UnresolvedAddr]serverInfo // Incoming client's local address -> serverInfo
+		is        *infoStore                         // The backing infostore
+		incoming  nodeSet                            // Incoming client node IDs
+		nodeMap   map[util.UnresolvedAddr]serverInfo // Incoming client's local address -> serverInfo
+		clusterID uuid.UUID
 		// ready broadcasts a wakeup to waiting gossip requests. This is done
 		// via closing the current ready channel and opening a new one. This
 		// is required due to the fact that condition variables are not
@@ -63,7 +63,7 @@ type server struct {
 		// https://github.com/golang/go/issues/16620
 		ready chan struct{}
 	}
-	tighten chan roachpb.NodeID // Channel of too-distant node IDs
+	tighten chan struct{} // Sent on when we may want to tighten the network
 
 	nodeMetrics   Metrics
 	serverMetrics Metrics
@@ -82,7 +82,7 @@ func newServer(
 		AmbientContext: ambient,
 		NodeID:         nodeID,
 		stopper:        stopper,
-		tighten:        make(chan roachpb.NodeID, 1),
+		tighten:        make(chan struct{}, 1),
 		nodeMetrics:    makeMetrics(),
 		serverMetrics:  makeMetrics(),
 	}
@@ -98,6 +98,21 @@ func newServer(
 	return s
 }
 
+// SetClusterID sets the cluster ID to prevent nodes from illegally
+// connecting to incorrect clusters, or from allowing nodes from
+// other clusters to incorrectly connect to this one.
+func (s *server) SetClusterID(clusterID uuid.UUID) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.mu.clusterID = clusterID
+}
+
+func (s *server) GetClusterID() uuid.UUID {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.mu.clusterID
+}
+
 // GetNodeMetrics returns this server's node metrics struct.
 func (s *server) GetNodeMetrics() *Metrics {
 	return &s.nodeMetrics
@@ -110,6 +125,9 @@ func (s *server) Gossip(stream Gossip_GossipServer) error {
 	args, err := stream.Recv()
 	if err != nil {
 		return err
+	}
+	if (args.ClusterID != uuid.UUID{}) && args.ClusterID != s.GetClusterID() {
+		return errors.Errorf("gossip connection refused from different cluster %s", args.ClusterID)
 	}
 
 	ctx, cancel := context.WithCancel(s.AnnotateCtx(stream.Context()))
@@ -135,21 +153,11 @@ func (s *server) Gossip(stream Gossip_GossipServer) error {
 
 	defer func() { syncChan <- struct{}{} }()
 
-	// Verify that there aren't multiple incoming connections from the same
-	// node. This can happen when bootstrap connections are initiated through
-	// a load balancer.
-	s.mu.Lock()
-	_, ok := s.mu.nodeMap[args.Addr]
-	s.mu.Unlock()
-	if ok {
-		return errors.Errorf("duplicate connection from node at %s", args.Addr)
-	}
-
 	errCh := make(chan error, 1)
 
 	// Starting workers in a task prevents data races during shutdown.
-	if err := s.stopper.RunTask(func() {
-		s.stopper.RunWorker(func() {
+	if err := s.stopper.RunTask(ctx, "gossip.server: receiver", func(ctx context.Context) {
+		s.stopper.RunWorker(ctx, func(ctx context.Context) {
 			errCh <- s.gossipReceiver(ctx, &args, send, stream.Recv)
 		})
 	}); err != nil {
@@ -208,11 +216,23 @@ func (s *server) gossipReceiver(
 
 	reply := new(Response)
 
+	// Track whether we've decided whether or not to admit the gossip connection
+	// from this node. We only want to do this once so that we can do a duplicate
+	// connection check based on node ID here.
+	nodeIdentified := false
+
 	// This loop receives gossip from the client. It does not attempt to send the
 	// server's gossip to the client.
 	for {
 		args := *argsPtr
-		if args.NodeID != 0 {
+		if args.NodeID == 0 {
+			// Let the connection through so that the client can get a node ID. Once it
+			// has one, we'll run the logic below to decide whether to keep the
+			// connection to it or to forward it elsewhere.
+			log.Infof(ctx, "received initial cluster-verification connection from %s", args.Addr)
+		} else if !nodeIdentified {
+			nodeIdentified = true
+
 			// Decide whether or not we can accept the incoming connection
 			// as a permanent peer.
 			if args.NodeID == s.NodeID.Get() {
@@ -221,15 +241,16 @@ func (s *server) gossipReceiver(
 				if log.V(2) {
 					log.Infof(ctx, "ignoring gossip from node %d (loopback)", args.NodeID)
 				}
-			} else if s.mu.incoming.hasNode(args.NodeID) {
-				// Do nothing.
+			} else if _, ok := s.mu.nodeMap[args.Addr]; ok {
+				// This is a duplicate incoming connection from the same node as an existing
+				// connection. This can happen when bootstrap connections are initiated
+				// through a load balancer.
 				if log.V(2) {
-					log.Infof(ctx, "gossip received from node %d", args.NodeID)
+					log.Infof(ctx, "duplicate connection received from node %d at %s", args.NodeID, args.Addr)
 				}
+				return errors.Errorf("duplicate connection from node at %s", args.Addr)
 			} else if s.mu.incoming.hasSpace() {
-				if log.V(2) {
-					log.Infof(ctx, "adding node %d to incoming set", args.NodeID)
-				}
+				log.VEventf(ctx, 2, "adding node %d to incoming set", args.NodeID)
 
 				s.mu.incoming.addNode(args.NodeID)
 				s.mu.nodeMap[args.Addr] = serverInfo{
@@ -238,14 +259,12 @@ func (s *server) gossipReceiver(
 				}
 
 				defer func(nodeID roachpb.NodeID, addr util.UnresolvedAddr) {
-					if log.V(2) {
-						log.Infof(ctx, "removing node %d from incoming set", args.NodeID)
-					}
-
+					log.VEventf(ctx, 2, "removing node %d from incoming set", args.NodeID)
 					s.mu.incoming.removeNode(nodeID)
 					delete(s.mu.nodeMap, addr)
 				}(args.NodeID, args.Addr)
 			} else {
+				// If we don't have any space left, forward the client along to a peer.
 				var alternateAddr util.UnresolvedAddr
 				var alternateNodeID roachpb.NodeID
 				// Choose a random peer for forwarding.
@@ -259,6 +278,7 @@ func (s *server) gossipReceiver(
 					altIdx--
 				}
 
+				s.nodeMetrics.ConnectionsRefused.Inc(1)
 				log.Infof(ctx, "refusing gossip from node %d (max %d conns); forwarding to %d (%s)",
 					args.NodeID, s.mu.incoming.maxSize, alternateNodeID, alternateAddr)
 
@@ -281,8 +301,6 @@ func (s *server) gossipReceiver(
 					return err
 				}
 			}
-		} else {
-			log.Info(ctx, "received gossip from unknown node")
 		}
 
 		bytesReceived := int64(args.Size())
@@ -332,25 +350,10 @@ func (s *server) gossipReceiver(
 	}
 }
 
-// maybeTightenLocked examines the infostore for the most distant node and
-// if more distant than MaxHops, sends on the tightenNetwork channel
-// to start a new client connection. The mutex must be held by the caller.
 func (s *server) maybeTightenLocked() {
-	ctx := s.AnnotateCtx(context.TODO())
-	distantNodeID, distantHops := s.mu.is.mostDistant()
-	if log.V(2) {
-		log.Infof(ctx, "distantHops: %d from %d", distantHops, distantNodeID)
-	}
-	if distantHops > MaxHops {
-		select {
-		case s.tighten <- distantNodeID:
-			if log.V(1) {
-				log.Infof(ctx, "if possible, tightening network to node %d (%d > %d)",
-					distantNodeID, distantHops, MaxHops)
-			}
-		default:
-			// Do nothing.
-		}
+	select {
+	case s.tighten <- struct{}{}:
+	default:
 	}
 }
 
@@ -377,7 +380,7 @@ func (s *server) start(addr net.Addr) {
 		broadcast()
 	})
 
-	s.stopper.RunWorker(func() {
+	s.stopper.RunWorker(context.TODO(), func(context.Context) {
 		<-s.stopper.ShouldQuiesce()
 
 		s.mu.Lock()

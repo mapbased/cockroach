@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Matt Jibson (mjibson@gmail.com)
 
 package sql_test
 
@@ -21,10 +19,12 @@ import (
 	"fmt"
 	"testing"
 
-	inf "gopkg.in/inf.v0"
+	"golang.org/x/net/context"
 
+	"github.com/cockroachdb/apd"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	csql "github.com/cockroachdb/cockroach/pkg/sql"
+	"github.com/cockroachdb/cockroach/pkg/sql"
+	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/storage/storagebase"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
@@ -36,11 +36,11 @@ func TestAsOfTime(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
 	params, _ := createTestServerParams()
-	params.Knobs.SQLSchemaChanger = &csql.SchemaChangerTestingKnobs{
+	params.Knobs.SQLSchemaChanger = &sql.SchemaChangerTestingKnobs{
 		AsyncExecNotification: asyncSchemaChangerDisabled,
 	}
 	s, db, _ := serverutils.StartServer(t, params)
-	defer s.Stopper().Stop()
+	defer s.Stopper().Stop(context.TODO())
 
 	const val1 = 1
 	const val2 = 2
@@ -63,7 +63,7 @@ func TestAsOfTime(t *testing.T) {
 	if err := db.QueryRow("CREATE DATABASE d; SELECT cluster_logical_timestamp()").Scan(&tsDBExists); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := db.Query(fmt.Sprintf(query, tsDBExists), 0); !testutils.IsError(err, `pq: table "d.t" does not exist`) {
+	if _, err := db.Query(fmt.Sprintf(query, tsDBExists), 0); !testutils.IsError(err, `pq: relation "d.t" does not exist`) {
 		t.Fatal(err)
 	}
 
@@ -157,7 +157,7 @@ func TestAsOfTime(t *testing.T) {
 	// Old queries shouldn't work.
 	if err := db.QueryRow("SELECT a FROM d.t AS OF SYSTEM TIME '1969-12-31'").Scan(&i); err == nil {
 		t.Fatal("expected error")
-	} else if !testutils.IsError(err, "pq: batch timestamp -86400.000000000,0 must be after replica GC threshold 0.000000000,0") {
+	} else if !testutils.IsError(err, "pq: batch timestamp -86400.000000000,0 must be after GC threshold 0.000000000,0") {
 		t.Fatal(err)
 	}
 
@@ -196,7 +196,7 @@ func TestAsOfRetry(t *testing.T) {
 	// Disable one phase commits because they cannot be restarted.
 	params.Knobs.Store.(*storage.StoreTestingKnobs).DisableOnePhaseCommits = true
 	s, sqlDB, _ := serverutils.StartServer(t, params)
-	defer s.Stopper().Stop()
+	defer s.Stopper().Stop(context.TODO())
 
 	const val1 = 1
 	const val2 = 2
@@ -220,13 +220,16 @@ func TestAsOfRetry(t *testing.T) {
 	if err := sqlDB.QueryRow("UPDATE d.t SET a = $1 RETURNING cluster_logical_timestamp()", val2).Scan(&tsVal2); err != nil {
 		t.Fatal(err)
 	}
-	walltime := new(inf.Dec)
-	if _, ok := walltime.SetString(tsVal2); !ok {
+	walltime := new(apd.Decimal)
+	if _, _, err := walltime.SetString(tsVal2); err != nil {
 		t.Fatalf("couldn't set decimal: %s", tsVal2)
 	}
-	oneTick := inf.NewDec(1, 0)
+	oneTick := apd.New(1, 0)
 	// Set tsVal1 to 1ns before tsVal2.
-	tsVal1 := walltime.Sub(walltime, oneTick).String()
+	if _, err := parser.ExactCtx.Sub(walltime, walltime, oneTick); err != nil {
+		t.Fatal(err)
+	}
+	tsVal1 := walltime.Text('f')
 
 	// Set up error injection that causes retries.
 	magicVals := createFilterVals(nil, nil)
@@ -246,7 +249,7 @@ func TestAsOfRetry(t *testing.T) {
 					}
 					if count > 0 && bytes.Contains(req.Key, []byte(key)) {
 						magicVals.restartCounts[key]--
-						err := roachpb.NewTransactionRetryError()
+						err := roachpb.NewTransactionRetryError(roachpb.RETRY_REASON_UNKNOWN)
 						magicVals.failedValues[string(req.Key)] =
 							failureRecord{err, args.Hdr.Txn}
 						txn := args.Hdr.Txn.Clone()

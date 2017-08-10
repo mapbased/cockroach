@@ -11,15 +11,12 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Spencer Kimball (spencer.kimball@gmail.com)
 
 package server
 
 import (
 	"fmt"
 	"net/http"
-	"path/filepath"
 	"time"
 
 	"github.com/pkg/errors"
@@ -31,9 +28,13 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/internal/client"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
+	migrations "github.com/cockroachdb/cockroach/pkg/migration/sqlmigrations"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/rpc"
 	"github.com/cockroachdb/cockroach/pkg/security"
+	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
+	"github.com/cockroachdb/cockroach/pkg/sql/distsqlplan"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire"
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/storage/engine"
 	"github.com/cockroachdb/cockroach/pkg/ts"
@@ -57,19 +58,20 @@ const (
 // Certs with the test certs directory.
 // We need to override the certs loader.
 func makeTestConfig() Config {
-	cfg := MakeConfig()
+	cfg := MakeConfig(cluster.MakeClusterSettings())
 
 	// Test servers start in secure mode by default.
 	cfg.Insecure = false
 
+	// Override the DistSQL local store with an in-memory store.
+	cfg.TempStore = base.DefaultTestStoreSpec
+
 	// Load test certs. In addition, the tests requiring certs
-	// need to call security.SetReadFileFn(securitytest.Asset)
+	// need to call security.SetAssetLoader(securitytest.EmbeddedAssets)
 	// in their init to mock out the file system calls for calls to AssetFS,
 	// which has the test certs compiled in. Typically this is done
 	// once per package, in main_test.go.
-	cfg.SSLCA = filepath.Join(security.EmbeddedCertsDir, security.EmbeddedCACert)
-	cfg.SSLCert = filepath.Join(security.EmbeddedCertsDir, security.EmbeddedNodeCert)
-	cfg.SSLCertKey = filepath.Join(security.EmbeddedCertsDir, security.EmbeddedNodeKey)
+	cfg.SSLCertsDir = security.EmbeddedCertsDir
 
 	// Addr defaults to localhost with port set at time of call to
 	// Start() to an available port. May be overridden later (as in
@@ -85,10 +87,12 @@ func makeTestConfig() Config {
 	return cfg
 }
 
-// makeTestConfigtFromParams creates a Config from a TestServerParams.
+// makeTestConfigFromParams creates a Config from a TestServerParams.
 func makeTestConfigFromParams(params base.TestServerArgs) Config {
 	cfg := makeTestConfig()
 	cfg.TestingKnobs = params.Knobs
+	cfg.RaftConfig = params.RaftConfig
+	cfg.RaftConfig.SetDefaults()
 	if params.JoinAddr != "" {
 		cfg.JoinList = []string{params.JoinAddr}
 	}
@@ -98,15 +102,9 @@ func makeTestConfigFromParams(params base.TestServerArgs) Config {
 	if params.MetricsSampleInterval != 0 {
 		cfg.MetricsSampleInterval = params.MetricsSampleInterval
 	}
-	if params.RaftTickInterval != 0 {
-		cfg.RaftTickInterval = params.RaftTickInterval
-	}
-	if params.RaftElectionTimeoutTicks != 0 {
-		cfg.RaftElectionTimeoutTicks = params.RaftElectionTimeoutTicks
-	}
 	if knobs := params.Knobs.Store; knobs != nil {
 		if mo := knobs.(*storage.StoreTestingKnobs).MaxOffset; mo != 0 {
-			cfg.MaxOffset = mo
+			cfg.MaxOffset = MaxOffsetType(mo)
 		}
 	}
 	if params.ScanInterval != 0 {
@@ -115,20 +113,17 @@ func makeTestConfigFromParams(params base.TestServerArgs) Config {
 	if params.ScanMaxIdleTime != 0 {
 		cfg.ScanMaxIdleTime = params.ScanMaxIdleTime
 	}
-	if params.SSLCA != "" {
-		cfg.SSLCA = params.SSLCA
-	}
-	if params.SSLCert != "" {
-		cfg.SSLCert = params.SSLCert
-	}
-	if params.SSLCertKey != "" {
-		cfg.SSLCertKey = params.SSLCertKey
+	if params.SSLCertsDir != "" {
+		cfg.SSLCertsDir = params.SSLCertsDir
 	}
 	if params.TimeSeriesQueryWorkerMax != 0 {
 		cfg.TimeSeriesServerConfig.QueryWorkerMax = params.TimeSeriesQueryWorkerMax
 	}
 	if params.DisableEventLog {
 		cfg.EventLogEnabled = false
+	}
+	if params.SQLMemoryPoolSize != 0 {
+		cfg.SQLMemoryPoolSize = params.SQLMemoryPoolSize
 	}
 	cfg.JoinList = []string{params.JoinAddr}
 	if cfg.Insecure {
@@ -147,6 +142,13 @@ func makeTestConfigFromParams(params base.TestServerArgs) Config {
 		cfg.Addr = params.Addr
 		cfg.AdvertiseAddr = params.Addr
 	}
+	if params.HTTPAddr != "" {
+		cfg.HTTPAddr = params.HTTPAddr
+	}
+
+	if params.ListeningURLFile != "" {
+		cfg.ListeningURLFile = params.ListeningURLFile
+	}
 
 	// Ensure we have the correct number of engines. Add in-memory ones where
 	// needed. There must be at least one store/engine.
@@ -159,10 +161,12 @@ func makeTestConfigFromParams(params base.TestServerArgs) Config {
 			if storeSpec.SizePercent > 0 {
 				panic(fmt.Sprintf("test server does not yet support in memory stores based on percentage of total memory: %s", storeSpec))
 			}
-		} else {
-			// TODO(bram): This will require some cleanup of on disk files.
-			panic(fmt.Sprintf("test server does not yet support on disk stores: %s", storeSpec))
 		}
+		// The default store spec is in-memory, so if this one is on-disk then
+		// one specific test must have requested it. A failure is returned if
+		// the Path field is empty, which means the test is then forced to pick
+		// the dir (and the test is then responsible for cleaning it up, not
+		// TestServer).
 	}
 	// Copy over the store specs.
 	cfg.Stores = base.StoreSpecList{Specs: params.StoreSpecs}
@@ -214,6 +218,14 @@ func (ts *TestServer) Clock() *hlc.Clock {
 	return nil
 }
 
+// JobRegistry returns the *jobs.Registry as an interface{}.
+func (ts *TestServer) JobRegistry() interface{} {
+	if ts != nil {
+		return ts.jobRegistry
+	}
+	return nil
+}
+
 // RPCContext returns the rpc context used by the TestServer.
 func (ts *TestServer) RPCContext() *rpc.Context {
 	if ts != nil {
@@ -238,6 +250,14 @@ func (ts *TestServer) DB() *client.DB {
 	return nil
 }
 
+// PGServer returns the pgwire.Server used by the TestServer.
+func (ts *TestServer) PGServer() *pgwire.Server {
+	if ts != nil {
+		return ts.pgServer
+	}
+	return nil
+}
+
 // Start starts the TestServer by bootstrapping an in-memory store
 // (defaults to maximum of 100M). The server is started, launching the
 // node RPC server and all HTTP endpoints. Use the value of
@@ -253,6 +273,9 @@ func (ts *TestServer) Start(params base.TestServerArgs) error {
 		params.Stopper = stop.NewStopper()
 	}
 
+	// TODO(andrei): Running two TestServers concurrently with
+	// PartOfCluster==false can result in the default zone config not be reset
+	// properly. It would be nice if this were more robust.
 	if !params.PartOfCluster {
 		// Change the replication requirements so we don't get log spam about ranges
 		// not being replicated enough.
@@ -299,9 +322,21 @@ func (ts *TestServer) Start(params base.TestServerArgs) error {
 // be on the server after initial (asynchronous) splits have been completed,
 // assuming no additional information is added outside of the normal bootstrap
 // process.
-func ExpectedInitialRangeCount() int {
-	bootstrap := GetBootstrapSchema()
-	return bootstrap.SystemDescriptorCount() - bootstrap.SystemConfigDescriptorCount() + 1
+func (ts *TestServer) ExpectedInitialRangeCount() (int, error) {
+	return ExpectedInitialRangeCount(ts.DB())
+}
+
+// ExpectedInitialRangeCount returns the expected number of ranges that should
+// be on the server after initial (asynchronous) splits have been completed,
+// assuming no additional information is added outside of the normal bootstrap
+// process.
+func ExpectedInitialRangeCount(db *client.DB) (int, error) {
+	_, migrationRangeCount, err := migrations.AdditionalInitialDescriptors(
+		context.Background(), db)
+	if err != nil {
+		return 0, errors.Wrap(err, "counting initial migration ranges")
+	}
+	return GetBootstrapSchema().InitialRangeCount() + migrationRangeCount, nil
 }
 
 // WaitForInitialSplits waits for the server to complete its expected initial
@@ -315,7 +350,10 @@ func (ts *TestServer) WaitForInitialSplits() error {
 // populated in the meta2 table. If the expected range count is not reached
 // within a configured timeout, an error is returned.
 func WaitForInitialSplits(db *client.DB) error {
-	expectedRanges := ExpectedInitialRangeCount()
+	expectedRanges, err := ExpectedInitialRangeCount(db)
+	if err != nil {
+		return err
+	}
 	return util.RetryForDuration(initialSplitsTimeout, func() error {
 		// Scan all keys in the Meta2Prefix; we only need a count.
 		rows, err := db.Scan(context.TODO(), keys.Meta2Prefix, keys.MetaMax, 0)
@@ -332,6 +370,16 @@ func WaitForInitialSplits(db *client.DB) error {
 // Stores returns the collection of stores from this TestServer's node.
 func (ts *TestServer) Stores() *storage.Stores {
 	return ts.node.stores
+}
+
+// GetStores is part of TestServerInterface.
+func (ts *TestServer) GetStores() interface{} {
+	return ts.node.stores
+}
+
+// ClusterSettings returns the ClusterSettings.
+func (ts *TestServer) ClusterSettings() *cluster.Settings {
+	return ts.Cfg.Settings
 }
 
 // Engines returns the TestServer's engines.
@@ -406,6 +454,11 @@ func (ts *TestServer) LeaseManager() interface{} {
 	return ts.leaseMgr
 }
 
+// Executor is part of TestServerInterface.
+func (ts *TestServer) Executor() interface{} {
+	return ts.sqlExecutor
+}
+
 // GetNode exposes the Server's Node.
 func (ts *TestServer) GetNode() *Node {
 	return ts.node
@@ -414,6 +467,16 @@ func (ts *TestServer) GetNode() *Node {
 // DistSender exposes the Server's DistSender.
 func (ts *TestServer) DistSender() *kv.DistSender {
 	return ts.distSender
+}
+
+// DistSQLServer is part of TestServerInterface.
+func (ts *TestServer) DistSQLServer() interface{} {
+	return ts.distSQLServer
+}
+
+// SetDistSQLSpanResolver is part of TestServerInterface.
+func (ts *Server) SetDistSQLSpanResolver(spanResolver interface{}) {
+	ts.sqlExecutor.SetDistSQLSpanResolver(spanResolver.(distsqlplan.SpanResolver))
 }
 
 // GetFirstStoreID is part of TestServerInterface.
@@ -457,18 +520,10 @@ func (ts *TestServer) LookupRange(key roachpb.Key) (roachpb.RangeDescriptor, err
 func (ts *TestServer) SplitRange(
 	splitKey roachpb.Key,
 ) (roachpb.RangeDescriptor, roachpb.RangeDescriptor, error) {
+	ctx := context.Background()
 	splitRKey, err := keys.Addr(splitKey)
 	if err != nil {
 		return roachpb.RangeDescriptor{}, roachpb.RangeDescriptor{}, err
-	}
-	origRangeDesc, err := ts.LookupRange(splitKey)
-	if err != nil {
-		return roachpb.RangeDescriptor{}, roachpb.RangeDescriptor{}, err
-	}
-	if origRangeDesc.StartKey.Equal(splitRKey) {
-		return roachpb.RangeDescriptor{}, roachpb.RangeDescriptor{},
-			errors.Errorf(
-				"cannot split range %+v at start key %q", origRangeDesc, splitKey)
 	}
 	splitReq := roachpb.AdminSplitRequest{
 		Span: roachpb.Span{
@@ -476,29 +531,106 @@ func (ts *TestServer) SplitRange(
 		},
 		SplitKey: splitKey,
 	}
-	_, pErr := client.SendWrapped(context.Background(), ts.DistSender(), &splitReq)
+	_, pErr := client.SendWrapped(ctx, ts.DistSender(), &splitReq)
 	if pErr != nil {
 		return roachpb.RangeDescriptor{}, roachpb.RangeDescriptor{},
 			errors.Errorf(
 				"%q: split unexpected error: %s", splitReq.SplitKey, pErr)
 	}
 
+	// The split point may not be exactly at the key we requested (we request
+	// splits at valid table keys, and the split point corresponds to the row's
+	// prefix). We scan for the range that includes the key we requested and the
+	// one that precedes it.
+
+	// We use a transaction so that we get consistent results between the two
+	// scans (in case there are other splits happening).
 	var leftRangeDesc, rightRangeDesc roachpb.RangeDescriptor
-	if err := ts.DB().GetProto(context.TODO(),
-		keys.RangeDescriptorKey(origRangeDesc.StartKey), &leftRangeDesc); err != nil {
-		return roachpb.RangeDescriptor{}, roachpb.RangeDescriptor{},
-			errors.Wrap(err, "could not look up left-hand side descriptor")
+
+	// Errors returned from scanMeta cannot be wrapped or retryable errors won't
+	// be retried. Instead, the message to wrap is stored in case of
+	// non-retryable failures and then wrapped when the full transaction fails.
+	var wrappedMsg string
+	if err := ts.DB().Txn(ctx, func(ctx context.Context, txn *client.Txn) error {
+		scanMeta := func(key roachpb.RKey, reverse bool) (desc roachpb.RangeDescriptor, err error) {
+			var kvs []client.KeyValue
+			if reverse {
+				// Find the last range that ends at or before key.
+				kvs, err = txn.ReverseScan(
+					ctx, keys.Meta2Prefix, keys.RangeMetaKey(key.Next()), 1, /* one result */
+				)
+			} else {
+				// Find the first range that ends after key.
+				kvs, err = txn.Scan(
+					ctx, keys.RangeMetaKey(key.Next()), keys.Meta2Prefix.PrefixEnd(), 1, /* one result */
+				)
+			}
+			if err != nil {
+				return desc, err
+			}
+			if len(kvs) != 1 {
+				return desc, fmt.Errorf("expected 1 result, got %d", len(kvs))
+			}
+			err = kvs[0].ValueProto(&desc)
+			return desc, err
+		}
+
+		rightRangeDesc, err = scanMeta(splitRKey, false /* !reverse */)
+		if err != nil {
+			wrappedMsg = "could not look up right-hand side descriptor"
+			return err
+		}
+
+		leftRangeDesc, err = scanMeta(splitRKey, true /* reverse */)
+		if err != nil {
+			wrappedMsg = "could not look up left-hand side descriptor"
+			return err
+		}
+
+		if !leftRangeDesc.EndKey.Equal(rightRangeDesc.StartKey) {
+			return errors.Errorf(
+				"inconsistent left (%v) and right (%v) descriptors", leftRangeDesc, rightRangeDesc,
+			)
+		}
+		return nil
+	}); err != nil {
+		if len(wrappedMsg) > 0 {
+			return roachpb.RangeDescriptor{}, roachpb.RangeDescriptor{}, errors.Wrap(err, wrappedMsg)
+		}
+		return roachpb.RangeDescriptor{}, roachpb.RangeDescriptor{}, err
 	}
-	// The split point might not be exactly the one we requested (it can be
-	// adjusted slightly so we don't split in the middle of SQL rows). Update it
-	// to the real point.
-	splitRKey = leftRangeDesc.EndKey
-	if err := ts.DB().GetProto(context.TODO(),
-		keys.RangeDescriptorKey(splitRKey), &rightRangeDesc); err != nil {
-		return roachpb.RangeDescriptor{}, roachpb.RangeDescriptor{},
-			errors.Wrap(err, "could not look up right-hand side descriptor")
-	}
+
 	return leftRangeDesc, rightRangeDesc, nil
+}
+
+// GetRangeLease returns the current lease for the range containing key, and a
+// timestamp taken from the node.
+//
+// The lease is returned regardless of its status.
+func (ts *TestServer) GetRangeLease(
+	ctx context.Context, key roachpb.Key,
+) (_ roachpb.Lease, now hlc.Timestamp, _ error) {
+	leaseReq := roachpb.LeaseInfoRequest{
+		Span: roachpb.Span{
+			Key: key,
+		},
+	}
+	leaseResp, pErr := client.SendWrappedWith(
+		ctx,
+		ts.DB().GetSender(),
+		roachpb.Header{
+			// INCONSISTENT read, since we want to make sure that the node used to
+			// send this is the one that processes the command, for the hint to
+			// matter.
+			ReadConsistency: roachpb.INCONSISTENT,
+		},
+		&leaseReq,
+	)
+	if pErr != nil {
+		return roachpb.Lease{}, hlc.Timestamp{}, pErr.GoError()
+	}
+	return leaseResp.(*roachpb.LeaseInfoResponse).Lease, ts.Clock().Now(), nil
+
 }
 
 type testServerFactoryImpl struct{}

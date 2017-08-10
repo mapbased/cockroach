@@ -11,61 +11,35 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Raphael 'kena' Poss (knz@cockroachlabs.com)
 
 package sql
 
-import "github.com/cockroachdb/cockroach/pkg/sql/parser"
+import (
+	"golang.org/x/net/context"
+
+	"github.com/cockroachdb/cockroach/pkg/sql/parser"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+)
 
 // delayedNode wraps a planNode in cases where the planNode
 // constructor must be delayed during query execution (as opposed to
 // SQL prepare) for resource tracking purposes.
 type delayedNode struct {
-	p           *planner
 	name        string
-	columns     ResultColumns
+	columns     sqlbase.ResultColumns
 	constructor nodeConstructor
 	plan        planNode
 }
 
-type nodeConstructor func(p *planner) (planNode, error)
+type nodeConstructor func(context.Context, *planner) (planNode, error)
 
-func (d *delayedNode) SetLimitHint(_ int64, _ bool) {}
-func (d *delayedNode) setNeededColumns(_ []bool)    {}
-
-func (d *delayedNode) expandPlan() error {
-	v, err := d.constructor(d.p)
-	if err != nil {
-		return err
-	}
-	if err := v.expandPlan(); err != nil {
-		v.Close()
-		return err
-	}
-	d.plan = v
-	return nil
-}
-
-func (d *delayedNode) Close() {
+func (d *delayedNode) Close(ctx context.Context) {
 	if d.plan != nil {
-		d.plan.Close()
+		d.plan.Close(ctx)
 		d.plan = nil
 	}
 }
 
-func (d *delayedNode) ExplainPlan(verbose bool) (name, description string, children []planNode) {
-	if d.plan != nil {
-		children = []planNode{d.plan}
-	}
-	return "virtual table", d.name, children
-}
-
-func (d *delayedNode) ExplainTypes(rt func(string, string)) {}
-func (d *delayedNode) Columns() ResultColumns               { return d.columns }
-func (d *delayedNode) Ordering() orderingInfo               { return orderingInfo{} }
-func (d *delayedNode) MarkDebug(_ explainMode)              {}
-func (d *delayedNode) Start() error                         { return d.plan.Start() }
-func (d *delayedNode) Next() (bool, error)                  { return d.plan.Next() }
-func (d *delayedNode) Values() parser.DTuple                { return d.plan.Values() }
-func (d *delayedNode) DebugValues() debugValues             { return d.plan.DebugValues() }
+func (d *delayedNode) Start(params runParams) error        { return d.plan.Start(params) }
+func (d *delayedNode) Next(params runParams) (bool, error) { return d.plan.Next(params) }
+func (d *delayedNode) Values() parser.Datums               { return d.plan.Values() }

@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Vivek Menezes (vivek@cockroachlabs.com)
 
 package storage
 
@@ -26,10 +24,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
-)
-
-const (
-	consistencyQueueSize = 100
 )
 
 type consistencyQueue struct {
@@ -47,8 +41,9 @@ func newConsistencyQueue(store *Store, gossip *gossip.Gossip) *consistencyQueue 
 	q.baseQueue = newBaseQueue(
 		"replica consistency checker", q, store, gossip,
 		queueConfig{
-			maxSize:              consistencyQueueSize,
+			maxSize:              defaultQueueMaxSize,
 			needsLease:           true,
+			needsSystemConfig:    false,
 			acceptsUnsplitRanges: true,
 			successes:            store.metrics.ConsistencyQueueSuccesses,
 			failures:             store.metrics.ConsistencyQueueFailures,
@@ -72,20 +67,24 @@ func (q *consistencyQueue) shouldQueue(
 			return false, 0
 		}
 	}
-	// Check if all replicas are live.
-	for _, rep := range repl.Desc().Replicas {
-		if live, err := repl.store.cfg.NodeLiveness.IsLive(rep.NodeID); err != nil {
-			log.ErrEventf(ctx, "node %d liveness failed: %s", rep.NodeID, err)
-			return false, 0
-		} else if !live {
-			return false, 0
+	// Check if all replicas are live. Some tests run without a NodeLiveness configured.
+	if repl.store.cfg.NodeLiveness != nil {
+		for _, rep := range repl.Desc().Replicas {
+			if live, err := repl.store.cfg.NodeLiveness.IsLive(rep.NodeID); err != nil {
+				log.ErrEventf(ctx, "node %d liveness failed: %s", rep.NodeID, err)
+				return false, 0
+			} else if !live {
+				return false, 0
+			}
 		}
 	}
 	return true, priority
 }
 
 // process() is called on every range for which this node is a lease holder.
-func (q *consistencyQueue) process(ctx context.Context, repl *Replica, _ config.SystemConfig) error {
+func (q *consistencyQueue) process(
+	ctx context.Context, repl *Replica, _ config.SystemConfig,
+) error {
 	req := roachpb.CheckConsistencyRequest{}
 	if _, pErr := repl.CheckConsistency(ctx, req); pErr != nil {
 		log.Error(ctx, pErr.GoError())

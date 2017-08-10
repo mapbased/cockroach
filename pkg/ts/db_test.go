@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Matt Tracy (matt@cockroachlabs.com)
 
 package ts
 
@@ -272,7 +270,7 @@ type modelDataSource struct {
 func (mds *modelDataSource) GetTimeSeriesData() []tspb.TimeSeriesData {
 	if len(mds.datasets) == 0 {
 		// Stop on goroutine to prevent deadlock.
-		go mds.once.Do(mds.stopper.Stop)
+		go mds.once.Do(func() { mds.stopper.Stop(context.Background()) })
 		return nil
 	}
 	mds.calledCount++

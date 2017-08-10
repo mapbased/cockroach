@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Spencer Kimball (spencer.kimball@gmail.com)
 
 package storage
 
@@ -34,6 +32,9 @@ import (
 
 // An idAllocator is used to increment a key in allocation blocks
 // of arbitrary size starting at a minimum ID.
+//
+// Note: if all you want is to increment a key and retry on retryable errors,
+// see client.IncrementValRetryable().
 type idAllocator struct {
 	log.AmbientContext
 
@@ -92,8 +93,8 @@ func (ia *idAllocator) Allocate() (uint32, error) {
 }
 
 func (ia *idAllocator) start() {
-	ia.stopper.RunWorker(func() {
-		ctx := ia.AnnotateCtx(context.Background())
+	ctx := ia.AnnotateCtx(context.Background())
+	ia.stopper.RunWorker(ctx, func(ctx context.Context) {
 		defer close(ia.ids)
 
 		for {
@@ -103,7 +104,7 @@ func (ia *idAllocator) start() {
 				var res client.KeyValue
 				for r := retry.Start(base.DefaultRetryOptions()); r.Next(); {
 					idKey := ia.idKey.Load().(roachpb.Key)
-					if err := ia.stopper.RunTask(func() {
+					if err := ia.stopper.RunTask(ctx, "storage.idAllocator: allocating block", func(ctx context.Context) {
 						res, err = ia.db.Inc(ctx, idKey, int64(ia.blockSize))
 					}); err != nil {
 						log.Warning(ctx, err)

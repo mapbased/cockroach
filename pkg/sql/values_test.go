@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Tobias Schottdorf
 
 package sql
 
@@ -22,19 +20,20 @@ import (
 	"testing"
 	"time"
 
-	"gopkg.in/inf.v0"
+	"github.com/pkg/errors"
+	"golang.org/x/net/context"
 
+	"github.com/cockroachdb/apd"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
-	"github.com/pkg/errors"
 )
 
 func makeTestPlanner() *planner {
-	return makeInternalPlanner("test", nil, security.RootUser, &MemoryMetrics{})
+	return makeInternalPlanner("test", nil /* txn */, security.RootUser, &MemoryMetrics{})
 }
 
 func TestValues(t *testing.T) {
@@ -58,8 +57,8 @@ func TestValues(t *testing.T) {
 			Type: &parser.FloatColType{},
 		}
 	}
-	asRow := func(datums ...parser.Datum) []parser.DTuple {
-		return []parser.DTuple{datums}
+	asRow := func(datums ...parser.Datum) []parser.Datums {
+		return []parser.Datums{datums}
 	}
 
 	makeValues := func(tuples ...*parser.Tuple) *parser.ValuesClause {
@@ -71,7 +70,7 @@ func TestValues(t *testing.T) {
 
 	testCases := []struct {
 		stmt *parser.ValuesClause
-		rows []parser.DTuple
+		rows []parser.Datums
 		ok   bool
 	}{
 		{
@@ -112,30 +111,32 @@ func TestValues(t *testing.T) {
 	}
 
 	for i, tc := range testCases {
+		ctx := context.TODO()
 		plan, err := func() (_ planNode, err error) {
 			defer func() {
 				if r := recover(); r != nil {
 					err = errors.Errorf("%v", r)
 				}
 			}()
-			return p.ValuesClause(tc.stmt, nil)
+			return p.ValuesClause(context.TODO(), tc.stmt, nil)
 		}()
 		if err == nil != tc.ok {
 			t.Errorf("%d: error_expected=%t, but got error %v", i, tc.ok, err)
 		}
 		if plan != nil {
-			defer plan.Close()
-			if err := plan.expandPlan(); err != nil {
-				t.Errorf("%d: unexpected error in expandPlan: %v", i, err)
+			defer plan.Close(ctx)
+			plan, err = p.optimizePlan(ctx, plan, allColumns(plan))
+			if err != nil {
+				t.Errorf("%d: unexpected error in optimizePlan: %v", i, err)
 				continue
 			}
-			if err := plan.Start(); err != nil {
+			if err := p.startPlan(ctx, plan); err != nil {
 				t.Errorf("%d: unexpected error in Start: %v", i, err)
 				continue
 			}
-			var rows []parser.DTuple
-			next, err := plan.Next()
-			for ; next; next, err = plan.Next() {
+			var rows []parser.Datums
+			next, err := plan.Next(runParams{ctx: ctx})
+			for ; next; next, err = plan.Next(runParams{ctx: ctx}) {
 				rows = append(rows, plan.Values())
 			}
 			if err != nil {
@@ -184,7 +185,7 @@ func TestGolangQueryArgs(t *testing.T) {
 		{float64(1.0), reflect.TypeOf(parser.TypeFloat)},
 
 		// Decimal type.
-		{inf.NewDec(55, 1), reflect.TypeOf(parser.TypeDecimal)},
+		{apd.New(55, 1), reflect.TypeOf(parser.TypeDecimal)},
 
 		// String type.
 		{"test", reflect.TypeOf(parser.TypeString)},

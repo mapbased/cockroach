@@ -11,9 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Ben Darnell
-// Author: Tamir Duberstein (tamird@gmail.com)
 
 package pgwire
 
@@ -21,13 +18,16 @@ import (
 	"bufio"
 	"crypto/tls"
 	"fmt"
+	"math"
 	"net"
 	"strconv"
+	"time"
 
 	"github.com/lib/pq/oid"
 	"github.com/pkg/errors"
 	"golang.org/x/net/context"
 
+	"github.com/cockroachdb/cockroach/pkg/build"
 	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/mon"
@@ -35,6 +35,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 )
 
@@ -84,6 +85,8 @@ const (
 	serverErrFieldSeverity    serverErrFieldType = 'S'
 	serverErrFieldSQLState    serverErrFieldType = 'C'
 	serverErrFieldMsgPrimary  serverErrFieldType = 'M'
+	serverErrFileldDetail     serverErrFieldType = 'D'
+	serverErrFileldHint       serverErrFieldType = 'H'
 	serverErrFieldSrcFile     serverErrFieldType = 'F'
 	serverErrFieldSrcLine     serverErrFieldType = 'L'
 	serverErrFieldSrcFunction serverErrFieldType = 'R'
@@ -114,6 +117,51 @@ type preparedPortalMeta struct {
 	outFormats []formatCode
 }
 
+// readTimeoutConn overloads net.Conn.Read by periodically calling
+// checkExitConds() and aborting the read if an error is returned.
+type readTimeoutConn struct {
+	net.Conn
+	checkExitConds func() error
+}
+
+func newReadTimeoutConn(c net.Conn, checkExitConds func() error) net.Conn {
+	// net.Pipe does not support setting deadlines. See
+	// https://github.com/golang/go/blob/go1.7.4/src/net/pipe.go#L57-L67
+	if c.LocalAddr().Network() == "pipe" {
+		return c
+	}
+	return &readTimeoutConn{
+		Conn:           c,
+		checkExitConds: checkExitConds,
+	}
+}
+
+func (c *readTimeoutConn) Read(b []byte) (int, error) {
+	// readTimeout is the amount of time ReadTimeoutConn should wait on a
+	// read before checking for exit conditions. The tradeoff is between the
+	// time it takes to react to session context cancellation and the overhead
+	// of waking up and checking for exit conditions.
+	const readTimeout = 150 * time.Millisecond
+
+	// Remove the read deadline when returning from this function to avoid
+	// unexpected behavior.
+	defer func() { _ = c.SetReadDeadline(time.Time{}) }()
+	for {
+		if err := c.checkExitConds(); err != nil {
+			return 0, err
+		}
+		if err := c.SetReadDeadline(timeutil.Now().Add(readTimeout)); err != nil {
+			return 0, err
+		}
+		n, err := c.Conn.Read(b)
+		// Continue if the error is due to timing out.
+		if err, ok := err.(net.Error); ok && err.Timeout() {
+			continue
+		}
+		return n, err
+	}
+}
+
 type v3Conn struct {
 	conn        net.Conn
 	rd          *bufio.Reader
@@ -130,17 +178,19 @@ type v3Conn struct {
 	// https://github.com/postgres/postgres/blob/master/src/backend/tcop/postgres.c
 	doingExtendedQueryMessage, ignoreTillSync bool
 
+	// The above comment also holds for this boolean, which can be set to cause
+	// the backend to *not* send another ready for query message. This behavior
+	// is required when the backend is supposed to drop messages, such as when
+	// it gets extra data after an error happened during a COPY operation.
+	doNotSendReadyForQuery bool
+
 	metrics *ServerMetrics
 
-	sqlMemoryPool *mon.MemoryMonitor
+	sqlMemoryPool *mon.BytesMonitor
 }
 
 func makeV3Conn(
-	ctx context.Context,
-	conn net.Conn,
-	metrics *ServerMetrics,
-	sqlMemoryPool *mon.MemoryMonitor,
-	executor *sql.Executor,
+	conn net.Conn, metrics *ServerMetrics, sqlMemoryPool *mon.BytesMonitor, executor *sql.Executor,
 ) v3Conn {
 	return v3Conn{
 		conn:          conn,
@@ -161,7 +211,7 @@ func (c *v3Conn) finish(ctx context.Context) {
 	_ = c.conn.Close()
 }
 
-func parseOptions(data []byte) (sql.SessionArgs, error) {
+func parseOptions(ctx context.Context, data []byte) (sql.SessionArgs, error) {
 	args := sql.SessionArgs{}
 	buf := readBuffer{msg: data}
 	for {
@@ -181,9 +231,11 @@ func parseOptions(data []byte) (sql.SessionArgs, error) {
 			args.Database = value
 		case "user":
 			args.User = value
+		case "application_name":
+			args.ApplicationName = value
 		default:
 			if log.V(1) {
-				log.Warningf(context.TODO(), "unrecognized configuration parameter %q", key)
+				log.Warningf(ctx, "unrecognized configuration parameter %q", key)
 			}
 		}
 	}
@@ -196,11 +248,22 @@ func parseOptions(data []byte) (sql.SessionArgs, error) {
 var statusReportParams = map[string]string{
 	"client_encoding": "UTF8",
 	"DateStyle":       "ISO",
+	// All datetime binary formats expect 64-bit integer microsecond values.
+	// This param needs to be provided to clients or some may provide 64-bit
+	// floating-point microsecond values instead, which was a legacy datetime
+	// binary format.
+	"integer_datetimes": "on",
 	// The latest version of the docs that was consulted during the development
 	// of this package. We specify this version to avoid having to support old
 	// code paths which various client tools fall back to if they can't
 	// determine that the server is new enough.
 	"server_version": sql.PgServerVersion,
+	// The current CockroachDB version string.
+	"crdb_version": build.GetInfo().Short(),
+	// If this parameter is not present, some drivers (including Python's psycopg2)
+	// will add redundant backslash escapes for compatibility with non-standard
+	// backslash handling in older versions of postgres.
+	"standard_conforming_strings": "on",
 }
 
 // handleAuthentication should discuss with the client to arrange
@@ -214,11 +277,14 @@ func (c *v3Conn) handleAuthentication(ctx context.Context, insecure bool) error 
 
 		// Check that the requested user exists and retrieve the hashed
 		// password in case password authentication is needed.
-		hashedPassword, err := sql.GetUserHashedPassword(
+		exists, hashedPassword, err := sql.GetUserHashedPassword(
 			ctx, c.executor, c.metrics.internalMemMetrics, c.sessionArgs.User,
 		)
 		if err != nil {
-			return c.sendInternalError(err.Error())
+			return c.sendError(err)
+		}
+		if !exists {
+			return c.sendError(errors.Errorf("user %s does not exist", c.sessionArgs.User))
 		}
 
 		tlsState := tlsConn.ConnectionState()
@@ -227,7 +293,7 @@ func (c *v3Conn) handleAuthentication(ctx context.Context, insecure bool) error 
 		if len(tlsState.PeerCertificates) == 0 {
 			password, err := c.sendAuthPasswordRequest()
 			if err != nil {
-				return c.sendInternalError(err.Error())
+				return c.sendError(err)
 			}
 			authenticationHook = security.UserAuthPasswordHook(
 				insecure, password, hashedPassword,
@@ -240,12 +306,12 @@ func (c *v3Conn) handleAuthentication(ctx context.Context, insecure bool) error 
 			var err error
 			authenticationHook, err = security.UserAuthCertHook(insecure, &tlsState)
 			if err != nil {
-				return c.sendInternalError(err.Error())
+				return c.sendError(err)
 			}
 		}
 
 		if err := authenticationHook(c.sessionArgs.User, true /* public */); err != nil {
-			return c.sendInternalError(err.Error())
+			return c.sendError(err)
 		}
 	}
 
@@ -267,7 +333,7 @@ func (c *v3Conn) closeSession(ctx context.Context) {
 	c.session = nil
 }
 
-func (c *v3Conn) serve(ctx context.Context, reserved mon.BoundAccount) error {
+func (c *v3Conn) serve(ctx context.Context, draining func() bool, reserved mon.BoundAccount) error {
 	for key, value := range statusReportParams {
 		c.writeBuf.initMsg(serverMsgParameterStatus)
 		c.writeBuf.writeTerminatedString(key)
@@ -284,18 +350,45 @@ func (c *v3Conn) serve(ctx context.Context, reserved mon.BoundAccount) error {
 	if err := c.setupSession(ctx, reserved); err != nil {
 		return err
 	}
-	defer c.closeSession(ctx)
+	// Now that a Session has been set up, further operations done on behalf of
+	// this session use Session.Ctx() (which may diverge from this method's ctx).
+
+	defer func() {
+		if r := recover(); r != nil {
+			// If we're panicking, use an emergency session shutdown so that
+			// the monitors don't shout that they are unhappy.
+			c.session.EmergencyClose()
+			panic(r)
+		}
+		c.closeSession(ctx)
+	}()
+
+	// Once a session has been set up, the underlying net.Conn is switched to
+	// a conn that exits if the session's context is cancelled or if the server
+	// is draining and the session does not have an ongoing transaction.
+	c.conn = newReadTimeoutConn(c.conn, func() error {
+		if err := func() error {
+			if draining() && c.session.TxnState.State() == sql.NoTxn {
+				return errors.New(ErrDraining)
+			}
+			return c.session.Ctx().Err()
+		}(); err != nil {
+			return newAdminShutdownErr(err)
+		}
+		return nil
+	})
+	c.rd = bufio.NewReader(c.conn)
 
 	for {
-		if !c.doingExtendedQueryMessage {
+		if !c.doingExtendedQueryMessage && !c.doNotSendReadyForQuery {
 			c.writeBuf.initMsg(serverMsgReady)
 			var txnStatus byte
-			switch c.session.TxnState.State {
+			switch c.session.TxnState.State() {
 			case sql.Aborted, sql.RestartWait:
 				// We send status "InFailedTransaction" also for state RestartWait
 				// because GO's lib/pq freaks out if we invent a new status.
 				txnStatus = 'E'
-			case sql.Open:
+			case sql.Open, sql.FirstBatch:
 				txnStatus = 'T'
 			case sql.NoTxn:
 				// We're not in a txn (i.e. the last txn was committed).
@@ -308,7 +401,7 @@ func (c *v3Conn) serve(ctx context.Context, reserved mon.BoundAccount) error {
 			}
 
 			if log.V(2) {
-				log.Infof(ctx, "pgwire: %s: %q", serverMsgReady, txnStatus)
+				log.Infof(c.session.Ctx(), "pgwire: %s: %q", serverMsgReady, txnStatus)
 			}
 			c.writeBuf.writeByte(txnStatus)
 			if err := c.writeBuf.finishMsg(c.wr); err != nil {
@@ -321,6 +414,7 @@ func (c *v3Conn) serve(ctx context.Context, reserved mon.BoundAccount) error {
 				return err
 			}
 		}
+		c.doNotSendReadyForQuery = false
 		typ, n, err := c.readBuf.readTypedMsg(c.rd)
 		c.metrics.BytesInCount.Inc(int64(n))
 		if err != nil {
@@ -330,12 +424,12 @@ func (c *v3Conn) serve(ctx context.Context, reserved mon.BoundAccount) error {
 		// any messages until we get a sync.
 		if c.ignoreTillSync && typ != clientMsgSync {
 			if log.V(2) {
-				log.Infof(ctx, "pgwire: ignoring %s till sync", typ)
+				log.Infof(c.session.Ctx(), "pgwire: ignoring %s till sync", typ)
 			}
 			continue
 		}
 		if log.V(2) {
-			log.Infof(ctx, "pgwire: processing %s", typ)
+			log.Infof(c.session.Ctx(), "pgwire: processing %s", typ)
 		}
 		switch typ {
 		case clientMsgSync:
@@ -344,41 +438,46 @@ func (c *v3Conn) serve(ctx context.Context, reserved mon.BoundAccount) error {
 
 		case clientMsgSimpleQuery:
 			c.doingExtendedQueryMessage = false
-			err = c.handleSimpleQuery(ctx, &c.readBuf)
+			err = c.handleSimpleQuery(&c.readBuf)
 
 		case clientMsgTerminate:
 			return nil
 
 		case clientMsgParse:
 			c.doingExtendedQueryMessage = true
-			err = c.handleParse(ctx, &c.readBuf)
+			err = c.handleParse(&c.readBuf)
 
 		case clientMsgDescribe:
 			c.doingExtendedQueryMessage = true
-			err = c.handleDescribe(ctx, &c.readBuf)
+			err = c.handleDescribe(c.session.Ctx(), &c.readBuf)
 
 		case clientMsgClose:
 			c.doingExtendedQueryMessage = true
-			err = c.handleClose(&c.readBuf)
+			err = c.handleClose(c.session.Ctx(), &c.readBuf)
 
 		case clientMsgBind:
 			c.doingExtendedQueryMessage = true
-			err = c.handleBind(&c.readBuf)
+			err = c.handleBind(c.session.Ctx(), &c.readBuf)
 
 		case clientMsgExecute:
 			c.doingExtendedQueryMessage = true
-			err = c.handleExecute(ctx, &c.readBuf)
+			err = c.handleExecute(&c.readBuf)
 
 		case clientMsgFlush:
 			c.doingExtendedQueryMessage = true
 			err = c.wr.Flush()
 
 		case clientMsgCopyData, clientMsgCopyDone, clientMsgCopyFail:
-			// The spec says to drop any extra of these messages.
+			// We don't want to send a ready for query message here - we're supposed
+			// to ignore these messages, per the protocol spec. This state will
+			// happen when an error occurs on the server-side during a copy
+			// operation: the server will send an error and a ready message back to
+			// the client, and must then ignore further copy messages. See
+			// https://github.com/postgres/postgres/blob/6e1dd2773eb60a6ab87b27b8d9391b756e904ac3/src/backend/tcop/postgres.c#L4295
+			c.doNotSendReadyForQuery = true
 
 		default:
-			err = c.sendErrorWithCode(pgerror.CodeProtocolViolationError, sqlbase.MakeSrcCtx(0),
-				fmt.Sprintf("unrecognized client message type %s", typ))
+			return c.sendError(newUnrecognizedMsgTypeErr(typ))
 		}
 		if err != nil {
 			return err
@@ -411,16 +510,25 @@ func (c *v3Conn) sendAuthPasswordRequest() (string, error) {
 	return c.readBuf.getString()
 }
 
-func (c *v3Conn) handleSimpleQuery(ctx context.Context, buf *readBuffer) error {
+func (c *v3Conn) handleSimpleQuery(buf *readBuffer) error {
 	query, err := buf.getString()
 	if err != nil {
 		return err
 	}
 
-	return c.executeStatements(ctx, query, nil, nil, true, 0)
+	tracing.AnnotateTrace()
+	results := c.executor.ExecuteStatements(c.session, query, nil)
+	return c.finishExecute(results, nil, true, 0)
 }
 
-func (c *v3Conn) handleParse(ctx context.Context, buf *readBuffer) error {
+// maxPreparedStatementArgs is the maximum number of arguments a prepared
+// statement can have when prepared via the Postgres wire protocol. This is not
+// documented by Postgres, but is a consequence of the fact that a 16-bit
+// integer in the wire format is used to indicate the number of values to bind
+// during prepared statement execution.
+const maxPreparedStatementArgs = math.MaxUint16
+
+func (c *v3Conn) handleParse(buf *readBuffer) error {
 	name, err := buf.getString()
 	if err != nil {
 		return err
@@ -457,19 +565,23 @@ func (c *v3Conn) handleParse(ctx context.Context, buf *readBuffer) error {
 		if t == 0 {
 			continue
 		}
-		v, ok := sql.OidToDatum(t)
+		v, ok := parser.OidToType[t]
 		if !ok {
 			return c.sendInternalError(fmt.Sprintf("unknown oid type: %v", t))
 		}
-		sqlTypeHints[fmt.Sprint(i+1)] = v
+		sqlTypeHints[strconv.Itoa(i+1)] = v
 	}
 	// Create the new PreparedStatement in the connection's Session.
-	stmt, err := c.session.PreparedStatements.New(ctx, c.executor, name, query, sqlTypeHints)
+	stmt, err := c.session.PreparedStatements.NewFromString(c.executor, name, query, sqlTypeHints)
 	if err != nil {
 		return c.sendError(err)
 	}
 	// Convert the inferred SQL types back to an array of pgwire Oids.
 	inTypes := make([]oid.Oid, 0, len(stmt.SQLTypes))
+	if len(stmt.SQLTypes) > maxPreparedStatementArgs {
+		return c.sendError(pgerror.NewErrorf(pgerror.CodeProtocolViolationError,
+			"more than %d arguments to prepared statement: %d", maxPreparedStatementArgs, len(stmt.SQLTypes)))
+	}
 	for k, t := range stmt.SQLTypes {
 		i, err := strconv.Atoi(k)
 		if err != nil || i < 1 {
@@ -492,11 +604,7 @@ func (c *v3Conn) handleParse(ctx context.Context, buf *readBuffer) error {
 		if inTypes[i] != 0 {
 			continue
 		}
-		id, ok := sql.DatumToOid(t)
-		if !ok {
-			return c.sendInternalError(fmt.Sprintf("unknown datum type: %s", t))
-		}
-		inTypes[i] = id
+		inTypes[i] = t.Oid()
 	}
 	for i, t := range inTypes {
 		if t == 0 {
@@ -510,10 +618,16 @@ func (c *v3Conn) handleParse(ctx context.Context, buf *readBuffer) error {
 	return c.writeBuf.finishMsg(c.wr)
 }
 
+// canSendNoData returns true if describing a result of the input statement
+// type should return NoData.
+func canSendNoData(stmt parser.Statement) bool {
+	return stmt == nil || stmt.StatementType() != parser.Rows
+}
+
 func (c *v3Conn) handleDescribe(ctx context.Context, buf *readBuffer) error {
 	typ, err := buf.getPrepareType()
 	if err != nil {
-		return c.sendInternalError(err.Error())
+		return c.sendError(err)
 	}
 	name, err := buf.getString()
 	if err != nil {
@@ -536,7 +650,7 @@ func (c *v3Conn) handleDescribe(ctx context.Context, buf *readBuffer) error {
 			return err
 		}
 
-		return c.sendRowDescription(ctx, stmt.Columns, nil)
+		return c.sendRowDescription(ctx, stmt.Columns, nil, canSendNoData(stmt.Statement))
 	case preparePortal:
 		portal, ok := c.session.PreparedPortals.Get(name)
 		if !ok {
@@ -544,16 +658,16 @@ func (c *v3Conn) handleDescribe(ctx context.Context, buf *readBuffer) error {
 		}
 
 		portalMeta := portal.ProtocolMeta.(preparedPortalMeta)
-		return c.sendRowDescription(ctx, portal.Stmt.Columns, portalMeta.outFormats)
+		return c.sendRowDescription(ctx, portal.Stmt.Columns, portalMeta.outFormats, canSendNoData(portal.Stmt.Statement))
 	default:
 		return errors.Errorf("unknown describe type: %s", typ)
 	}
 }
 
-func (c *v3Conn) handleClose(buf *readBuffer) error {
+func (c *v3Conn) handleClose(ctx context.Context, buf *readBuffer) error {
 	typ, err := buf.getPrepareType()
 	if err != nil {
-		return c.sendInternalError(err.Error())
+		return c.sendError(err)
 	}
 	name, err := buf.getString()
 	if err != nil {
@@ -561,9 +675,9 @@ func (c *v3Conn) handleClose(buf *readBuffer) error {
 	}
 	switch typ {
 	case prepareStatement:
-		c.session.PreparedStatements.Delete(name)
+		c.session.PreparedStatements.Delete(ctx, name)
 	case preparePortal:
-		c.session.PreparedPortals.Delete(name)
+		c.session.PreparedPortals.Delete(ctx, name)
 	default:
 		return errors.Errorf("unknown close type: %s", typ)
 	}
@@ -571,7 +685,7 @@ func (c *v3Conn) handleClose(buf *readBuffer) error {
 	return c.writeBuf.finishMsg(c.wr)
 }
 
-func (c *v3Conn) handleBind(buf *readBuffer) error {
+func (c *v3Conn) handleBind(ctx context.Context, buf *readBuffer) error {
 	portalName, err := buf.getString()
 	if err != nil {
 		return err
@@ -642,7 +756,7 @@ func (c *v3Conn) handleBind(buf *readBuffer) error {
 		if err != nil {
 			return err
 		}
-		k := fmt.Sprint(i + 1)
+		k := strconv.Itoa(i + 1)
 		if int32(plen) == -1 {
 			// The argument is a NULL value.
 			qargs[k] = parser.DNull
@@ -698,17 +812,22 @@ func (c *v3Conn) handleBind(buf *readBuffer) error {
 		return c.sendInternalError(fmt.Sprintf("expected 0, 1, or %d for number of format codes, got %d", numColumns, numColumnFormatCodes))
 	}
 	// Create the new PreparedPortal in the connection's Session.
-	portal, err := c.session.PreparedPortals.New(portalName, stmt, qargs)
+	portal, err := c.session.PreparedPortals.New(ctx, portalName, stmt, qargs)
 	if err != nil {
 		return err
 	}
+
+	if log.V(2) {
+		log.Infof(ctx, "portal: %q for %q, args %q, formats %q", portalName, stmt.Statement, qargs, columnFormatCodes)
+	}
+
 	// Attach pgwire-specific metadata to the PreparedPortal.
 	portal.ProtocolMeta = preparedPortalMeta{outFormats: columnFormatCodes}
 	c.writeBuf.initMsg(serverMsgBindComplete)
 	return c.writeBuf.finishMsg(c.wr)
 }
 
-func (c *v3Conn) handleExecute(ctx context.Context, buf *readBuffer) error {
+func (c *v3Conn) handleExecute(buf *readBuffer) error {
 	portalName, err := buf.getString()
 	if err != nil {
 		return err
@@ -724,27 +843,28 @@ func (c *v3Conn) handleExecute(ctx context.Context, buf *readBuffer) error {
 
 	stmt := portal.Stmt
 	portalMeta := portal.ProtocolMeta.(preparedPortalMeta)
-	pinfo := parser.PlaceholderInfo{
+	pinfo := &parser.PlaceholderInfo{
 		Types:  stmt.SQLTypes,
 		Values: portal.Qargs,
 	}
 
-	return c.executeStatements(ctx, stmt.Query, &pinfo, portalMeta.outFormats, false, int(limit))
+	tracing.AnnotateTrace()
+
+	results, err := c.executor.ExecutePreparedStatement(c.session, stmt, pinfo)
+	if err != nil {
+		return c.sendError(err)
+	}
+	return c.finishExecute(results, portalMeta.outFormats, false, int(limit))
 }
 
-func (c *v3Conn) executeStatements(
-	ctx context.Context,
-	stmts string,
-	pinfo *parser.PlaceholderInfo,
-	formatCodes []formatCode,
-	sendDescription bool,
-	limit int,
+func (c *v3Conn) finishExecute(
+	results sql.StatementResults, formatCodes []formatCode, sendDescription bool, limit int,
 ) error {
-	tracing.AnnotateTrace()
-	// Note: sql.Executor gets its Context from c.session.context, which
-	// has been bound by v3Conn.setupSession().
-	results := c.executor.ExecuteStatements(c.session, stmts, pinfo)
-	defer results.Close()
+	// Delay evaluation of c.session.Ctx().
+	defer func() {
+		results.Close(c.session.Ctx())
+		c.session.FinishPlan()
+	}()
 
 	tracing.AnnotateTrace()
 	if results.Empty {
@@ -752,7 +872,7 @@ func (c *v3Conn) executeStatements(
 		c.writeBuf.initMsg(serverMsgEmptyQuery)
 		return c.writeBuf.finishMsg(c.wr)
 	}
-	return c.sendResponse(ctx, results.ResultList, formatCodes, sendDescription, limit)
+	return c.sendResponse(c.session.Ctx(), results.ResultList, formatCodes, sendDescription, limit)
 }
 
 func (c *v3Conn) sendCommandComplete(tag []byte) error {
@@ -762,22 +882,13 @@ func (c *v3Conn) sendCommandComplete(tag []byte) error {
 	return c.writeBuf.finishMsg(c.wr)
 }
 
-func (c *v3Conn) sendError(err error) error {
-	if sqlErr, ok := err.(sqlbase.ErrorWithPGCode); ok {
-		return c.sendErrorWithCode(sqlErr.Code(), sqlErr.SrcContext(), err.Error())
-	}
-	return c.sendInternalError(err.Error())
-}
-
 // TODO(andrei): Figure out the correct codes to send for all the errors
 // in this file and remove this function.
 func (c *v3Conn) sendInternalError(errToSend string) error {
-	return c.sendErrorWithCode(pgerror.CodeInternalError, sqlbase.MakeSrcCtx(1), errToSend)
+	return c.sendError(pgerror.NewError(pgerror.CodeInternalError, errToSend))
 }
 
-// errCode is a postgres error code, plus our extensions.
-// See http://www.postgresql.org/docs/9.5/static/errcodes-appendix.html
-func (c *v3Conn) sendErrorWithCode(errCode string, errCtx sqlbase.SrcCtx, errToSend string) error {
+func (c *v3Conn) sendError(err error) error {
 	if c.doingExtendedQueryMessage {
 		c.ignoreTillSync = true
 	}
@@ -787,26 +898,47 @@ func (c *v3Conn) sendErrorWithCode(errCode string, errCtx sqlbase.SrcCtx, errToS
 	c.writeBuf.putErrFieldMsg(serverErrFieldSeverity)
 	c.writeBuf.writeTerminatedString("ERROR")
 
+	pgErr, ok := pgerror.GetPGCause(err)
+	var code string
+	if ok {
+		code = pgErr.Code
+	} else {
+		code = pgerror.CodeInternalError
+	}
+
 	c.writeBuf.putErrFieldMsg(serverErrFieldSQLState)
-	c.writeBuf.writeTerminatedString(errCode)
+	c.writeBuf.writeTerminatedString(code)
+
+	if ok && pgErr.Detail != "" {
+		c.writeBuf.putErrFieldMsg(serverErrFileldDetail)
+		c.writeBuf.writeTerminatedString(pgErr.Detail)
+	}
+
+	if ok && pgErr.Hint != "" {
+		c.writeBuf.putErrFieldMsg(serverErrFileldHint)
+		c.writeBuf.writeTerminatedString(pgErr.Hint)
+	}
+
+	if ok && pgErr.Source != nil {
+		errCtx := pgErr.Source
+		if errCtx.File != "" {
+			c.writeBuf.putErrFieldMsg(serverErrFieldSrcFile)
+			c.writeBuf.writeTerminatedString(errCtx.File)
+		}
+
+		if errCtx.Line > 0 {
+			c.writeBuf.putErrFieldMsg(serverErrFieldSrcLine)
+			c.writeBuf.writeTerminatedString(strconv.Itoa(int(errCtx.Line)))
+		}
+
+		if errCtx.Function != "" {
+			c.writeBuf.putErrFieldMsg(serverErrFieldSrcFunction)
+			c.writeBuf.writeTerminatedString(errCtx.Function)
+		}
+	}
 
 	c.writeBuf.putErrFieldMsg(serverErrFieldMsgPrimary)
-	c.writeBuf.writeTerminatedString(errToSend)
-
-	if errCtx.File != "" {
-		c.writeBuf.putErrFieldMsg(serverErrFieldSrcFile)
-		c.writeBuf.writeTerminatedString(errCtx.File)
-	}
-
-	if errCtx.Line > 0 {
-		c.writeBuf.putErrFieldMsg(serverErrFieldSrcLine)
-		c.writeBuf.writeTerminatedString(strconv.Itoa(errCtx.Line))
-	}
-
-	if errCtx.Function != "" {
-		c.writeBuf.putErrFieldMsg(serverErrFieldSrcFunction)
-		c.writeBuf.writeTerminatedString(errCtx.Function)
-	}
+	c.writeBuf.writeTerminatedString(err.Error())
 
 	c.writeBuf.nullTerminate()
 	if err := c.writeBuf.finishMsg(c.wr); err != nil {
@@ -859,7 +991,9 @@ func (c *v3Conn) sendResponse(
 
 		case parser.Rows:
 			if sendDescription {
-				if err := c.sendRowDescription(ctx, result.Columns, formatCodes); err != nil {
+				// We're not allowed to send a NoData message here, even if there are
+				// 0 result columns, since we're responding to a "Simple Query".
+				if err := c.sendRowDescription(ctx, result.Columns, formatCodes, false); err != nil {
 					return err
 				}
 			}
@@ -877,9 +1011,9 @@ func (c *v3Conn) sendResponse(
 					}
 					switch fmtCode {
 					case formatText:
-						c.writeBuf.writeTextDatum(col, c.session.Location)
+						c.writeBuf.writeTextDatum(ctx, col, c.session.Location)
 					case formatBinary:
-						c.writeBuf.writeBinaryDatum(col, c.session.Location)
+						c.writeBuf.writeBinaryDatum(ctx, col, c.session.Location)
 					default:
 						c.writeBuf.setError(errors.Errorf("unsupported format code %s", fmtCode))
 					}
@@ -897,12 +1031,24 @@ func (c *v3Conn) sendResponse(
 			}
 
 		case parser.Ack, parser.DDL:
+			if result.PGTag == "SELECT" {
+				tag = append(tag, ' ')
+				tag = strconv.AppendInt(tag, int64(result.RowsAffected), 10)
+			}
 			if err := c.sendCommandComplete(tag); err != nil {
 				return err
 			}
 
 		case parser.CopyIn:
-			if err := c.copyIn(result.Columns); err != nil {
+			rows, err := c.copyIn(ctx, result.Columns)
+			if err != nil {
+				return err
+			}
+
+			// Send CommandComplete.
+			tag = append(tag, ' ')
+			tag = strconv.AppendInt(tag, rows, 10)
+			if err := c.sendCommandComplete(tag); err != nil {
 				return err
 			}
 
@@ -914,10 +1060,18 @@ func (c *v3Conn) sendResponse(
 	return nil
 }
 
+// sendRowDescription sends a row description over the wire for the given
+// slice of columns. canSendNoData indicates that the current state of the
+// connection allows for short circuiting by sending the NoData message if
+// there aren't any columns to send. This must be set to true iff we are
+// responding in the Extended Query protocol and the portal or statement will
+// not return rows. See the notes about the NoData message in the Extended
+// Query section of the docs here:
+// https://www.postgresql.org/docs/9.6/static/protocol-flow.html#PROTOCOL-FLOW-EXT-QUERY
 func (c *v3Conn) sendRowDescription(
-	ctx context.Context, columns []sql.ResultColumn, formatCodes []formatCode,
+	ctx context.Context, columns []sqlbase.ResultColumn, formatCodes []formatCode, canSendNoData bool,
 ) error {
-	if len(columns) == 0 {
+	if len(columns) == 0 && canSendNoData {
 		c.writeBuf.initMsg(serverMsgNoData)
 		return c.writeBuf.finishMsg(c.wr)
 	}
@@ -926,7 +1080,7 @@ func (c *v3Conn) sendRowDescription(
 	c.writeBuf.putInt16(int16(len(columns)))
 	for i, column := range columns {
 		if log.V(2) {
-			log.Infof(ctx, "pgwire: writing column %s of type: %T", column.Name, column.Typ)
+			log.Infof(c.session.Ctx(), "pgwire: writing column %s of type: %T", column.Name, column.Typ)
 		}
 		c.writeBuf.writeTerminatedString(column.Name)
 
@@ -935,7 +1089,16 @@ func (c *v3Conn) sendRowDescription(
 		c.writeBuf.putInt16(0) // Column attribute ID (optional).
 		c.writeBuf.putInt32(int32(typ.oid))
 		c.writeBuf.putInt16(int16(typ.size))
-		c.writeBuf.putInt32(0) // Type modifier (none of our supported types have modifiers).
+		// The type modifier (atttypmod) is used to include various extra information
+		// about the type being sent. -1 is used for values which don't make use of
+		// atttypmod and is generally an acceptable catch-all for those that do.
+		// See https://www.postgresql.org/docs/9.6/static/catalog-pg-attribute.html
+		// for information on atttypmod. In theory we differ from Postgres by never
+		// giving the scale/precision, and by not including the length of a VARCHAR,
+		// but it's not clear if any drivers/ORMs depend on this.
+		//
+		// TODO(justin): It would be good to include this information when possible.
+		c.writeBuf.putInt32(-1)
 		if formatCodes == nil {
 			c.writeBuf.putInt16(int16(formatText))
 		} else {
@@ -945,9 +1108,11 @@ func (c *v3Conn) sendRowDescription(
 	return c.writeBuf.finishMsg(c.wr)
 }
 
+// copyIn processes COPY IN data and returns the number of rows inserted.
 // See: https://www.postgresql.org/docs/current/static/protocol-flow.html#PROTOCOL-COPY
-func (c *v3Conn) copyIn(columns []sql.ResultColumn) error {
-	defer c.session.CopyEnd()
+func (c *v3Conn) copyIn(ctx context.Context, columns []sqlbase.ResultColumn) (int64, error) {
+	var rows int64
+	defer c.session.CopyEnd(ctx)
 
 	c.writeBuf.initMsg(serverMsgCopyInResponse)
 	c.writeBuf.writeByte(byte(formatText))
@@ -956,17 +1121,17 @@ func (c *v3Conn) copyIn(columns []sql.ResultColumn) error {
 		c.writeBuf.putInt16(int16(formatText))
 	}
 	if err := c.writeBuf.finishMsg(c.wr); err != nil {
-		return err
+		return 0, err
 	}
 	if err := c.wr.Flush(); err != nil {
-		return err
+		return 0, err
 	}
 
 	for {
 		typ, n, err := c.readBuf.readTypedMsg(c.rd)
 		c.metrics.BytesInCount.Inc(int64(n))
 		if err != nil {
-			return err
+			return rows, err
 		}
 		var sr sql.StatementResults
 		var done bool
@@ -989,16 +1154,25 @@ func (c *v3Conn) copyIn(columns []sql.ResultColumn) error {
 			// Spec says to "ignore Flush and Sync messages received during copy-in mode".
 
 		default:
-			return c.sendErrorWithCode(pgerror.CodeProtocolViolationError, sqlbase.MakeSrcCtx(0),
-				fmt.Sprintf("unrecognized client message type %s", typ))
+			return rows, c.sendError(newUnrecognizedMsgTypeErr(typ))
 		}
 		for _, res := range sr.ResultList {
+			rows += int64(res.RowsAffected)
 			if res.Err != nil {
-				return c.sendError(res.Err)
+				return rows, c.sendError(res.Err)
 			}
 		}
 		if done {
-			return nil
+			return rows, nil
 		}
 	}
+}
+
+func newUnrecognizedMsgTypeErr(typ clientMessageType) error {
+	return pgerror.NewErrorf(
+		pgerror.CodeProtocolViolationError, "unrecognized client message type %v", typ)
+}
+
+func newAdminShutdownErr(err error) error {
+	return pgerror.NewErrorf(pgerror.CodeAdminShutdownError, err.Error())
 }

@@ -13,8 +13,6 @@
 // permissions and limitations under the License.
 //
 // This code is based on: https://github.com/golang/groupcache/
-//
-// Author: Spencer Kimball (spencer.kimball@gmail.com)
 
 package cache
 
@@ -496,7 +494,7 @@ func (ic *IntervalCache) MakeKey(start, end []byte) IntervalKey {
 
 // Implementation of cacheStore interface.
 func (ic *IntervalCache) init() {
-	ic.tree = interval.Tree{Overlapper: interval.Range.OverlapExclusive}
+	ic.tree = interval.NewTree(interval.ExclusiveOverlapper)
 }
 
 func (ic *IntervalCache) get(key interface{}) *Entry {
@@ -552,12 +550,4 @@ func (ic *IntervalCache) doOverlaps(i interval.Interface) bool {
 	ic.access(e) // maintain cache eviction ordering
 	ic.overlaps = append(ic.overlaps, e)
 	return false
-}
-
-// Do invokes f on all of the entries in the cache.
-func (ic *IntervalCache) Do(f func(k, v interface{})) {
-	ic.tree.Do(func(e interval.Interface) (done bool) {
-		f(e.(*Entry).Key, e.(*Entry).Value)
-		return
-	})
 }

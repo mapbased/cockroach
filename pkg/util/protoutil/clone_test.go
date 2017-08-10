@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Tamir Duberstein (tamird@gmail.com)
 
 package protoutil_test
 
@@ -31,7 +29,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/storage/engine/enginepb"
 	"github.com/cockroachdb/cockroach/pkg/storage/storagebase"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
-	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 )
 
 func TestCloneProto(t *testing.T) {
@@ -50,7 +47,6 @@ func TestCloneProto(t *testing.T) {
 		{&config.ZoneConfig{}, false},
 		{&gossip.Info{}, false},
 		{&gossip.BootstrapInfo{}, false},
-		{&tracing.SpanContextCarrier{}, false},
 		{&sqlbase.IndexDescriptor{}, false},
 		{&roachpb.SplitTrigger{}, false},
 		{&roachpb.Value{}, false},

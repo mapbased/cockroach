@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Peter Mattis (peter@cockroachlabs.com)
 
 package acceptance
 
@@ -33,6 +31,9 @@ const longWaitTime = 2 * time.Minute
 const shortWaitTime = 20 * time.Second
 
 func TestGossipPeerings(t *testing.T) {
+	s := log.Scope(t)
+	defer s.Close(t)
+
 	runTestOnConfigs(t, testGossipPeeringsInner)
 }
 
@@ -49,14 +50,18 @@ func testGossipPeeringsInner(
 	}
 
 	for timeutil.Now().Before(deadline) {
-		CheckGossip(ctx, t, c, waitTime, HasPeers(num))
+		if err := CheckGossip(ctx, c, waitTime, HasPeers(num)); err != nil {
+			t.Fatal(err)
+		}
 
 		// Restart the first node.
 		log.Infof(ctx, "restarting node 0")
 		if err := c.Restart(ctx, 0); err != nil {
 			t.Fatal(err)
 		}
-		CheckGossip(ctx, t, c, waitTime, HasPeers(num))
+		if err := CheckGossip(ctx, c, waitTime, HasPeers(num)); err != nil {
+			t.Fatal(err)
+		}
 
 		// Restart another node (if there is one).
 		var pickedNode int
@@ -67,7 +72,9 @@ func testGossipPeeringsInner(
 		if err := c.Restart(ctx, pickedNode); err != nil {
 			t.Fatal(err)
 		}
-		CheckGossip(ctx, t, c, waitTime, HasPeers(num))
+		if err := CheckGossip(ctx, c, waitTime, HasPeers(num)); err != nil {
+			t.Fatal(err)
+		}
 	}
 }
 
@@ -75,6 +82,9 @@ func testGossipPeeringsInner(
 // re-bootstrapped after a time when all nodes were down
 // simultaneously.
 func TestGossipRestart(t *testing.T) {
+	s := log.Scope(t)
+	defer s.Close(t)
+
 	// TODO(bram): #4559 Limit this test to only the relevant cases. No chaos
 	// agents should be required.
 	runTestOnConfigs(t, testGossipRestartInner)
@@ -100,9 +110,15 @@ func testGossipRestartInner(
 
 	for timeutil.Now().Before(deadline) {
 		log.Infof(ctx, "waiting for initial gossip connections")
-		CheckGossip(ctx, t, c, waitTime, HasPeers(num))
-		CheckGossip(ctx, t, c, waitTime, hasClusterID)
-		CheckGossip(ctx, t, c, waitTime, hasSentinel)
+		if err := CheckGossip(ctx, c, waitTime, HasPeers(num)); err != nil {
+			t.Fatal(err)
+		}
+		if err := CheckGossip(ctx, c, waitTime, hasClusterID); err != nil {
+			t.Fatal(err)
+		}
+		if err := CheckGossip(ctx, c, waitTime, hasSentinel); err != nil {
+			t.Fatal(err)
+		}
 
 		log.Infof(ctx, "killing all nodes")
 		for i := 0; i < num; i++ {
@@ -112,16 +128,40 @@ func testGossipRestartInner(
 		}
 
 		log.Infof(ctx, "restarting all nodes")
-		for i := 0; i < num; i++ {
-			if err := c.Restart(ctx, i); err != nil {
-				t.Fatal(err)
+		if _, ok := c.(*cluster.LocalCluster); ok {
+			// It is not safe to call Restart in parallel when using
+			// cluster.LocalCluster because expected container shutdown events
+			// may be reordered.
+			for i := 0; i < num; i++ {
+				if err := c.Restart(ctx, i); err != nil {
+					t.Errorf("error restarting node %d: %s", i, err)
+				}
 			}
+		} else {
+			ch := make(chan error)
+			for i := 0; i < num; i++ {
+				go func(i int) { ch <- c.Restart(ctx, i) }(i)
+			}
+			for i := 0; i < num; i++ {
+				if err := <-ch; err != nil {
+					t.Errorf("error restarting node %d: %s", i, err)
+				}
+			}
+		}
+		if t.Failed() {
+			t.FailNow()
 		}
 
 		log.Infof(ctx, "waiting for gossip to be connected")
-		CheckGossip(ctx, t, c, waitTime, HasPeers(num))
-		CheckGossip(ctx, t, c, waitTime, hasClusterID)
-		CheckGossip(ctx, t, c, waitTime, hasSentinel)
+		if err := CheckGossip(ctx, c, waitTime, HasPeers(num)); err != nil {
+			t.Fatal(err)
+		}
+		if err := CheckGossip(ctx, c, waitTime, hasClusterID); err != nil {
+			t.Fatal(err)
+		}
+		if err := CheckGossip(ctx, c, waitTime, hasSentinel); err != nil {
+			t.Fatal(err)
+		}
 
 		for i := 0; i < num; i++ {
 			db, err := c.NewClient(ctx, i)
@@ -134,9 +174,9 @@ func testGossipRestartInner(
 				}
 			}
 			var kv client.KeyValue
-			if err := db.Txn(ctx, func(txn *client.Txn) error {
+			if err := db.Txn(ctx, func(ctx context.Context, txn *client.Txn) error {
 				var err error
-				kv, err = txn.Inc("count", 1)
+				kv, err = txn.Inc(ctx, "count", 1)
 				return err
 			}); err != nil {
 				t.Fatal(err)

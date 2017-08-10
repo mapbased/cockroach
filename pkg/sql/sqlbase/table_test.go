@@ -11,14 +11,14 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Daniel Harrison (daniel.harrison@gmail.com)
 
 package sqlbase
 
 import (
 	"bytes"
 	"testing"
+
+	"golang.org/x/net/context"
 
 	"github.com/cockroachdb/cockroach/pkg/internal/client"
 	"github.com/pkg/errors"
@@ -42,7 +42,7 @@ func makeTableDescForTest(test indexKeyTest) (TableDescriptor, map[ColumnID]int)
 	columns := make([]ColumnDescriptor, len(test.primaryValues)+len(test.secondaryValues))
 	colMap := make(map[ColumnID]int, len(test.secondaryValues))
 	for i := range columns {
-		columns[i] = ColumnDescriptor{ID: ColumnID(i + 1), Type: ColumnType{Kind: ColumnType_INT}}
+		columns[i] = ColumnDescriptor{ID: ColumnID(i + 1), Type: ColumnType{SemanticType: ColumnType_INT}}
 		colMap[columns[i].ID] = i
 		if i < len(test.primaryValues) {
 			primaryColumnIDs[i] = columns[i].ID
@@ -75,12 +75,12 @@ func makeTableDescForTest(test indexKeyTest) (TableDescriptor, map[ColumnID]int)
 			Interleave:       makeInterleave(1, test.primaryInterleaves),
 		},
 		Indexes: []IndexDescriptor{{
-			ID:                2,
-			ColumnIDs:         secondaryColumnIDs,
-			ImplicitColumnIDs: primaryColumnIDs,
-			Unique:            true,
-			ColumnDirections:  make([]IndexDescriptor_Direction, len(secondaryColumnIDs)),
-			Interleave:        makeInterleave(2, test.secondaryInterleaves),
+			ID:               2,
+			ColumnIDs:        secondaryColumnIDs,
+			ExtraColumnIDs:   primaryColumnIDs,
+			Unique:           true,
+			ColumnDirections: make([]IndexDescriptor_Direction, len(secondaryColumnIDs)),
+			Interleave:       makeInterleave(2, test.secondaryInterleaves),
 		}},
 	}
 
@@ -167,7 +167,7 @@ func TestIndexKey(t *testing.T) {
 		valuesLen := randutil.RandIntInRange(rng, len(t.primaryInterleaves)+1, len(t.primaryInterleaves)+10)
 		t.primaryValues = make([]parser.Datum, valuesLen)
 		for j := range t.primaryValues {
-			t.primaryValues[j] = RandDatum(rng, ColumnType_INT, true)
+			t.primaryValues[j] = RandDatum(rng, ColumnType{SemanticType: ColumnType_INT}, true)
 		}
 
 		t.secondaryInterleaves = make([]ID, rng.Intn(10))
@@ -177,13 +177,15 @@ func TestIndexKey(t *testing.T) {
 		valuesLen = randutil.RandIntInRange(rng, len(t.secondaryInterleaves)+1, len(t.secondaryInterleaves)+10)
 		t.secondaryValues = make([]parser.Datum, valuesLen)
 		for j := range t.secondaryValues {
-			t.secondaryValues[j] = RandDatum(rng, ColumnType_INT, true)
+			t.secondaryValues[j] = RandDatum(rng, ColumnType{SemanticType: ColumnType_INT}, true)
 		}
 
 		tests = append(tests, t)
 	}
 
 	for i, test := range tests {
+		evalCtx := parser.NewTestingEvalContext()
+		defer evalCtx.Stop(context.Background())
 		tableDesc, colMap := makeTableDescForTest(test)
 		testValues := append(test.primaryValues, test.secondaryValues...)
 
@@ -214,7 +216,7 @@ func TestIndexKey(t *testing.T) {
 
 			for j, value := range values {
 				testValue := testValues[colMap[index.ColumnIDs[j]]]
-				if value.Compare(testValue) != 0 {
+				if value.Compare(evalCtx, testValue) != 0 {
 					t.Fatalf("%d: value %d got %q but expected %q", i, j, value, testValue)
 				}
 			}
@@ -238,5 +240,127 @@ func TestIndexKey(t *testing.T) {
 
 		checkEntry(&tableDesc.PrimaryIndex, primaryIndexKV)
 		checkEntry(&tableDesc.Indexes[0], secondaryIndexKV)
+	}
+}
+
+type arrayEncodingTest struct {
+	name     string
+	datum    parser.DArray
+	encoding []byte
+}
+
+func TestArrayEncoding(t *testing.T) {
+	tests := []arrayEncodingTest{
+		{
+			"empty int array",
+			parser.DArray{
+				ParamTyp: parser.TypeInt,
+				Array:    parser.Datums{},
+			},
+			[]byte{1, 3, 0},
+		}, {
+			"single int array",
+			parser.DArray{
+				ParamTyp: parser.TypeInt,
+				Array:    parser.Datums{parser.NewDInt(1)},
+			},
+			[]byte{1, 3, 1, 2},
+		}, {
+			"multiple int array",
+			parser.DArray{
+				ParamTyp: parser.TypeInt,
+				Array:    parser.Datums{parser.NewDInt(1), parser.NewDInt(2), parser.NewDInt(3)},
+			},
+			[]byte{1, 3, 3, 2, 4, 6},
+		}, {
+			"string array",
+			parser.DArray{
+				ParamTyp: parser.TypeString,
+				Array:    parser.Datums{parser.NewDString("foo"), parser.NewDString("bar"), parser.NewDString("baz")},
+			},
+			[]byte{1, 6, 3, 3, 102, 111, 111, 3, 98, 97, 114, 3, 98, 97, 122},
+		}, {
+			"bool array",
+			parser.DArray{
+				ParamTyp: parser.TypeBool,
+				Array:    parser.Datums{parser.MakeDBool(true), parser.MakeDBool(false)},
+			},
+			[]byte{1, 10, 2, 10, 11},
+		}, {
+			"array containing a single null",
+			parser.DArray{
+				ParamTyp: parser.TypeInt,
+				Array:    parser.Datums{parser.DNull},
+				HasNulls: true,
+			},
+			[]byte{17, 3, 1, 1},
+		}, {
+			"array containing multiple nulls",
+			parser.DArray{
+				ParamTyp: parser.TypeInt,
+				Array:    parser.Datums{parser.NewDInt(1), parser.DNull, parser.DNull},
+				HasNulls: true,
+			},
+			[]byte{17, 3, 3, 6, 2},
+		}, {
+			"array whose NULL bitmap spans exactly one byte",
+			parser.DArray{
+				ParamTyp: parser.TypeInt,
+				Array: parser.Datums{
+					parser.NewDInt(1), parser.DNull, parser.DNull, parser.NewDInt(2), parser.NewDInt(3),
+					parser.NewDInt(4), parser.NewDInt(5), parser.NewDInt(6),
+				},
+				HasNulls: true,
+			},
+			[]byte{17, 3, 8, 6, 2, 4, 6, 8, 10, 12},
+		}, {
+			"array whose NULL bitmap spans more than one byte",
+			parser.DArray{
+				ParamTyp: parser.TypeInt,
+				Array: parser.Datums{
+					parser.NewDInt(1), parser.DNull, parser.DNull, parser.NewDInt(2), parser.NewDInt(3),
+					parser.NewDInt(4), parser.NewDInt(5), parser.NewDInt(6), parser.DNull,
+				},
+				HasNulls: true,
+			},
+			[]byte{17, 3, 9, 6, 1, 2, 4, 6, 8, 10, 12},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run("encode "+test.name, func(t *testing.T) {
+			enc, err := encodeArray(&test.datum, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !bytes.Equal(enc, test.encoding) {
+				t.Fatalf("expected %s to encode to %v, got %v", test.datum.String(), test.encoding, enc)
+			}
+		})
+
+		t.Run("decode "+test.name, func(t *testing.T) {
+			enc := make([]byte, 0)
+			enc = append(enc, byte(len(test.encoding)))
+			enc = append(enc, test.encoding...)
+			d, _, err := decodeArray(&DatumAlloc{}, test.datum.ParamTyp, enc)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if d.Compare(parser.NewTestingEvalContext(), &test.datum) != 0 {
+				t.Fatalf("expected %v to decode to %s, got %s", enc, test.datum.String(), d.String())
+			}
+		})
+	}
+}
+
+func BenchmarkArrayEncoding(b *testing.B) {
+	ary := parser.DArray{ParamTyp: parser.TypeInt, Array: parser.Datums{}}
+	for i := 0; i < 10000; i++ {
+		_ = ary.Append(parser.NewDInt(1))
+	}
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_, _ = encodeArray(&ary, nil)
 	}
 }

@@ -12,8 +12,6 @@
 // implied. See the License for the specific language governing
 // permissions and limitations under the License. See the AUTHORS file
 // for names of contributors.
-//
-// Author: Tobias Schottdorf
 
 // +build race
 
@@ -52,20 +50,20 @@ func jitter(avgInterval time.Duration) time.Duration {
 	return time.Duration(rand.Int63n(int64(2 * avgInterval)))
 }
 
-// grpcTransportFactory during race builds wraps the implementation and
+// GRPCTransportFactory during race builds wraps the implementation and
 // intercepts all BatchRequests, reading them in a tight loop. This allows the
 // race detector to catch any mutations of a batch passed to the transport.
-func grpcTransportFactory(
+func GRPCTransportFactory(
 	opts SendOptions, rpcContext *rpc.Context, replicas ReplicaSlice, args roachpb.BatchRequest,
 ) (Transport, error) {
 	if atomic.AddInt32(&running, 1) <= 1 {
-		rpcContext.Stopper.RunWorker(func() {
+		rpcContext.Stopper.RunWorker(context.TODO(), func(ctx context.Context) {
 			var iters int
 			var curIdx int
 			defer func() {
 				atomic.StoreInt32(&running, 0)
 				log.Infof(
-					context.TODO(),
+					ctx,
 					"transport race promotion: ran %d iterations on up to %d requests",
 					iters, curIdx+1,
 				)

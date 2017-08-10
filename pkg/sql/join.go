@@ -11,18 +11,18 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Raphael 'kena' Poss (knz@cockroachlabs.com)
-// Author: Irfan Sharif (irfansharif@cockroachlabs.com)
 
 package sql
 
 import (
-	"bytes"
 	"fmt"
+	"unsafe"
+
+	"github.com/pkg/errors"
+	"golang.org/x/net/context"
 
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 )
 
 type joinType int
@@ -30,53 +30,56 @@ type joinType int
 const (
 	joinTypeInner joinType = iota
 	joinTypeLeftOuter
+	joinTypeRightOuter
 	joinTypeFullOuter
 )
 
 // bucket here is the set of rows for a given group key (comprised of
 // columns specified by the join constraints), 'seen' is used to determine if
-// there was a matching group (with the same group key) in the opposite stream.
+// there was a matching row in the opposite stream.
 type bucket struct {
-	rows []parser.DTuple
-	seen bool
+	rows []parser.Datums
+	seen []bool
 }
 
-func (b *bucket) Seen() bool {
-	return b.seen
+func (b *bucket) Seen(i int) bool {
+	return b.seen[i]
 }
 
-func (b *bucket) Rows() []parser.DTuple {
+func (b *bucket) Rows() []parser.Datums {
 	return b.rows
 }
 
-func (b *bucket) MarkSeen() {
-	b.seen = true
+func (b *bucket) MarkSeen(i int) {
+	b.seen[i] = true
 }
 
-func (b *bucket) AddRow(row parser.DTuple) {
+func (b *bucket) AddRow(row parser.Datums) {
 	b.rows = append(b.rows, row)
 }
 
 type buckets struct {
 	buckets      map[string]*bucket
-	rowContainer *RowContainer
+	rowContainer *sqlbase.RowContainer
 }
 
 func (b *buckets) Buckets() map[string]*bucket {
 	return b.buckets
 }
 
-func (b *buckets) AddRow(acc WrappedMemoryAccount, encoding []byte, row parser.DTuple) error {
+func (b *buckets) AddRow(
+	ctx context.Context, acc WrappedMemoryAccount, encoding []byte, row parser.Datums,
+) error {
 	bk, ok := b.buckets[string(encoding)]
 	if !ok {
 		bk = &bucket{}
 	}
 
-	rowCopy, err := b.rowContainer.AddRow(row)
+	rowCopy, err := b.rowContainer.AddRow(ctx, row)
 	if err != nil {
 		return err
 	}
-	if err := acc.Grow(sizeOfDTuple); err != nil {
+	if err := acc.Grow(ctx, sqlbase.SizeOfDatums); err != nil {
 		return err
 	}
 	bk.AddRow(rowCopy)
@@ -87,8 +90,25 @@ func (b *buckets) AddRow(acc WrappedMemoryAccount, encoding []byte, row parser.D
 	return nil
 }
 
-func (b *buckets) Close() {
-	b.rowContainer.Close()
+const sizeOfBoolSlice = unsafe.Sizeof([]bool{})
+const sizeOfBool = unsafe.Sizeof(true)
+
+// InitSeen initializes the seen array for each of the buckets. It must be run
+// before the buckets' seen state is used.
+func (b *buckets) InitSeen(ctx context.Context, acc WrappedMemoryAccount) error {
+	for _, bucket := range b.buckets {
+		if err := acc.Grow(
+			ctx, int64(sizeOfBoolSlice+uintptr(len(bucket.rows))*sizeOfBool),
+		); err != nil {
+			return err
+		}
+		bucket.seen = make([]bool, len(bucket.rows))
+	}
+	return nil
+}
+
+func (b *buckets) Close(ctx context.Context) {
+	b.rowContainer.Close(ctx)
 	b.rowContainer = nil
 	b.buckets = nil
 }
@@ -105,18 +125,28 @@ type joinNode struct {
 	joinType joinType
 
 	// The data sources.
-	left    planDataSource
-	right   planDataSource
-	swapped bool
+	left  planDataSource
+	right planDataSource
 
 	// pred represents the join predicate.
 	pred *joinPredicate
 
+	// mergeJoinOrdering is set during expandPlan if the left and right sides have
+	// similar ordering on the equality columns (or a subset of them). The column
+	// indices refer to equality columns: a ColIdx of i refers to left column
+	// pred.leftEqualityIndices[i] and right column pred.rightEqualityIndices[i].
+	// See computeMergeJoinOrdering. This information is used by distsql planning.
+	mergeJoinOrdering sqlbase.ColumnOrdering
+
+	// ordering is set during expandPlan based on mergeJoinOrdering, but later
+	// trimmed.
+	ordering orderingInfo
+
 	// columns contains the metadata for the results of this node.
-	columns ResultColumns
+	columns sqlbase.ResultColumns
 
 	// output contains the last generated row of results from this node.
-	output parser.DTuple
+	output parser.Datums
 
 	// buffer is our intermediate row store where we effectively 'stash' a batch
 	// of results at once, this is then used for subsequent calls to Next() and
@@ -126,21 +156,17 @@ type joinNode struct {
 	buckets       buckets
 	bucketsMemAcc WrappableMemoryAccount
 
-	// emptyRight contain tuples of NULL values to use on the
-	// right for outer joins when the filter fails.
-	emptyRight parser.DTuple
+	// emptyRight contain tuples of NULL values to use on the right for left and
+	// full outer joins when the on condition fails.
+	emptyRight parser.Datums
 
-	// emptyLeft contains tuples of NULL values to use
-	// on the left for full outer joins when the filter fails.
-	emptyLeft parser.DTuple
+	// emptyLeft contains tuples of NULL values to use on the left for right and
+	// full outer joins when the on condition fails.
+	emptyLeft parser.Datums
 
-	// explain indicates whether this node is running on behalf of
-	// EXPLAIN(DEBUG).
-	explain explainMode
-
-	// doneReadingRight is used by debugNext() and DebugValues() when
-	// explain == explainDebug.
-	doneReadingRight bool
+	// finishedOutput indicates that we've finished writing all of the rows for
+	// this join and that we can quit as soon as our buffer is empty.
+	finishedOutput bool
 }
 
 // commonColumns returns the names of columns common on the
@@ -148,15 +174,15 @@ type joinNode struct {
 func commonColumns(left, right *dataSourceInfo) parser.NameList {
 	var res parser.NameList
 	for _, cLeft := range left.sourceColumns {
-		if cLeft.hidden {
+		if cLeft.Hidden {
 			continue
 		}
 		for _, cRight := range right.sourceColumns {
-			if cRight.hidden {
+			if cRight.Hidden {
 				continue
 			}
 
-			if parser.ReNormalizeName(cLeft.Name) == parser.ReNormalizeName(cRight.Name) {
+			if cLeft.Name == cRight.Name {
 				res = append(res, parser.Name(cLeft.Name))
 			}
 		}
@@ -168,11 +194,12 @@ func commonColumns(left, right *dataSourceInfo) parser.NameList {
 // The tableInfo field from the left node is taken over (overwritten)
 // by the new node.
 func (p *planner) makeJoin(
-	astJoinType string, left planDataSource, right planDataSource, cond parser.JoinCond,
+	ctx context.Context,
+	astJoinType string,
+	left planDataSource,
+	right planDataSource,
+	cond parser.JoinCond,
 ) (planDataSource, error) {
-	leftInfo, rightInfo := left.info, right.info
-
-	swapped := false
 	var typ joinType
 	switch astJoinType {
 	case "JOIN", "INNER JOIN", "CROSS JOIN":
@@ -180,18 +207,18 @@ func (p *planner) makeJoin(
 	case "LEFT JOIN":
 		typ = joinTypeLeftOuter
 	case "RIGHT JOIN":
-		left, right = right, left // swap
-		typ = joinTypeLeftOuter
-		swapped = true
+		typ = joinTypeRightOuter
 	case "FULL JOIN":
 		typ = joinTypeFullOuter
 	default:
 		return planDataSource{}, errors.Errorf("unsupported JOIN type %T", astJoinType)
 	}
 
+	leftInfo, rightInfo := left.info, right.info
+
 	// Check that the same table name is not used on both sides.
-	for _, alias := range right.info.sourceAliases {
-		if _, ok := left.info.sourceAliases.srcIdx(alias.name); ok {
+	for _, alias := range rightInfo.sourceAliases {
+		if _, ok := leftInfo.sourceAliases.srcIdx(alias.name); ok {
 			t := alias.name.Table()
 			if t == "" {
 				// Allow joins of sources that define columns with no
@@ -216,7 +243,7 @@ func (p *planner) makeJoin(
 	} else {
 		switch t := cond.(type) {
 		case *parser.OnJoinCond:
-			pred, info, err = p.makeOnPredicate(leftInfo, rightInfo, t.Expr)
+			pred, info, err = p.makeOnPredicate(ctx, leftInfo, rightInfo, t.Expr)
 		case parser.NaturalJoinCond:
 			cols := commonColumns(leftInfo, rightInfo)
 			pred, info, err = makeUsingPredicate(leftInfo, rightInfo, cols)
@@ -235,17 +262,22 @@ func (p *planner) makeJoin(
 		joinType: typ,
 		pred:     pred,
 		columns:  info.sourceColumns,
-		swapped:  swapped,
 	}
 
 	n.buffer = &RowBuffer{
-		RowContainer: NewRowContainer(p.session.TxnState.makeBoundAccount(), n.Columns(), 0),
+		RowContainer: sqlbase.NewRowContainer(
+			p.session.TxnState.makeBoundAccount(), sqlbase.ColTypeInfoFromResCols(planColumns(n)), 0,
+		),
 	}
 
 	n.bucketsMemAcc = p.session.TxnState.OpenAccount()
 	n.buckets = buckets{
-		buckets:      make(map[string]*bucket),
-		rowContainer: NewRowContainer(p.session.TxnState.makeBoundAccount(), n.right.plan.Columns(), 0),
+		buckets: make(map[string]*bucket),
+		rowContainer: sqlbase.NewRowContainer(
+			p.session.TxnState.makeBoundAccount(),
+			sqlbase.ColTypeInfoFromResCols(planColumns(n.right.plan)),
+			0,
+		),
 	}
 
 	return planDataSource{
@@ -254,114 +286,32 @@ func (p *planner) makeJoin(
 	}, nil
 }
 
-// ExplainTypes implements the planNode interface.
-func (n *joinNode) ExplainTypes(regTypes func(string, string)) {
-	if n.pred.filter != nil {
-		regTypes("filter", parser.AsStringWithFlags(n.pred.filter, parser.FmtShowTypes))
-	}
-}
-
-// SetLimitHint implements the planNode interface.
-func (n *joinNode) SetLimitHint(numRows int64, soft bool) {}
-
-// setNeededColumns implements the planNode interface.
-func (n *joinNode) setNeededColumns(needed []bool) {
-	leftNeeded, rightNeeded := n.pred.getNeededColumns(needed)
-	n.left.plan.setNeededColumns(leftNeeded)
-	n.right.plan.setNeededColumns(rightNeeded)
-	for i, v := range needed {
-		n.columns[i].omitted = !v
-	}
-}
-
-// expandPlan implements the planNode interface.
-func (n *joinNode) expandPlan() error {
-	if err := n.planner.expandSubqueryPlans(n.pred.filter); err != nil {
-		return err
-	}
-	if err := n.left.plan.expandPlan(); err != nil {
-		return err
-	}
-	return n.right.plan.expandPlan()
-}
-
-// ExplainPlan implements the planNode interface.
-func (n *joinNode) ExplainPlan(v bool) (name, description string, children []planNode) {
-	var buf bytes.Buffer
-	switch n.joinType {
-	case joinTypeInner:
-		jType := "INNER"
-		if len(n.pred.leftColNames) == 0 && n.pred.filter == nil {
-			jType = "CROSS"
-		}
-		buf.WriteString(jType)
-	case joinTypeLeftOuter:
-		if !n.swapped {
-			buf.WriteString("LEFT OUTER")
-		} else {
-			buf.WriteString("RIGHT OUTER")
-		}
-	case joinTypeFullOuter:
-		buf.WriteString("FULL OUTER")
-	}
-
-	n.pred.format(&buf)
-
-	subplans := []planNode{n.left.plan, n.right.plan}
-	if n.swapped {
-		subplans[0], subplans[1] = subplans[1], subplans[0]
-	}
-	subplans = n.planner.collectSubqueryPlans(n.pred.filter, subplans)
-
-	return "join", buf.String(), subplans
-}
-
-// Columns implements the planNode interface.
-func (n *joinNode) Columns() ResultColumns { return n.columns }
-
-// Ordering implements the planNode interface.
-func (n *joinNode) Ordering() orderingInfo { return orderingInfo{} }
-
-// MarkDebug implements the planNode interface.
-func (n *joinNode) MarkDebug(mode explainMode) {
-	if mode != explainDebug {
-		panic(fmt.Sprintf("unknown debug mode %d", mode))
-	}
-	n.explain = mode
-	n.left.plan.MarkDebug(mode)
-	n.right.plan.MarkDebug(mode)
-}
-
 // Start implements the planNode interface.
-func (n *joinNode) Start() error {
-	if err := n.planner.startSubqueryPlans(n.pred.filter); err != nil {
+func (n *joinNode) Start(params runParams) error {
+	if err := n.left.plan.Start(params); err != nil {
+		return err
+	}
+	if err := n.right.plan.Start(params); err != nil {
 		return err
 	}
 
-	if err := n.left.plan.Start(); err != nil {
+	if err := n.hashJoinStart(params); err != nil {
 		return err
-	}
-	if err := n.right.plan.Start(); err != nil {
-		return err
-	}
-
-	if n.explain != explainDebug {
-		if err := n.hashJoinStart(); err != nil {
-			return err
-		}
 	}
 
 	// Pre-allocate the space for output rows.
-	n.output = make(parser.DTuple, len(n.columns))
+	n.output = make(parser.Datums, len(n.columns))
 
 	// If needed, pre-allocate left and right rows of NULL tuples for when the
 	// join predicate fails to match.
 	if n.joinType == joinTypeLeftOuter || n.joinType == joinTypeFullOuter {
-		n.emptyRight = make(parser.DTuple, len(n.right.plan.Columns()))
+		n.emptyRight = make(parser.Datums, len(planColumns(n.right.plan)))
 		for i := range n.emptyRight {
 			n.emptyRight[i] = parser.DNull
 		}
-		n.emptyLeft = make(parser.DTuple, len(n.left.plan.Columns()))
+	}
+	if n.joinType == joinTypeRightOuter || n.joinType == joinTypeFullOuter {
+		n.emptyLeft = make(parser.Datums, len(planColumns(n.left.plan)))
 		for i := range n.emptyLeft {
 			n.emptyLeft[i] = parser.DNull
 		}
@@ -370,17 +320,18 @@ func (n *joinNode) Start() error {
 	return nil
 }
 
-func (n *joinNode) hashJoinStart() error {
+func (n *joinNode) hashJoinStart(params runParams) error {
 	var scratch []byte
 	// Load all the rows from the right side and build our hashmap.
 	acc := n.bucketsMemAcc.Wtxn(n.planner.session)
+	ctx := params.ctx
 	for {
-		hasRow, err := n.right.plan.Next()
+		hasRow, err := n.right.plan.Next(params)
 		if err != nil {
 			return err
 		}
 		if !hasRow {
-			return nil
+			break
 		}
 		row := n.right.plan.Values()
 		encoding, _, err := n.pred.encode(scratch, row, n.pred.rightEqualityIndices)
@@ -388,52 +339,49 @@ func (n *joinNode) hashJoinStart() error {
 			return err
 		}
 
-		if err := n.buckets.AddRow(acc, encoding, row); err != nil {
+		if err := n.buckets.AddRow(ctx, acc, encoding, row); err != nil {
 			return err
 		}
 
 		scratch = encoding[:0]
 	}
-}
-
-func (n *joinNode) debugNext() (bool, error) {
-	if !n.doneReadingRight {
-		hasRightRow, err := n.right.plan.Next()
-		if err != nil {
-			return false, err
-		}
-		if hasRightRow {
-			return true, nil
-		}
-		n.doneReadingRight = true
+	if n.joinType == joinTypeFullOuter || n.joinType == joinTypeRightOuter {
+		return n.buckets.InitSeen(ctx, acc)
 	}
-
-	return n.left.plan.Next()
+	return nil
 }
 
 // Next implements the planNode interface.
-func (n *joinNode) Next() (res bool, err error) {
-	if n.explain == explainDebug {
-		return n.debugNext()
-	}
-
-	if len(n.buckets.Buckets()) == 0 {
-		if n.joinType != joinTypeLeftOuter && n.joinType != joinTypeFullOuter {
-			// No rows on right; don't even try.
-			return false, nil
-		}
-	}
-
+func (n *joinNode) Next(params runParams) (res bool, err error) {
 	// If results available from from previously computed results, we just
 	// return true.
 	if n.buffer.Next() {
 		return true, nil
 	}
 
+	// If the buffer is empty and we've finished outputting, we're done.
+	if n.finishedOutput {
+		return false, nil
+	}
+
+	wantUnmatchedLeft := n.joinType == joinTypeLeftOuter || n.joinType == joinTypeFullOuter
+	wantUnmatchedRight := n.joinType == joinTypeRightOuter || n.joinType == joinTypeFullOuter
+
+	if len(n.buckets.Buckets()) == 0 {
+		if !wantUnmatchedLeft {
+			// No rows on right; don't even try.
+			return false, nil
+		}
+	}
+
 	// Compute next batch of matching rows.
 	var scratch []byte
 	for {
-		leftHasRow, err := n.left.plan.Next()
+		if err := params.p.cancelChecker.Check(); err != nil {
+			return false, err
+		}
+
+		leftHasRow, err := n.left.plan.Next(params)
 		if err != nil {
 			return false, nil
 		}
@@ -491,7 +439,7 @@ func (n *joinNode) Next() (res bool, err error) {
 		//    | NULL |  52  |
 		//    | NULL |  52  |
 		if containsNull {
-			if n.joinType == joinTypeInner {
+			if !wantUnmatchedLeft {
 				scratch = encoding[:0]
 				// Failed to match -- no matching row, nothing to do.
 				continue
@@ -499,7 +447,7 @@ func (n *joinNode) Next() (res bool, err error) {
 			// We append an empty right row to the left row, adding the result
 			// to our buffer for the subsequent call to Next().
 			n.pred.prepareRow(n.output, lrow, n.emptyRight)
-			if _, err := n.buffer.AddRow(n.output); err != nil {
+			if _, err := n.buffer.AddRow(params.ctx, n.output); err != nil {
 				return false, err
 			}
 			return n.buffer.Next(), nil
@@ -507,36 +455,51 @@ func (n *joinNode) Next() (res bool, err error) {
 
 		b, ok := n.buckets.Fetch(encoding)
 		if !ok {
-			if n.joinType == joinTypeInner {
+			if !wantUnmatchedLeft {
 				scratch = encoding[:0]
 				continue
 			}
-			// Outer join: unmatched rows are padded with NULLs.
+			// Left or full outer join: unmatched rows are padded with NULLs.
 			// Given that we did not find a matching right row we append an
 			// empty right row to the left row, adding the result to our buffer
 			// for the subsequent call to Next().
 			n.pred.prepareRow(n.output, lrow, n.emptyRight)
-			if _, err := n.buffer.AddRow(n.output); err != nil {
+			if _, err := n.buffer.AddRow(params.ctx, n.output); err != nil {
 				return false, err
 			}
 			return n.buffer.Next(), nil
 		}
-		b.MarkSeen()
 
 		// We iterate through all the rows in the bucket attempting to match the
-		// filter, if the filter passes we add it to the buffer.
-		for _, rrow := range b.Rows() {
-			passesFilter, err := n.pred.eval(&n.planner.evalCtx, n.output, lrow, rrow)
+		// on condition, if the on condition passes we add it to the buffer.
+		foundMatch := false
+		for idx, rrow := range b.Rows() {
+			passesOnCond, err := n.pred.eval(&n.planner.evalCtx, n.output, lrow, rrow)
 			if err != nil {
 				return false, err
 			}
 
-			if !passesFilter {
+			if !passesOnCond {
 				continue
 			}
+			foundMatch = true
 
 			n.pred.prepareRow(n.output, lrow, rrow)
-			if _, err := n.buffer.AddRow(n.output); err != nil {
+			if wantUnmatchedRight {
+				// Mark the row as seen if we need to retrieve the rows
+				// without matches for right or full joins later.
+				b.MarkSeen(idx)
+			}
+			if _, err := n.buffer.AddRow(params.ctx, n.output); err != nil {
+				return false, err
+			}
+		}
+		if !foundMatch && wantUnmatchedLeft {
+			// If none of the rows matched the on condition and we are computing a
+			// left or full outer join, we need to add a row with an empty
+			// right side.
+			n.pred.prepareRow(n.output, lrow, n.emptyRight)
+			if _, err := n.buffer.AddRow(params.ctx, n.output); err != nil {
 				return false, err
 			}
 		}
@@ -547,51 +510,89 @@ func (n *joinNode) Next() (res bool, err error) {
 	}
 
 	// no more lrows, we go through the unmatched rows in the internal hashmap.
-	if n.joinType != joinTypeFullOuter {
+	if !wantUnmatchedRight {
 		return false, nil
 	}
 
 	for _, b := range n.buckets.Buckets() {
-		if !b.Seen() {
-			for _, rrow := range b.Rows() {
+		for idx, rrow := range b.Rows() {
+			if err := params.p.cancelChecker.Check(); err != nil {
+				return false, err
+			}
+			if !b.Seen(idx) {
 				n.pred.prepareRow(n.output, n.emptyLeft, rrow)
-				if _, err := n.buffer.AddRow(n.output); err != nil {
+				if _, err := n.buffer.AddRow(params.ctx, n.output); err != nil {
 					return false, err
 				}
 			}
-			b.MarkSeen()
 		}
 	}
+	n.finishedOutput = true
 
 	return n.buffer.Next(), nil
 }
 
 // Values implements the planNode interface.
-func (n *joinNode) Values() parser.DTuple {
+func (n *joinNode) Values() parser.Datums {
 	return n.buffer.Values()
 }
 
-// DebugValues implements the planNode interface.
-func (n *joinNode) DebugValues() debugValues {
-	var res debugValues
-	if !n.doneReadingRight {
-		res = n.right.plan.DebugValues()
-	} else {
-		res = n.left.plan.DebugValues()
-	}
-	if res.output == debugValueRow {
-		res.output = debugValueBuffered
-	}
-	return res
+// Close implements the planNode interface.
+func (n *joinNode) Close(ctx context.Context) {
+	n.buffer.Close(ctx)
+	n.buffer = nil
+	n.buckets.Close(ctx)
+	n.bucketsMemAcc.Wtxn(n.planner.session).Close(ctx)
+
+	n.right.plan.Close(ctx)
+	n.left.plan.Close(ctx)
 }
 
-// Close implements the planNode interface.
-func (n *joinNode) Close() {
-	n.buffer.Close()
-	n.buffer = nil
-	n.buckets.Close()
-	n.bucketsMemAcc.Wtxn(n.planner.session).Close()
+// equalityColIdxInSchema takes a column index from joinPred.leftEqualityIndices
+// or joinPred.rightEqualityIndices, and maps it to the column index in n.Columns.
+func (n *joinNode) equalityColIdxInSchema(colIdx int, right bool) uint32 {
+	if right {
+		return uint32(n.pred.rightEqualityIndices[colIdx] +
+			n.pred.numMergedEqualityColumns +
+			n.pred.numLeftCols)
+	}
+	return uint32(n.pred.numMergedEqualityColumns +
+		n.pred.leftEqualityIndices[colIdx])
+}
 
-	n.right.plan.Close()
-	n.left.plan.Close()
+func (n *joinNode) joinOrdering() orderingInfo {
+	if len(n.mergeJoinOrdering) == 0 {
+		return orderingInfo{}
+	}
+	info := orderingInfo{}
+
+	// For now we only propagate orderings on INNER JOINs.
+	// TODO(arjun): Support order propagation for other JOIN types.
+	if n.joinType == joinTypeInner {
+		// TODO(arjun): copy over the constant columns as well from the left and right subplans.
+
+		for _, col := range n.mergeJoinOrdering {
+			group := orderingColumnGroup{}
+			// n.Columns has the following schema on equality JOINs:
+			// First, the merged columns.
+			// Second, the non-merged columns from the left input.
+			// Third, the non-merged columns from the right input.
+
+			// If col is an index into the equality columns, then its simple:
+			// we just add it.
+			if col.ColIdx < n.pred.numMergedEqualityColumns {
+				group.cols.Add(uint32(col.ColIdx))
+			}
+
+			// Otherwise, this is an index into non-equality columns, so we
+			// then add all the columns from the left and right inputs that
+			// have an ordering.
+			group.cols.Add(n.equalityColIdxInSchema(col.ColIdx, false /* !right */))
+			group.cols.Add(n.equalityColIdxInSchema(col.ColIdx, true /* right */))
+
+			group.dir = col.Direction
+			info.ordering = append(info.ordering, group)
+		}
+	}
+	return info
 }

@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Tobias Schottdorf (tobias.schottdorf@gmail.com)
 
 package storage
 
@@ -20,14 +18,13 @@ import (
 	"math/rand"
 	"testing"
 
-	"github.com/coreos/etcd/raft"
 	"github.com/pkg/errors"
 	"golang.org/x/net/context"
 
 	"github.com/cockroachdb/cockroach/pkg/config"
 	"github.com/cockroachdb/cockroach/pkg/internal/client"
-	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/randutil"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
@@ -40,7 +37,7 @@ const valSize = 1 << 10 // 1 KiB
 func fillTestRange(rep *Replica, size int64) error {
 	src := rand.New(rand.NewSource(0))
 	for i := int64(0); i < size/int64(keySize+valSize); i++ {
-		key := keys.MakeRowSentinelKey(randutil.RandBytes(src, keySize))
+		key := randutil.RandBytes(src, keySize)
 		val := randutil.RandBytes(src, valSize)
 		pArgs := putArgs(key, val)
 		if _, pErr := client.SendWrappedWith(context.Background(), rep, roachpb.Header{
@@ -69,7 +66,7 @@ func TestSkipLargeReplicaSnapshot(t *testing.T) {
 	defer config.TestingSetDefaultZoneConfig(cfg)()
 
 	stopper := stop.NewStopper()
-	defer stopper.Stop()
+	defer stopper.Stop(context.TODO())
 	store := createTestStoreWithConfig(t, stopper, &storeCfg)
 
 	rep, err := store.GetReplica(rangeID)
@@ -86,26 +83,25 @@ func TestSkipLargeReplicaSnapshot(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if _, err := rep.GetSnapshot(context.Background(), "test"); err != nil {
+	if snap, err := rep.GetSnapshot(context.Background(), "test"); err != nil {
 		t.Fatal(err)
+	} else {
+		snap.Close()
 	}
-	rep.CloseOutSnap()
 
 	if err := fillTestRange(rep, snapSize*2); err != nil {
 		t.Fatal(err)
 	}
 
-	rep.mu.Lock()
-	_, err = rep.Snapshot()
-	rep.mu.Unlock()
-	if err != raft.ErrSnapshotTemporarilyUnavailable {
+	const expected = "not generating test snapshot because replica is too large"
+	if _, err := rep.GetSnapshot(context.Background(), "test"); !testutils.IsError(err, expected) {
 		rep.mu.Lock()
 		after := rep.mu.state.Stats.Total()
 		rep.mu.Unlock()
 		t.Fatalf(
 			"snapshot of a very large range (%d / %d, needsSplit: %v, exceeds snap limit: %v) should fail but got %v",
 			after, rep.GetMaxBytes(),
-			rep.needsSplitBySize(), rep.exceedsDoubleSplitSizeLocked(), err,
+			rep.needsSplitBySize(), rep.exceedsDoubleSplitSizeRLocked(), err,
 		)
 	}
 }

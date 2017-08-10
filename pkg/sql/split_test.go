@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Marc Berhault (marc@cockroachlabs.com)
 
 package sql_test
 
@@ -39,7 +37,7 @@ func getRangeKeys(db *client.DB) ([]roachpb.Key, error) {
 	if err != nil {
 		return nil, err
 	}
-	ret := make([]roachpb.Key, len(rows), len(rows))
+	ret := make([]roachpb.Key, len(rows))
 	for i := 0; i < len(rows); i++ {
 		ret[i] = bytes.TrimPrefix(rows[i].Key, keys.Meta2Prefix)
 	}
@@ -76,9 +74,12 @@ func TestSplitOnTableBoundaries(t *testing.T) {
 	params.ScanInterval = time.Millisecond
 	params.ScanMaxIdleTime = time.Millisecond
 	s, sqlDB, kvDB := serverutils.StartServer(t, params)
-	defer s.Stopper().Stop()
+	defer s.Stopper().Stop(context.TODO())
 
-	expectedInitialRanges := server.ExpectedInitialRangeCount()
+	expectedInitialRanges, err := server.ExpectedInitialRangeCount(kvDB)
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	if _, err := sqlDB.Exec(`CREATE DATABASE test`); err != nil {
 		t.Fatal(err)

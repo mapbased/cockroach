@@ -11,257 +11,150 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Peter Mattis (peter@cockroachlabs.com)
 
 package sql
 
 import (
-	"fmt"
 	"time"
-
-	"golang.org/x/net/context"
 
 	"github.com/cockroachdb/cockroach/pkg/config"
 	"github.com/cockroachdb/cockroach/pkg/internal/client"
-	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/sql/mon"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
-	"github.com/cockroachdb/cockroach/pkg/util"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/util/envutil"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"golang.org/x/net/context"
 )
 
 // planner is the centerpiece of SQL statement execution combining session
-// state and database state with the logic for SQL execution.
-// A planner is generally part of a Session object. If one needs to be created
-// outside of a Session, use makePlanner().
+// state and database state with the logic for SQL execution. It is logically
+// scoped to the execution of a single statement, and should not be used to
+// execute multiple statements. It is not safe to use the same planner from
+// multiple goroutines concurrently.
+//
+// planners are usually created by using the newPlanner method on a Session.
+// If one needs to be created outside of a Session, use makeInternalPlanner().
 type planner struct {
 	txn *client.Txn
+
 	// As the planner executes statements, it may change the current user session.
-	// TODO(andrei): see if the circular dependency between planner and Session
-	// can be broken if we move the User and Database here from the Session.
-	session  *Session
-	semaCtx  parser.SemaContext
-	evalCtx  parser.EvalContext
-	leases   []*LeaseState
-	leaseMgr *LeaseManager
-	// This is used as a cache for database names.
-	// TODO(andrei): get rid of it and replace it with a leasing system for
-	// database descriptors.
-	systemConfig  config.SystemConfig
-	databaseCache *databaseCache
+	session *Session
 
-	testingVerifyMetadataFn func(config.SystemConfig) error
-	verifyFnCheckedOnce     bool
+	// Reference to the corresponding sql Statement for this query.
+	stmt *Statement
 
-	parser parser.Parser
+	// Contexts for different stages of planning and execution.
+	semaCtx parser.SemaContext
+	evalCtx parser.EvalContext
 
-	// If set, table descriptors will only be fetched at the time of the
-	// transaction, not leased. This is used for things like AS OF SYSTEM TIME
-	// queries and building query plans for views when they're created.
-	// It's used in layers below the executor to modify the behavior of SELECT.
+	// avoidCachedDescriptors, when true, instructs all code that
+	// accesses table/view descriptors to force reading the descriptors
+	// within the transaction. This is necessary to:
+	// - ensure that queries ran with AS OF SYSTEM TIME get the right
+	//   version of descriptors.
+	// - queries that create/update descriptors read all their dependencies
+	//   in the same txn that they write new descriptors or update their
+	//   dependencies, so that update/creation appears transactional
+	//   to the rest of the cluster.
+	// Code that sets this to true should probably also check that
+	// the txn isolation level is SERIALIZABLE, and reject any update
+	// if it is SNAPSHOT.
 	avoidCachedDescriptors bool
 
 	// If set, the planner should skip checking for the SELECT privilege when
 	// initializing plans to read from a table. This should be used with care.
 	skipSelectPrivilegeChecks bool
 
-	// If set, contains the in progress COPY FROM columns.
-	copyFrom *copyNode
+	// autoCommit indicates whether we're planning for a spontaneous transaction.
+	// If autoCommit is true, the plan is allowed (but not required) to
+	// commit the transaction along with other KV operations.
+	// Note: The autoCommit parameter enables operations to enable the
+	// 1PC optimization. This is a bit hackish/preliminary at present.
+	autoCommit bool
 
-	// Avoid allocations by embedding commonly used visitors.
-	subqueryVisitor             subqueryVisitor
-	subqueryPlanVisitor         subqueryPlanVisitor
-	collectSubqueryPlansVisitor collectSubqueryPlansVisitor
-	nameResolutionVisitor       nameResolutionVisitor
+	// phaseTimes helps measure the time spent in each phase of SQL execution.
+	// See executor_statement_metrics.go for details.
+	phaseTimes phaseTimes
 
-	execCfg *ExecutorConfig
+	// cancelChecker is used by planNodes to check for cancellation of the associated
+	// query.
+	cancelChecker CancelChecker
 
-	noCopy util.NoCopy
+	// planDeps, if non-nil, collects the table/view dependencies for this query.
+	// Any planNode constructors that resolves a table name or reference in the query
+	// to a descriptor must register this descriptor into planDeps.
+	// This is (currently) used by CREATE VIEW.
+	// TODO(knz): Remove this in favor of a better encapsulated mechanism.
+	planDeps planDependencies
+
+	// Avoid allocations by embedding commonly used objects and visitors.
+	parser                parser.Parser
+	subqueryVisitor       subqueryVisitor
+	subqueryPlanVisitor   subqueryPlanVisitor
+	nameResolutionVisitor nameResolutionVisitor
+	srfExtractionVisitor  srfExtractionVisitor
+
+	// Use a common datum allocator across all the plan nodes. This separates the
+	// plan lifetime from the lifetime of returned results allowing plan nodes to
+	// be pool allocated.
+	alloc sqlbase.DatumAlloc
 }
 
-// makePlanner creates a new planner instances, referencing a dummy Session.
-// Only use this internally where a Session cannot be created.
-func makePlanner(opName string) *planner {
-	// init with an empty session. We can't leave this nil because too much code
-	// looks in the session for the current database.
-	ctx := log.WithLogTagStr(context.Background(), opName, "")
-	p := &planner{
-		session: &Session{
-			Location: time.UTC,
-			context:  ctx,
-		},
-	}
-	p.session.TxnState.Ctx = ctx
-	return p
-}
+var emptyPlanner planner
 
-// queryRunner abstracts the services provided by a planner object
-// to the other SQL front-end components.
-type queryRunner interface {
-	// The following methods control the state of the planner during its
-	// lifecycle.
-
-	// setTxn  resets the current transaction in the planner and
-	// initializes the timestamps used by SQL built-in functions from
-	// the new txn object, if any.
-	setTxn(*client.Txn)
-
-	// resetTxn clears the planner's current transaction.
-	resetTxn()
-
-	// resetForBatch prepares the planner for executing a new batch of
-	// statements.
-	resetForBatch(e *Executor)
-
-	// The following methods run SQL queries.
-
-	// parser.EvalPlanner gives us the QueryRow method.
-	parser.EvalPlanner
-
-	// queryRows executes a SQL query string where multiple result rows are returned.
-	queryRows(sql string, args ...interface{}) ([]parser.DTuple, error)
-
-	// queryRowsAsRoot executes a SQL query string using security.RootUser
-	// and multiple result rows are returned.
-	queryRowsAsRoot(sql string, args ...interface{}) ([]parser.DTuple, error)
-
-	// exec executes a SQL query string and returns the number of rows
-	// affected.
-	exec(sql string, args ...interface{}) (int, error)
-
-	// The following methods can be used during testing.
-
-	// setTestingVerifyMetadata sets a callback to be called after the planner
-	// is done executing the current SQL statement. It can be used to verify
-	// assumptions about how metadata will be asynchronously updated.
-	// Note that this can overwrite a previous callback that was waiting to be
-	// verified, which is not ideal.
-	setTestingVerifyMetadata(fn func(config.SystemConfig) error)
-
-	// blockConfigUpdatesMaybe will ask the Executor to block config updates,
-	// so that checkTestingVerifyMetadataInitialOrDie() can later be run.
-	// The point is to lock the system config so that no gossip updates sneak in
-	// under us, so that we're able to assert that the verify callback only succeeds
-	// after a gossip update.
-	//
-	// It returns an unblock function which can be called after
-	// checkTestingVerifyMetadata{Initial}OrDie() has been called.
-	//
-	// This lock does not change semantics. Even outside of tests, the planner uses
-	// static systemConfig for a user request, so locking the Executor's
-	// systemConfig cannot change the semantics of the SQL operation being performed
-	// under lock.
-	blockConfigUpdatesMaybe(e *Executor) func()
-
-	// checkTestingVerifyMetadataInitialOrDie verifies that the metadata callback,
-	// if one was set, fails. This validates that we need a gossip update for it to
-	// eventually succeed.
-	// No-op if we've already done an initial check for the set callback.
-	// Gossip updates for the system config are assumed to be blocked when this is
-	// called.
-	checkTestingVerifyMetadataInitialOrDie(e *Executor, stmts parser.StatementList)
-
-	// checkTestingVerifyMetadataOrDie verifies the metadata callback, if one was
-	// set.
-	// Gossip updates for the system config are assumed to be blocked when this is
-	// called.
-	checkTestingVerifyMetadataOrDie(e *Executor, stmts parser.StatementList)
-}
-
-var _ queryRunner = &planner{}
-
-// ctx returns the current session context (suitable for logging/tracing).
-func (p *planner) ctx() context.Context {
-	return p.session.Ctx()
-}
-
-// setTxn implements the queryRunner interface.
-func (p *planner) setTxn(txn *client.Txn) {
-	p.txn = txn
-	if txn != nil {
-		p.evalCtx.SetClusterTimestamp(txn.Proto.OrigTimestamp)
-	} else {
-		p.evalCtx.SetTxnTimestamp(time.Time{})
-		p.evalCtx.SetStmtTimestamp(time.Time{})
-		p.evalCtx.SetClusterTimestamp(hlc.ZeroTimestamp)
-	}
-}
-
-// resetTxn implements the queryRunner interface.
-func (p *planner) resetTxn() {
-	p.setTxn(nil)
-}
-
-// resetContexts (re-)initializes the structures
-// needed for expression handling.
-func (p *planner) resetContexts() {
-	// Need to reset the parser because it cannot be reused between
-	// batches.
-	p.parser = parser.Parser{}
-
-	p.semaCtx = parser.MakeSemaContext()
-	p.semaCtx.Location = &p.session.Location
-	p.semaCtx.SearchPath = p.session.SearchPath
-
-	p.evalCtx = parser.EvalContext{
-		Location:   &p.session.Location,
-		Database:   p.session.Database,
-		SearchPath: p.session.SearchPath,
-		Planner:    p,
-	}
-}
-
-// runShowTransactionState returns the state of current transaction.
-func (p *planner) runShowTransactionState(txnState *txnState, implicitTxn bool) (Result, error) {
-	var result Result
-	result.PGTag = (*parser.Show)(nil).StatementTag()
-	result.Type = (*parser.Show)(nil).StatementType()
-	result.Columns = ResultColumns{{Name: "TRANSACTION STATUS", Typ: parser.TypeString}}
-	result.Rows = NewRowContainer(p.session.makeBoundAccount(), result.Columns, 0)
-	state := txnState.State
-	if implicitTxn {
-		state = NoTxn
-	}
-	if _, err := result.Rows.AddRow(parser.DTuple{parser.NewDString(state.String())}); err != nil {
-		result.Rows.Close()
-		result.Err = err
-		return result, err
-	}
-	return result, nil
-}
-
-// noteworthyInternalMemoryUsageBytes is the minimum size tracked by
-// each internal SQL pool before the pool start explicitly logging
-// overall usage growth in the log.
+// noteworthyInternalMemoryUsageBytes is the minimum size tracked by each
+// internal SQL pool before the pool starts explicitly logging overall usage
+// growth in the log.
 var noteworthyInternalMemoryUsageBytes = envutil.EnvOrDefaultInt64("COCKROACH_NOTEWORTHY_INTERNAL_MEMORY_USAGE", 100*1024)
 
+// makePlanner creates a new planner instance, referencing a dummy session.
 func makeInternalPlanner(
 	opName string, txn *client.Txn, user string, memMetrics *MemoryMetrics,
 ) *planner {
-	p := makePlanner(opName)
-	p.setTxn(txn)
-	p.resetContexts()
-	p.session.User = user
+	// init with an empty session. We can't leave this nil because too much code
+	// looks in the session for the current database.
+	ctx := log.WithLogTagStr(context.Background(), opName, "")
 
-	p.session.mon = mon.MakeUnlimitedMonitor(p.session.context,
+	s := &Session{
+		Location: time.UTC,
+		User:     user,
+		TxnState: txnState{Ctx: ctx},
+		context:  ctx,
+		tables:   TableCollection{databaseCache: newDatabaseCache(config.SystemConfig{})},
+	}
+
+	s.mon = mon.MakeUnlimitedMonitor(ctx,
 		"internal-root",
+		mon.MemoryResource,
 		memMetrics.CurBytesCount, memMetrics.MaxBytesHist,
 		noteworthyInternalMemoryUsageBytes)
 
-	p.session.sessionMon = mon.MakeMonitor("internal-session",
+	s.sessionMon = mon.MakeMonitor("internal-session",
+		mon.MemoryResource,
 		memMetrics.SessionCurBytesCount,
 		memMetrics.SessionMaxBytesHist,
 		-1, noteworthyInternalMemoryUsageBytes/5)
-	p.session.sessionMon.Start(p.session.context, &p.session.mon, mon.BoundAccount{})
+	s.sessionMon.Start(ctx, &s.mon, mon.BoundAccount{})
 
-	p.session.TxnState.mon = mon.MakeMonitor("internal-txn",
+	s.TxnState.mon = mon.MakeMonitor("internal-txn",
+		mon.MemoryResource,
 		memMetrics.TxnCurBytesCount,
 		memMetrics.TxnMaxBytesHist,
 		-1, noteworthyInternalMemoryUsageBytes/5)
-	p.session.TxnState.mon.Start(p.session.context, &p.session.mon, mon.BoundAccount{})
+	s.TxnState.mon.Start(ctx, &s.mon, mon.BoundAccount{})
+
+	p := s.newPlanner(nil, txn)
+
+	if txn != nil {
+		if txn.Proto().OrigTimestamp == (hlc.Timestamp{}) {
+			panic("makeInternalPlanner called with a transaction without timestamps")
+		}
+		ts := txn.Proto().OrigTimestamp.GoTime()
+		p.evalCtx.SetTxnTimestamp(ts)
+		p.evalCtx.SetStmtTimestamp(ts)
+	}
 
 	return p
 }
@@ -272,33 +165,69 @@ func finishInternalPlanner(p *planner) {
 	p.session.mon.Stop(p.session.context)
 }
 
-// resetForBatch implements the queryRunner interface.
-func (p *planner) resetForBatch(e *Executor) {
-	// Update the systemConfig to a more recent copy, so that we can use tables
-	// that we created in previus batches of the same transaction.
-	cfg, cache := e.getSystemConfig()
-	p.systemConfig = cfg
-	p.databaseCache = cache
-	p.session.TxnState.schemaChangers.curGroupNum++
-	p.resetContexts()
-	p.evalCtx.NodeID = e.cfg.NodeID.Get()
-	p.evalCtx.ReCache = e.reCache
+// ExecCfg implements the PlanHookState interface.
+func (p *planner) ExecCfg() *ExecutorConfig {
+	return p.session.execCfg
+}
+
+func (p *planner) LeaseMgr() *LeaseManager {
+	return p.session.tables.leaseMgr
+}
+
+func (p *planner) User() string {
+	return p.session.User
+}
+
+func (p *planner) EvalContext() parser.EvalContext {
+	return p.evalCtx
+}
+
+// TODO(dan): This is here to implement PlanHookState, but it's not clear that
+// this is the right abstraction. We could also export distSQLPlanner, for
+// example. Revisit.
+func (p *planner) DistLoader() *DistLoader {
+	return &DistLoader{distSQLPlanner: p.session.distSQLPlanner}
+}
+
+// setTxn resets the current transaction in the planner and
+// initializes the timestamps used by SQL built-in functions from
+// the new txn object, if any.
+func (p *planner) setTxn(txn *client.Txn) {
+	p.txn = txn
+	if txn != nil {
+		p.evalCtx.SetClusterTimestamp(txn.OrigTimestamp())
+	} else {
+		p.evalCtx.SetTxnTimestamp(time.Time{})
+		p.evalCtx.SetStmtTimestamp(time.Time{})
+		p.evalCtx.SetClusterTimestamp(hlc.Timestamp{})
+	}
 }
 
 // query initializes a planNode from a SQL statement string. Close() must be
 // called on the returned planNode after use.
-func (p *planner) query(sql string, args ...interface{}) (planNode, error) {
-	stmt, err := parser.ParseOneTraditional(sql)
+// This function is not suitable for use in the planNode constructors directly:
+// the returned planNode has already been optimized.
+// Consider also (*planner).delegateQuery(...).
+func (p *planner) query(ctx context.Context, sql string, args ...interface{}) (planNode, error) {
+	if log.V(2) {
+		log.Infof(ctx, "internal query: %s", sql)
+		if len(args) > 0 {
+			log.Infof(ctx, "placeholders: %q", args)
+		}
+	}
+	stmt, err := parser.ParseOne(sql)
 	if err != nil {
 		return nil, err
 	}
-	golangFillQueryArguments(p.semaCtx.Placeholders, args)
-	return p.makePlan(stmt, false)
+	golangFillQueryArguments(&p.semaCtx.Placeholders, args)
+	return p.makePlan(ctx, Statement{AST: stmt})
 }
 
 // QueryRow implements the parser.EvalPlanner interface.
-func (p *planner) QueryRow(sql string, args ...interface{}) (parser.DTuple, error) {
-	rows, err := p.queryRows(sql, args...)
+func (p *planner) QueryRow(
+	ctx context.Context, sql string, args ...interface{},
+) (parser.Datums, error) {
+	rows, err := p.queryRows(ctx, sql, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -312,28 +241,34 @@ func (p *planner) QueryRow(sql string, args ...interface{}) (parser.DTuple, erro
 	}
 }
 
-// queryRows implements the queryRunner interface.
-func (p *planner) queryRows(sql string, args ...interface{}) ([]parser.DTuple, error) {
-	plan, err := p.query(sql, args...)
+// queryRows executes a SQL query string where multiple result rows are returned.
+func (p *planner) queryRows(
+	ctx context.Context, sql string, args ...interface{},
+) ([]parser.Datums, error) {
+	plan, err := p.query(ctx, sql, args...)
 	if err != nil {
 		return nil, err
 	}
-	defer plan.Close()
-	if err := plan.Start(); err != nil {
+	defer plan.Close(ctx)
+	if err := p.startPlan(ctx, plan); err != nil {
 		return nil, err
 	}
-	if next, err := plan.Next(); err != nil || !next {
+	params := runParams{
+		ctx: ctx,
+		p:   p,
+	}
+	if next, err := plan.Next(params); err != nil || !next {
 		return nil, err
 	}
 
-	var rows []parser.DTuple
+	var rows []parser.Datums
 	for {
 		if values := plan.Values(); values != nil {
-			valCopy := append(parser.DTuple(nil), values...)
+			valCopy := append(parser.Datums(nil), values...)
 			rows = append(rows, valCopy)
 		}
 
-		next, err := plan.Next()
+		next, err := plan.Next(params)
 		if err != nil {
 			return nil, err
 		}
@@ -344,100 +279,134 @@ func (p *planner) queryRows(sql string, args ...interface{}) ([]parser.DTuple, e
 	return rows, nil
 }
 
-// queryRowsAsRoot implements the queryRunner interface.
-func (p *planner) queryRowsAsRoot(sql string, args ...interface{}) ([]parser.DTuple, error) {
-	currentUser := p.session.User
-	defer func() { p.session.User = currentUser }()
-	p.session.User = security.RootUser
-	return p.queryRows(sql, args...)
-}
-
-// exec implements the queryRunner interface.
-func (p *planner) exec(sql string, args ...interface{}) (int, error) {
-	plan, err := p.query(sql, args...)
+// exec executes a SQL query string and returns the number of rows
+// affected.
+func (p *planner) exec(ctx context.Context, sql string, args ...interface{}) (int, error) {
+	plan, err := p.query(ctx, sql, args...)
 	if err != nil {
 		return 0, err
 	}
-	defer plan.Close()
-	if err := plan.Start(); err != nil {
+	defer plan.Close(ctx)
+	if err := p.startPlan(ctx, plan); err != nil {
 		return 0, err
 	}
-	return countRowsAffected(plan)
+	params := runParams{
+		ctx: ctx,
+		p:   p,
+	}
+	return countRowsAffected(params, plan)
 }
 
-// setTestingVerifyMetadata implements the queryRunner interface.
-func (p *planner) setTestingVerifyMetadata(fn func(config.SystemConfig) error) {
-	p.testingVerifyMetadataFn = fn
-	p.verifyFnCheckedOnce = false
-}
-
-// blockConfigUpdatesMaybe implements the queryRunner interface.
-func (p *planner) blockConfigUpdatesMaybe(e *Executor) func() {
-	if !e.cfg.TestingKnobs.WaitForGossipUpdate {
-		return func() {}
-	}
-	return e.blockConfigUpdates()
-}
-
-// checkTestingVerifyMetadataInitialOrDie implements the queryRunner interface.
-func (p *planner) checkTestingVerifyMetadataInitialOrDie(e *Executor, stmts parser.StatementList) {
-	if !p.execCfg.TestingKnobs.WaitForGossipUpdate {
-		return
-	}
-	// If there's nothinging to verify, or we've already verified the initial
-	// condition, there's nothing to do.
-	if p.testingVerifyMetadataFn == nil || p.verifyFnCheckedOnce {
-		return
-	}
-	if p.testingVerifyMetadataFn(e.systemConfig) == nil {
-		panic(fmt.Sprintf(
-			"expected %q (or the statements before them) to require a "+
-				"gossip update, but they did not", stmts))
-	}
-	p.verifyFnCheckedOnce = true
-}
-
-// checkTestingVerifyMetadataOrDie implements the queryRunner interface.
-func (p *planner) checkTestingVerifyMetadataOrDie(e *Executor, stmts parser.StatementList) {
-	if !p.execCfg.TestingKnobs.WaitForGossipUpdate ||
-		p.testingVerifyMetadataFn == nil {
-		return
-	}
-	if !p.verifyFnCheckedOnce {
-		panic("initial state of the condition to verify was not checked")
-	}
-
-	for p.testingVerifyMetadataFn(e.systemConfig) != nil {
-		e.waitForConfigUpdate()
-	}
-	p.testingVerifyMetadataFn = nil
-}
-
-func (p *planner) fillFKTableMap(m tableLookupsByID) error {
+func (p *planner) fillFKTableMap(ctx context.Context, m sqlbase.TableLookupsByID) error {
 	for tableID := range m {
-		table, err := p.getTableLeaseByID(tableID)
+		table, err := p.session.tables.getTableVersionByID(ctx, p.txn, tableID)
 		if err == errTableAdding {
-			m[tableID] = tableLookup{isAdding: true}
+			m[tableID] = sqlbase.TableLookup{IsAdding: true}
 			continue
 		}
 		if err != nil {
 			return err
 		}
-		m[tableID] = tableLookup{table: table}
+		m[tableID] = sqlbase.TableLookup{Table: table}
 	}
 	return nil
 }
 
-// isDatabaseVisible returns true if the given database is visible to the
-// current user. Only the current database and system databases are available
-// to ordinary users; everything is available to root.
-func (p *planner) isDatabaseVisible(dbName string) bool {
-	if p.session.User == security.RootUser {
+// isDatabaseVisible returns true if the given database is visible
+// given the provided prefix.
+// An empty prefix makes all databases visible.
+// System databases are always visible.
+// Otherwise only the database with the same name as the prefix is available.
+func isDatabaseVisible(dbName, prefix, user string) bool {
+	if isSystemDatabaseName(dbName) {
 		return true
-	} else if dbName == p.evalCtx.Database {
+	} else if dbName == prefix {
 		return true
-	} else if isSystemDatabaseName(dbName) {
+	} else if prefix == "" {
 		return true
 	}
 	return false
+}
+
+// TypeAsString enforces (not hints) that the given expression typechecks as a
+// string and returns a function that can be called to get the string value
+// during (planNode).Start.
+func (p *planner) TypeAsString(e parser.Expr, op string) (func() (string, error), error) {
+	typedE, err := parser.TypeCheckAndRequire(e, &p.semaCtx, parser.TypeString, op)
+	if err != nil {
+		return nil, err
+	}
+	fn := func() (string, error) {
+		d, err := typedE.Eval(&p.evalCtx)
+		if err != nil {
+			return "", err
+		}
+		return parser.AsStringWithFlags(d, parser.FmtBareStrings), nil
+	}
+	return fn, nil
+}
+
+// TypeAsString enforces (not hints) that the given expression typechecks as a
+// string and returns a function that can be called to get the string value
+// during (planNode).Start.
+func (p *planner) TypeAsStringOpts(
+	opts parser.KVOptions,
+) (func() (map[string]string, error), error) {
+	typed := make(map[string]parser.TypedExpr, len(opts))
+	for _, opt := range opts {
+		k := string(opt.Key)
+		if opt.Value == nil {
+			typed[k] = nil
+			continue
+		}
+		r, err := parser.TypeCheckAndRequire(opt.Value, &p.semaCtx, parser.TypeString, k)
+		if err != nil {
+			return nil, err
+		}
+		typed[k] = r
+	}
+	fn := func() (map[string]string, error) {
+		res := make(map[string]string, len(typed))
+		for name, e := range typed {
+			if e == nil {
+				res[name] = ""
+				continue
+			}
+			d, err := e.Eval(&p.evalCtx)
+			if err != nil {
+				return nil, err
+			}
+			res[name] = parser.AsStringWithFlags(d, parser.FmtBareStrings)
+		}
+		return res, nil
+	}
+	return fn, nil
+}
+
+// TypeAsStringArray enforces (not hints) that the given expressions all typecheck as
+// strings and returns a function that can be called to get the string values
+// during (planNode).Start.
+func (p *planner) TypeAsStringArray(
+	exprs parser.Exprs, op string,
+) (func() ([]string, error), error) {
+	typedExprs := make([]parser.TypedExpr, len(exprs))
+	for i := range exprs {
+		typedE, err := parser.TypeCheckAndRequire(exprs[i], &p.semaCtx, parser.TypeString, op)
+		if err != nil {
+			return nil, err
+		}
+		typedExprs[i] = typedE
+	}
+	fn := func() ([]string, error) {
+		strs := make([]string, len(exprs))
+		for i := range exprs {
+			d, err := typedExprs[i].Eval(&p.evalCtx)
+			if err != nil {
+				return nil, err
+			}
+			strs[i] = parser.AsStringWithFlags(d, parser.FmtBareStrings)
+		}
+		return strs, nil
+	}
+	return fn, nil
 }

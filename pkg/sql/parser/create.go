@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Peter Mattis (peter@cockroachlabs.com)
 
 // This code was derived from https://github.com/youtube/vitess.
 //
@@ -26,6 +24,8 @@ import (
 	"bytes"
 	"fmt"
 
+	"golang.org/x/text/language"
+
 	"github.com/pkg/errors"
 )
 
@@ -33,10 +33,10 @@ import (
 type CreateDatabase struct {
 	IfNotExists bool
 	Name        Name
-	Template    *StrVal
-	Encoding    *StrVal
-	Collate     *StrVal
-	CType       *StrVal
+	Template    string
+	Encoding    string
+	Collate     string
+	CType       string
 }
 
 // Format implements the NodeFormatter interface.
@@ -46,21 +46,21 @@ func (node *CreateDatabase) Format(buf *bytes.Buffer, f FmtFlags) {
 		buf.WriteString("IF NOT EXISTS ")
 	}
 	FormatNode(buf, f, node.Name)
-	if node.Template != nil {
+	if node.Template != "" {
 		buf.WriteString(" TEMPLATE = ")
-		Name((*node.Template).s).Format(buf, f)
+		encodeSQLStringWithFlags(buf, node.Template, f)
 	}
-	if node.Encoding != nil {
+	if node.Encoding != "" {
 		buf.WriteString(" ENCODING = ")
-		node.Encoding.Format(buf, f)
+		encodeSQLStringWithFlags(buf, node.Encoding, f)
 	}
-	if node.Collate != nil {
+	if node.Collate != "" {
 		buf.WriteString(" LC_COLLATE = ")
-		node.Collate.Format(buf, f)
+		encodeSQLStringWithFlags(buf, node.Collate, f)
 	}
-	if node.CType != nil {
+	if node.CType != "" {
 		buf.WriteString(" LC_CTYPE = ")
-		node.CType.Format(buf, f)
+		encodeSQLStringWithFlags(buf, node.CType, f)
 	}
 }
 
@@ -117,9 +117,12 @@ func (node *CreateIndex) Format(buf *bytes.Buffer, f FmtFlags) {
 		buf.WriteString("IF NOT EXISTS ")
 	}
 	if node.Name != "" {
-		fmt.Fprintf(buf, "%s ", node.Name)
+		FormatNode(buf, f, node.Name)
+		buf.WriteByte(' ')
 	}
-	fmt.Fprintf(buf, "ON %s (", node.Table)
+	buf.WriteString("ON ")
+	FormatNode(buf, f, &node.Table)
+	buf.WriteString(" (")
 	FormatNode(buf, f, node.Columns)
 	buf.WriteByte(')')
 	if len(node.Storing) > 0 {
@@ -206,6 +209,25 @@ type ColumnTableDefCheckExpr struct {
 	ConstraintName Name
 }
 
+func processCollationOnType(name Name, typ ColumnType, c ColumnCollation) (ColumnType, error) {
+	locale := string(c)
+	switch s := typ.(type) {
+	case *StringColType:
+		return &CollatedStringColType{s.Name, s.N, locale}, nil
+	case *CollatedStringColType:
+		return nil, errors.Errorf("multiple COLLATE declarations for column %q", name)
+	case *ArrayColType:
+		var err error
+		s.ParamType, err = processCollationOnType(name, s.ParamType, c)
+		if err != nil {
+			return nil, err
+		}
+		return s, nil
+	default:
+		return nil, errors.Errorf("COLLATE declaration for non-string-typed column %q", name)
+	}
+}
+
 func newColumnTableDef(
 	name Name, typ ColumnType, qualifications []NamedColumnQualification,
 ) (*ColumnTableDef, error) {
@@ -216,6 +238,16 @@ func newColumnTableDef(
 	d.Nullable.Nullability = SilentNull
 	for _, c := range qualifications {
 		switch t := c.Qualification.(type) {
+		case ColumnCollation:
+			locale := string(t)
+			_, err := language.Parse(locale)
+			if err != nil {
+				return nil, errors.Wrapf(err, "invalid locale %s", locale)
+			}
+			d.Type, err = processCollationOnType(name, d.Type, t)
+			if err != nil {
+				return nil, err
+			}
 		case *ColumnDefault:
 			if d.HasDefaultExpr() {
 				return nil, errors.Errorf("multiple default values specified for column %q", name)
@@ -287,10 +319,12 @@ func (node *ColumnTableDef) HasColumnFamily() bool {
 
 // Format implements the NodeFormatter interface.
 func (node *ColumnTableDef) Format(buf *bytes.Buffer, f FmtFlags) {
-	fmt.Fprintf(buf, "%s ", node.Name)
+	FormatNode(buf, f, node.Name)
+	buf.WriteByte(' ')
 	FormatNode(buf, f, node.Type)
 	if node.Nullable.Nullability != SilentNull && node.Nullable.ConstraintName != "" {
-		fmt.Fprintf(buf, " CONSTRAINT %s", node.Nullable.ConstraintName)
+		buf.WriteString(" CONSTRAINT ")
+		FormatNode(buf, f, node.Nullable.ConstraintName)
 	}
 	switch node.Nullable.Nullability {
 	case Null:
@@ -305,14 +339,16 @@ func (node *ColumnTableDef) Format(buf *bytes.Buffer, f FmtFlags) {
 	}
 	if node.HasDefaultExpr() {
 		if node.DefaultExpr.ConstraintName != "" {
-			fmt.Fprintf(buf, " CONSTRAINT %s", node.DefaultExpr.ConstraintName)
+			buf.WriteString(" CONSTRAINT ")
+			FormatNode(buf, f, node.DefaultExpr.ConstraintName)
 		}
 		buf.WriteString(" DEFAULT ")
 		FormatNode(buf, f, node.DefaultExpr.Expr)
 	}
 	for _, checkExpr := range node.CheckExprs {
 		if checkExpr.ConstraintName != "" {
-			fmt.Fprintf(buf, " CONSTRAINT %s", checkExpr.ConstraintName)
+			buf.WriteString(" CONSTRAINT ")
+			FormatNode(buf, f, checkExpr.ConstraintName)
 		}
 		buf.WriteString(" CHECK (")
 		FormatNode(buf, f, checkExpr.Expr)
@@ -320,10 +356,11 @@ func (node *ColumnTableDef) Format(buf *bytes.Buffer, f FmtFlags) {
 	}
 	if node.HasFKConstraint() {
 		if node.References.ConstraintName != "" {
-			fmt.Fprintf(buf, " CONSTRAINT %s", node.References.ConstraintName)
+			buf.WriteString(" CONSTRAINT ")
+			FormatNode(buf, f, node.References.ConstraintName)
 		}
 		buf.WriteString(" REFERENCES ")
-		FormatNode(buf, f, node.References.Table)
+		FormatNode(buf, f, &node.References.Table)
 		if node.References.Col != "" {
 			buf.WriteString(" (")
 			FormatNode(buf, f, node.References.Col)
@@ -356,6 +393,7 @@ type ColumnQualification interface {
 	columnQualification()
 }
 
+func (ColumnCollation) columnQualification()         {}
 func (*ColumnDefault) columnQualification()          {}
 func (NotNullConstraint) columnQualification()       {}
 func (NullConstraint) columnQualification()          {}
@@ -364,6 +402,9 @@ func (UniqueConstraint) columnQualification()        {}
 func (*ColumnCheckConstraint) columnQualification()  {}
 func (*ColumnFKConstraint) columnQualification()     {}
 func (*ColumnFamilyConstraint) columnQualification() {}
+
+// ColumnCollation represents a COLLATE clause for a column.
+type ColumnCollation string
 
 // ColumnDefault represents a DEFAULT clause for a column.
 type ColumnDefault struct {
@@ -398,16 +439,6 @@ type ColumnFamilyConstraint struct {
 	Family      Name
 	Create      bool
 	IfNotExists bool
-}
-
-// NameListToIndexElems converts a NameList to an IndexElemList with all
-// members using the `DefaultDirection`.
-func NameListToIndexElems(lst NameList) IndexElemList {
-	elems := make(IndexElemList, 0, len(lst))
-	for _, n := range lst {
-		elems = append(elems, IndexElem{Column: n, Direction: DefaultDirection})
-	}
-	return elems
 }
 
 // IndexTableDef represents an index definition within a CREATE TABLE
@@ -464,7 +495,9 @@ type UniqueConstraintTableDef struct {
 // Format implements the NodeFormatter interface.
 func (node *UniqueConstraintTableDef) Format(buf *bytes.Buffer, f FmtFlags) {
 	if node.Name != "" {
-		fmt.Fprintf(buf, "CONSTRAINT %s ", node.Name)
+		buf.WriteString("CONSTRAINT ")
+		FormatNode(buf, f, node.Name)
+		buf.WriteByte(' ')
 	}
 	if node.PrimaryKey {
 		buf.WriteString("PRIMARY KEY ")
@@ -495,12 +528,14 @@ type ForeignKeyConstraintTableDef struct {
 // Format implements the NodeFormatter interface.
 func (node *ForeignKeyConstraintTableDef) Format(buf *bytes.Buffer, f FmtFlags) {
 	if node.Name != "" {
-		fmt.Fprintf(buf, "CONSTRAINT %s ", node.Name)
+		buf.WriteString("CONSTRAINT ")
+		FormatNode(buf, f, node.Name)
+		buf.WriteByte(' ')
 	}
 	buf.WriteString("FOREIGN KEY (")
 	FormatNode(buf, f, node.FromCols)
 	buf.WriteString(") REFERENCES ")
-	FormatNode(buf, f, node.Table)
+	FormatNode(buf, f, &node.Table)
 
 	if len(node.ToCols) > 0 {
 		buf.WriteByte(' ')
@@ -534,9 +569,11 @@ func (node *CheckConstraintTableDef) setName(name Name) {
 // Format implements the NodeFormatter interface.
 func (node *CheckConstraintTableDef) Format(buf *bytes.Buffer, f FmtFlags) {
 	if node.Name != "" {
-		fmt.Fprintf(buf, "CONSTRAINT %s ", node.Name)
+		buf.WriteString("CONSTRAINT ")
+		FormatNode(buf, f, node.Name)
+		buf.WriteByte(' ')
 	}
-	fmt.Fprintf(buf, "CHECK (")
+	buf.WriteString("CHECK (")
 	FormatNode(buf, f, node.Expr)
 	buf.WriteByte(')')
 }
@@ -567,7 +604,7 @@ func (node *FamilyTableDef) Format(buf *bytes.Buffer, f FmtFlags) {
 // InterleaveDef represents an interleave definition within a CREATE TABLE
 // or CREATE INDEX statement.
 type InterleaveDef struct {
-	Parent       NormalizableTableName
+	Parent       *NormalizableTableName
 	Fields       NameList
 	DropBehavior DropBehavior
 }
@@ -612,7 +649,7 @@ func (node *CreateTable) Format(buf *bytes.Buffer, f FmtFlags) {
 	if node.IfNotExists {
 		buf.WriteString("IF NOT EXISTS ")
 	}
-	FormatNode(buf, f, node.Table)
+	FormatNode(buf, f, &node.Table)
 	if node.As() {
 		if len(node.AsColumnNames) > 0 {
 			buf.WriteString(" (")
@@ -634,15 +671,25 @@ func (node *CreateTable) Format(buf *bytes.Buffer, f FmtFlags) {
 // CreateUser represents a CREATE USER statement.
 type CreateUser struct {
 	Name     Name
-	Password *StrVal
+	Password *string // pointer so that empty and nil can be differentiated
+}
+
+// HasPassword returns if the CreateUser has a password.
+func (node *CreateUser) HasPassword() bool {
+	return node.Password != nil
 }
 
 // Format implements the NodeFormatter interface.
 func (node *CreateUser) Format(buf *bytes.Buffer, f FmtFlags) {
 	buf.WriteString("CREATE USER ")
 	FormatNode(buf, f, node.Name)
-	if node.Password != nil {
-		buf.WriteString(" WITH PASSWORD *****")
+	if node.HasPassword() {
+		buf.WriteString(" WITH PASSWORD ")
+		if f.showPasswords {
+			encodeSQLString(buf, *node.Password)
+		} else {
+			buf.WriteString("*****")
+		}
 	}
 }
 
@@ -656,7 +703,7 @@ type CreateView struct {
 // Format implements the NodeFormatter interface.
 func (node *CreateView) Format(buf *bytes.Buffer, f FmtFlags) {
 	buf.WriteString("CREATE VIEW ")
-	FormatNode(buf, f, node.Name)
+	FormatNode(buf, f, &node.Name)
 
 	if len(node.ColumnNames) > 0 {
 		buf.WriteByte(' ')

@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Peter Mattis (peter@cockroachlabs.com)
 
 package engine
 
@@ -26,6 +24,8 @@ type InMem struct {
 // NewInMem allocates and returns a new, opened InMem engine.
 // The caller must call the engine's Close method when the engine is no longer
 // needed.
+//
+// FIXME(tschottdorf): make the signature similar to NewRocksDB (require a cfg).
 func NewInMem(attrs roachpb.Attributes, cacheSize int64) InMem {
 	cache := NewRocksDBCache(cacheSize)
 	// The cache starts out with a refcount of one, and creating the engine

@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Matt Jibson (mjibson@cockroachlabs.com)
 
 package acceptance
 
@@ -20,10 +18,15 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/cockroachdb/cockroach/pkg/util/log"
+
 	"golang.org/x/net/context"
 )
 
 func TestDockerJava(t *testing.T) {
+	s := log.Scope(t)
+	defer s.Close(t)
+
 	ctx := context.Background()
 	testDockerSuccess(ctx, t, "java", []string{"/bin/sh", "-c", strings.Replace(java, "%v", "Int(2, 3)", 1)})
 	testDockerFail(ctx, t, "java", []string{"/bin/sh", "-c", strings.Replace(java, "%v", `String(2, "a")`, 1)})
@@ -33,6 +36,8 @@ const java = `
 set -e
 cat > main.java << 'EOF'
 import java.sql.*;
+import java.util.UUID;
+import java.math.BigDecimal;
 
 public class main {
 	public static void main(String[] args) throws Exception {
@@ -76,6 +81,15 @@ public class main {
 		if (!tsStr.equals("2015-05-07 18:20:00.0")) {
 			throw new Exception("unexpected value for ts: "+tsStr);
 		}
+
+		stmt = conn.prepareStatement("INSERT INTO test.f VALUES (?, ?)");
+		stmt.setInt(1, 1);
+		stmt.setTimestamp(2, new Timestamp(System.currentTimeMillis()));
+		res = stmt.executeUpdate();
+		if (res != 1) {
+		    throw new Exception("unexpected: INSERT reports " + res + " rows changed, expecting 1");
+		}
+
 		stmt = conn.prepareStatement("DROP TABLE test.f");
 		res = stmt.executeUpdate();
 		if (res != 0) {
@@ -118,6 +132,54 @@ public class main {
 		stmt.setObject(3, new java.sql.Date(System.currentTimeMillis()));
 
 		stmt.executeUpdate();
+
+		stmt = conn.prepareStatement("CREATE TABLE empty()");
+		res = stmt.executeUpdate();
+		if (res != 0) {
+		    throw new Exception("unexpected: CREATE TABLE reports " + res + " rows changed, expecting 0");
+		}
+
+		stmt = conn.prepareStatement("SELECT * from empty");
+		rs = stmt.executeQuery();
+		int nCols = rs.getMetaData().getColumnCount();
+		if (nCols != 0) {
+		    throw new Exception("unexpected: SELECT returns " + nCols + " columns, expected 0");
+		}
+
+		stmt = conn.prepareStatement("SELECT 1.0::DECIMAL");
+		rs = stmt.executeQuery();
+		rs.next();
+		// The JDBC Postgres driver's getObject has different behavior than both
+		// its getString and getBigDecimal with respect to how it handles the type modifier:
+		// https://github.com/pgjdbc/pgjdbc/blob/REL42.1.1/pgjdbc/src/main/java/org/postgresql/jdbc/PgResultSet.java#L188
+		Object dec = rs.getObject(1);
+		if (!dec.toString().equals("1.0")) {
+			throw new Exception("unexpected: expected 1.0 to be \"1.0\", got \"" + dec.toString() + "\"");
+		}
+
+		stmt = conn.prepareStatement("SELECT 1e1::decimal");
+		rs = stmt.executeQuery();
+		rs.next();
+		BigDecimal bigdec = rs.getBigDecimal(1);
+		if (!bigdec.toString().equals("1E+1")) {
+			throw new Exception("unexpected: expected 1e1 to be \"1E+1\", got \"" + bigdec.toString() + "\"");
+		}
+
+		stmt = conn.prepareStatement("CREATE TABLE str (s STRING)");
+		stmt.executeUpdate();
+		stmt = conn.prepareStatement("UPDATE str SET s = ?");
+		stmt.setString(1, "hello");
+		stmt.execute();
+
+		UUID uuid = UUID.randomUUID();
+		stmt = conn.prepareStatement("SELECT ?");
+		stmt.setObject(1, uuid);
+		rs = stmt.executeQuery();
+		rs.next();
+		UUID returnedUuid = (UUID) rs.getObject(1);
+		if (!returnedUuid.equals(uuid)) {
+			throw new Exception("expected " + uuid + " but got " + returnedUuid);
+		}
 	}
 }
 EOF

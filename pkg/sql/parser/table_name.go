@@ -11,14 +11,14 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Raphael 'kena' Poss (knz@cockroachlabs.com)
 
 package parser
 
 import (
 	"bytes"
 	"fmt"
+
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 )
 
 // Table names are used in statements like CREATE TABLE,
@@ -37,16 +37,14 @@ type NormalizableTableName struct {
 }
 
 // Format implements the NodeFormatter interface.
-func (nt NormalizableTableName) Format(buf *bytes.Buffer, f FmtFlags) {
-	tnr := nt.TableNameReference
-	if f.tableNameNormalizer != nil {
-		if tn := f.tableNameNormalizer(&nt); tn != nil {
-			tnr = tn
-		}
+func (nt *NormalizableTableName) Format(buf *bytes.Buffer, f FmtFlags) {
+	if f.tableNameFormatter != nil {
+		f.tableNameFormatter(nt, buf, f)
+	} else {
+		FormatNode(buf, f, nt.TableNameReference)
 	}
-	tnr.Format(buf, f)
 }
-func (nt NormalizableTableName) String() string { return AsString(nt) }
+func (nt *NormalizableTableName) String() string { return AsString(nt) }
 
 // Normalize checks if the table name is already normalized and
 // normalizes it as necessary.
@@ -62,7 +60,7 @@ func (nt *NormalizableTableName) Normalize() (*TableName, error) {
 		nt.TableNameReference = tn
 		return tn, nil
 	default:
-		panic(fmt.Sprintf("unsupported function name: %+v (%T)",
+		panic(fmt.Sprintf("unsupported table name reference: %+v (%T)",
 			nt.TableNameReference, nt.TableNameReference))
 	}
 }
@@ -98,20 +96,29 @@ type TableNameReference interface {
 // TableName corresponds to the name of a table in a FROM clause,
 // INSERT or UPDATE statement (and possibly other places).
 type TableName struct {
+	PrefixName   Name
 	DatabaseName Name
 	TableName    Name
 
-	// dbNameOriginallyOmitted, when set to true, causes the
+	// DBNameOriginallyOmitted, when set to true, causes the
 	// String()/Format() methods to omit the database name even if one
 	// is set. This is used to ensure that pretty-printing
 	// a TableName normalized from a parser input yields back
 	// the original syntax.
-	dbNameOriginallyOmitted bool
+	DBNameOriginallyOmitted bool
+
+	// PrefixOriginallySpecified indicates whether a prefix was
+	// explicitly indicated in the input syntax.
+	PrefixOriginallySpecified bool
 }
 
 // Format implements the NodeFormatter interface.
 func (t *TableName) Format(buf *bytes.Buffer, f FmtFlags) {
-	if !t.dbNameOriginallyOmitted || f.tableNameNormalizer != nil {
+	if !t.DBNameOriginallyOmitted || f.tableNameFormatter != nil {
+		if t.PrefixOriginallySpecified {
+			FormatNode(buf, f, t.PrefixName)
+			buf.WriteByte('.')
+		}
 		FormatNode(buf, f, t.DatabaseName)
 		buf.WriteByte('.')
 	}
@@ -121,15 +128,6 @@ func (t *TableName) String() string { return AsString(t) }
 
 // NormalizeTableName implements the TableNameReference interface.
 func (t *TableName) NormalizeTableName() (*TableName, error) { return t, nil }
-
-// NormalizedTableName normalize DatabaseName and TableName to lowercase
-// and performs Unicode Normalization.
-func (t *TableName) NormalizedTableName() TableName {
-	return TableName{
-		DatabaseName: Name(t.DatabaseName.Normalize()),
-		TableName:    Name(t.TableName.Normalize()),
-	}
-}
 
 // Table retrieves the unqualified table name.
 func (t *TableName) Table() string {
@@ -141,37 +139,52 @@ func (t *TableName) Database() string {
 	return string(t.DatabaseName)
 }
 
+// NewInvalidNameErrorf initializes an error carrying the pg code CodeInvalidNameError.
+func NewInvalidNameErrorf(fmt string, args ...interface{}) error {
+	return pgerror.NewErrorf(pgerror.CodeInvalidNameError, fmt, args...)
+}
+
 // normalizeTableNameAsValue transforms an UnresolvedName to a TableName.
 // The resulting TableName may lack a db qualification. This is
 // valid if e.g. the name refers to a in-query table alias
 // (AS) or is qualified later using the QualifyWithDatabase method.
-func (n UnresolvedName) normalizeTableNameAsValue() (TableName, error) {
-	if len(n) == 0 || len(n) > 2 {
-		return TableName{}, fmt.Errorf("invalid table name: %q", n)
+func (n UnresolvedName) normalizeTableNameAsValue() (res TableName, err error) {
+	if len(n) == 0 || len(n) > 3 {
+		return res, NewInvalidNameErrorf("invalid table name: %q", ErrString(n))
 	}
 
 	name, ok := n[len(n)-1].(Name)
 	if !ok {
-		return TableName{}, fmt.Errorf("invalid table name: %q", n)
+		return res, NewInvalidNameErrorf("invalid table name: %q", ErrString(n))
 	}
 
 	if len(name) == 0 {
-		return TableName{}, fmt.Errorf("empty table name: %q", n)
+		return res, NewInvalidNameErrorf("empty table name: %q", ErrString(n))
 	}
 
-	res := TableName{TableName: name, dbNameOriginallyOmitted: true}
+	res = TableName{TableName: name, DBNameOriginallyOmitted: true}
 
 	if len(n) > 1 {
-		res.DatabaseName, ok = n[0].(Name)
+		res.DatabaseName, ok = n[len(n)-2].(Name)
 		if !ok {
-			return TableName{}, fmt.Errorf("invalid database name: %q", n[0])
+			return res, NewInvalidNameErrorf("invalid database name: %q", ErrString(n[len(n)-2]))
 		}
 
 		if len(res.DatabaseName) == 0 {
-			return TableName{}, fmt.Errorf("empty database name: %q", n)
+			return res, NewInvalidNameErrorf("empty database name: %q", ErrString(n))
 		}
 
-		res.dbNameOriginallyOmitted = false
+		res.DBNameOriginallyOmitted = false
+
+		if len(n) > 2 {
+			res.PrefixName, ok = n[len(n)-3].(Name)
+
+			if !ok {
+				return res, NewInvalidNameErrorf("invalid prefix: %q", ErrString(n[len(n)-3]))
+			}
+
+			res.PrefixOriginallySpecified = true
+		}
 	}
 
 	return res, nil
@@ -191,7 +204,7 @@ func (n UnresolvedName) NormalizeTableName() (*TableName, error) {
 // table       -> database.table
 // table@index -> database.table@index
 func (t *TableName) QualifyWithDatabase(database string) error {
-	if t.DatabaseName != "" {
+	if !t.DBNameOriginallyOmitted {
 		return nil
 	}
 	if database == "" {
@@ -233,14 +246,20 @@ func (t TableNameReferences) Format(buf *bytes.Buffer, f FmtFlags) {
 // TableNameWithIndex represents a "table@index", used in statements that
 // specifically refer to an index.
 type TableNameWithIndex struct {
-	Table       NormalizableTableName
-	Index       Name
+	Table NormalizableTableName
+	Index Name
+
+	// SearchTable indicates that we have just an index (no table name); we will
+	// need to search for a table that has an index with the given name.
+	//
+	// To allow schema-qualified index names in this case, the index is actually
+	// specified in Table as the table name, and Index is empty.
 	SearchTable bool
 }
 
 // Format implements the NodeFormatter interface.
 func (n *TableNameWithIndex) Format(buf *bytes.Buffer, f FmtFlags) {
-	FormatNode(buf, f, n.Table)
+	FormatNode(buf, f, &n.Table)
 	if !n.SearchTable {
 		buf.WriteByte('@')
 		FormatNode(buf, f, n.Index)

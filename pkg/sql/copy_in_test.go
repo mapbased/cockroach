@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Matt Jibson
 
 package sql_test
 
@@ -22,13 +20,15 @@ import (
 	"math/rand"
 	"reflect"
 	"strconv"
-	"strings"
 	"testing"
 	"time"
+
+	"golang.org/x/net/context"
 
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
+	"github.com/cockroachdb/cockroach/pkg/util/duration"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/lib/pq"
 )
@@ -38,7 +38,7 @@ func TestCopyNullInfNaN(t *testing.T) {
 
 	params, _ := createTestServerParams()
 	s, db, _ := serverutils.StartServer(t, params)
-	defer s.Stopper().Stop()
+	defer s.Stopper().Stop(context.TODO())
 
 	if _, err := db.Exec(`
 		CREATE DATABASE d;
@@ -99,6 +99,7 @@ func TestCopyNullInfNaN(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer rows.Close()
 
 	for row, in := range input {
 		if !rows.Next() {
@@ -128,7 +129,7 @@ func TestCopyRandom(t *testing.T) {
 
 	params, _ := createTestServerParams()
 	s, db, _ := serverutils.StartServer(t, params)
-	defer s.Stopper().Stop()
+	defer s.Stopper().Stop(context.TODO())
 
 	if _, err := db.Exec(`
 		CREATE DATABASE d;
@@ -159,7 +160,7 @@ func TestCopyRandom(t *testing.T) {
 	}
 
 	rng := rand.New(rand.NewSource(0))
-	types := []sqlbase.ColumnType_Kind{
+	types := []sqlbase.ColumnType_SemanticType{
 		sqlbase.ColumnType_BOOL,
 		sqlbase.ColumnType_INT,
 		sqlbase.ColumnType_FLOAT,
@@ -175,15 +176,18 @@ func TestCopyRandom(t *testing.T) {
 	for i := 0; i < 100; i++ {
 		row := make([]interface{}, len(types)+2)
 		row[0] = strconv.Itoa(i)
-		row[1] = time.Duration(rng.Int63()).String()
+
+		sign := 1 - rng.Int63n(2)*2
+		d := duration.Duration{
+			Months: sign * rng.Int63n(1000),
+			Days:   sign * rng.Int63n(1000),
+			Nanos:  sign * rng.Int63(),
+		}
+
+		row[1] = d.String()
 		for j, t := range types {
-			d := sqlbase.RandDatum(rng, t, false)
-			ds := d.String()
-			switch t {
-			case sqlbase.ColumnType_DECIMAL:
-				// Trailing 0s aren't represented below, so truncate here.
-				ds = strings.TrimRight(ds, "0")
-			}
+			d := sqlbase.RandDatum(rng, sqlbase.ColumnType{SemanticType: t}, false)
+			ds := parser.AsStringWithFlags(d, parser.FmtBareStrings)
 			row[j+2] = ds
 		}
 		_, err = stmt.Exec(row...)
@@ -206,6 +210,7 @@ func TestCopyRandom(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer rows.Close()
 
 	for row, in := range inputs {
 		if !rows.Next() {
@@ -226,7 +231,8 @@ func TestCopyRandom(t *testing.T) {
 			case []byte:
 				ds = string(d)
 			case time.Time:
-				ds = parser.MakeDTimestamp(d, time.Microsecond).String()
+				dt := parser.MakeDTimestamp(d, time.Microsecond)
+				ds = parser.AsStringWithFlags(dt, parser.FmtBareStrings)
 			}
 			if !reflect.DeepEqual(in[i], ds) {
 				t.Fatalf("row %v, col %v: got %#v (%T), expected %#v", row, i, ds, d, in[i])
@@ -240,7 +246,7 @@ func TestCopyError(t *testing.T) {
 
 	params, _ := createTestServerParams()
 	s, db, _ := serverutils.StartServer(t, params)
-	defer s.Stopper().Stop()
+	defer s.Stopper().Stop(context.TODO())
 
 	if _, err := db.Exec(`
 		CREATE DATABASE d;
@@ -291,11 +297,11 @@ func TestCopyError(t *testing.T) {
 func TestCopyOne(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
-	t.Skip("https://github.com/lib/pq/issues/494")
+	t.Skip("https://github.com/lib/pq/issues/558")
 
 	params, _ := createTestServerParams()
 	s, db, _ := serverutils.StartServer(t, params)
-	defer s.Stopper().Stop()
+	defer s.Stopper().Stop(context.TODO())
 
 	if _, err := db.Exec(`
 		CREATE DATABASE d;
@@ -325,11 +331,11 @@ func TestCopyOne(t *testing.T) {
 func TestCopyInProgress(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
-	t.Skip("https://github.com/lib/pq/issues/494")
+	t.Skip("https://github.com/lib/pq/issues/558")
 
 	params, _ := createTestServerParams()
 	s, db, _ := serverutils.StartServer(t, params)
-	defer s.Stopper().Stop()
+	defer s.Stopper().Stop(context.TODO())
 
 	if _, err := db.Exec(`
 		CREATE DATABASE d;
@@ -362,7 +368,7 @@ func TestCopyTransaction(t *testing.T) {
 
 	params, _ := createTestServerParams()
 	s, db, _ := serverutils.StartServer(t, params)
-	defer s.Stopper().Stop()
+	defer s.Stopper().Stop(context.TODO())
 
 	if _, err := db.Exec(`
 		CREATE DATABASE d;

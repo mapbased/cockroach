@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Spencer Kimball (spencer.kimball@gmail.com)
 
 package storage
 
@@ -21,6 +19,8 @@ import (
 	"reflect"
 	"testing"
 	"time"
+
+	"golang.org/x/net/context"
 
 	"github.com/cockroachdb/cockroach/pkg/gossip"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
@@ -31,11 +31,12 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
+	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 )
 
 func TestStoresAddStore(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	ls := NewStores(log.AmbientContext{}, hlc.NewClock(hlc.UnixNano, time.Nanosecond))
+	ls := NewStores(log.AmbientContext{Tracer: tracing.NewTracer()}, hlc.NewClock(hlc.UnixNano, time.Nanosecond))
 	store := Store{}
 	ls.AddStore(&store)
 	if !ls.HasStore(store.Ident.StoreID) {
@@ -48,7 +49,7 @@ func TestStoresAddStore(t *testing.T) {
 
 func TestStoresRemoveStore(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	ls := NewStores(log.AmbientContext{}, hlc.NewClock(hlc.UnixNano, time.Nanosecond))
+	ls := NewStores(log.AmbientContext{Tracer: tracing.NewTracer()}, hlc.NewClock(hlc.UnixNano, time.Nanosecond))
 
 	storeID := roachpb.StoreID(89)
 
@@ -63,7 +64,7 @@ func TestStoresRemoveStore(t *testing.T) {
 
 func TestStoresGetStoreCount(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	ls := NewStores(log.AmbientContext{}, hlc.NewClock(hlc.UnixNano, time.Nanosecond))
+	ls := NewStores(log.AmbientContext{Tracer: tracing.NewTracer()}, hlc.NewClock(hlc.UnixNano, time.Nanosecond))
 	if ls.GetStoreCount() != 0 {
 		t.Errorf("expected 0 stores in new local sender")
 	}
@@ -79,7 +80,7 @@ func TestStoresGetStoreCount(t *testing.T) {
 
 func TestStoresVisitStores(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	ls := NewStores(log.AmbientContext{}, hlc.NewClock(hlc.UnixNano, time.Nanosecond))
+	ls := NewStores(log.AmbientContext{Tracer: tracing.NewTracer()}, hlc.NewClock(hlc.UnixNano, time.Nanosecond))
 	numStores := 10
 	for i := 0; i < numStores; i++ {
 		ls.AddStore(&Store{Ident: roachpb.StoreIdent{StoreID: roachpb.StoreID(i)}})
@@ -107,7 +108,7 @@ func TestStoresVisitStores(t *testing.T) {
 
 func TestStoresGetStore(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	ls := NewStores(log.AmbientContext{}, hlc.NewClock(hlc.UnixNano, time.Nanosecond))
+	ls := NewStores(log.AmbientContext{Tracer: tracing.NewTracer()}, hlc.NewClock(hlc.UnixNano, time.Nanosecond))
 	store := Store{}
 	replica := roachpb.ReplicaDescriptor{StoreID: store.Ident.StoreID}
 	s, pErr := ls.GetStore(replica.StoreID)
@@ -130,9 +131,9 @@ func TestStoresGetStore(t *testing.T) {
 func TestStoresLookupReplica(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	stopper := stop.NewStopper()
-	defer stopper.Stop()
+	defer stopper.Stop(context.TODO())
 	cfg := TestStoreConfig(nil)
-	ls := NewStores(log.AmbientContext{}, cfg.Clock)
+	ls := NewStores(log.AmbientContext{Tracer: tracing.NewTracer()}, cfg.Clock)
 
 	// Create two new stores with ranges we care about.
 	var e [2]engine.Engine
@@ -201,7 +202,7 @@ func TestStoresLookupReplica(t *testing.T) {
 		{
 			start:    roachpb.RKey("z1"),
 			end:      roachpb.RKey("z2"),
-			expError: "range 0 was not found",
+			expError: "r0 was not found",
 		},
 	}
 	for testIdx, tc := range testCases {
@@ -231,7 +232,7 @@ func createStores(count int, t *testing.T) (*hlc.ManualClock, []*Store, *Stores,
 	stopper := stop.NewStopper()
 	manual := hlc.NewManualClock(123)
 	cfg := TestStoreConfig(hlc.NewClock(manual.UnixNano, time.Nanosecond))
-	ls := NewStores(log.AmbientContext{}, cfg.Clock)
+	ls := NewStores(log.AmbientContext{Tracer: tracing.NewTracer()}, cfg.Clock)
 
 	// Create two stores with ranges we care about.
 	stores := []*Store{}
@@ -252,7 +253,7 @@ func createStores(count int, t *testing.T) (*hlc.ManualClock, []*Store, *Stores,
 func TestStoresGossipStorage(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	manual, stores, ls, stopper := createStores(2, t)
-	defer stopper.Stop()
+	defer stopper.Stop(context.TODO())
 	ls.AddStore(stores[0])
 
 	// Verify initial read is empty.
@@ -285,7 +286,7 @@ func TestStoresGossipStorage(t *testing.T) {
 	ls.AddStore(stores[1])
 
 	// Create a new stores object to verify read.
-	ls2 := NewStores(log.AmbientContext{}, ls.clock)
+	ls2 := NewStores(log.AmbientContext{Tracer: tracing.NewTracer()}, ls.clock)
 	ls2.AddStore(stores[1])
 	var verifyBI gossip.BootstrapInfo
 	if err := ls2.ReadBootstrapInfo(&verifyBI); err != nil {
@@ -301,7 +302,7 @@ func TestStoresGossipStorage(t *testing.T) {
 func TestStoresGossipStorageReadLatest(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	manual, stores, ls, stopper := createStores(2, t)
-	defer stopper.Stop()
+	defer stopper.Stop(context.TODO())
 	ls.AddStore(stores[0])
 
 	// Add a fake address and write.
@@ -325,7 +326,7 @@ func TestStoresGossipStorageReadLatest(t *testing.T) {
 	// Create a new stores object to freshly read. Should get latest
 	// version from store 1.
 	manual.Increment(1)
-	ls2 := NewStores(log.AmbientContext{}, ls.clock)
+	ls2 := NewStores(log.AmbientContext{Tracer: tracing.NewTracer()}, ls.clock)
 	ls2.AddStore(stores[0])
 	ls2.AddStore(stores[1])
 	var verifyBI gossip.BootstrapInfo
@@ -338,7 +339,7 @@ func TestStoresGossipStorageReadLatest(t *testing.T) {
 
 	// Verify that stores[0], which had old info, was updated with
 	// latest bootstrap info during the read.
-	ls3 := NewStores(log.AmbientContext{}, ls.clock)
+	ls3 := NewStores(log.AmbientContext{Tracer: tracing.NewTracer()}, ls.clock)
 	ls3.AddStore(stores[0])
 	verifyBI.Reset()
 	if err := ls2.ReadBootstrapInfo(&verifyBI); err != nil {

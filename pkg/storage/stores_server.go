@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Tristan Rice (rice@fn.lc)
 
 package storage
 
@@ -26,13 +24,12 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 )
 
-// Server implements FreezeServer and ConsistencyServer.
+// Server implements ConsistencyServer.
 type Server struct {
 	descriptor *roachpb.NodeDescriptor
 	stores     *Stores
 }
 
-var _ FreezeServer = Server{}
 var _ ConsistencyServer = Server{}
 
 // MakeServer returns a new instance of Server.
@@ -52,19 +49,6 @@ func (is Server) execStoreCommand(h StoreRequestHeader, f func(*Store) error) er
 	return f(store)
 }
 
-// PollFrozen implements the FreezeServer interface.
-func (is Server) PollFrozen(
-	ctx context.Context, args *PollFrozenRequest,
-) (*PollFrozenResponse, error) {
-	resp := &PollFrozenResponse{}
-	err := is.execStoreCommand(args.StoreRequestHeader,
-		func(s *Store) error {
-			resp.Results = s.FrozenStatus(args.CollectFrozen)
-			return nil
-		})
-	return resp, err
-}
-
 // CollectChecksum implements ConsistencyServer.
 func (is Server) CollectChecksum(
 	ctx context.Context, req *CollectChecksumRequest,
@@ -82,7 +66,7 @@ func (is Server) CollectChecksum(
 			}
 			resp.Checksum = c.checksum
 			if !bytes.Equal(req.Checksum, c.checksum) {
-				log.Errorf(ctx, "consistency check failed on range ID %s: expected checksum %x, got %x",
+				log.Errorf(ctx, "consistency check failed on range r%d: expected checksum %x, got %x",
 					req.RangeID, req.Checksum, c.checksum)
 				resp.Snapshot = c.snapshot
 			}

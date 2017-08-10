@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Nathan VanBenschoten (nvanbenschoten@gmail.com)
 
 syntax = "proto2";
 package cockroach.roachpb;
@@ -26,6 +24,7 @@ import "gogoproto/gogo.proto";
 // Raft requires access to the term of the last truncated log entry even after the
 // rest of the entry has been discarded.
 message RaftTruncatedState {
+  option (gogoproto.equal) = true;
   option (gogoproto.populate) = true;
 
   // The highest index that has been removed from the log.

@@ -11,14 +11,15 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Spencer Kimball (spencer.kimball@gmail.com)
 
 package retry
 
 import (
+	"errors"
 	"testing"
 	"time"
+
+	"golang.org/x/net/context"
 )
 
 func TestRetryExceedsMaxBackoff(t *testing.T) {
@@ -102,5 +103,49 @@ func TestRetryStop(t *testing.T) {
 
 	if expAttempts := 1; attempts != expAttempts {
 		t.Errorf("expected %d attempts, got %d", expAttempts, attempts)
+	}
+}
+
+func TestRetryNextCh(t *testing.T) {
+	var attempts int
+
+	for r := Start(Options{MaxRetries: 1}); attempts < 2; attempts++ {
+		if r.currentAttempt != attempts {
+			t.Errorf("expected attempt=%d; got %d", attempts, r.currentAttempt)
+		}
+		if attempts == 0 {
+			if r.NextCh() == nil {
+				t.Errorf("expected non-nil NextCh() on first attempt")
+			}
+		} else if attempts == 1 {
+			if r.NextCh() != nil {
+				t.Errorf("expected nil NextCh() on second attempt")
+			}
+		}
+	}
+}
+
+func TestRetryWithMaxAttempts(t *testing.T) {
+	opts := Options{
+		InitialBackoff: time.Microsecond * 10,
+		MaxBackoff:     time.Second,
+		Multiplier:     2,
+		MaxRetries:     1,
+	}
+
+	attempts := 0
+	const maxAttempts = 3
+	expectedErr := errors.New("placeholder")
+	errFn := func() error {
+		attempts++
+		return expectedErr
+	}
+
+	actualErr := WithMaxAttempts(context.TODO(), opts, maxAttempts, errFn)
+	if actualErr != expectedErr {
+		t.Fatalf("expected err %v, got %v", expectedErr, actualErr)
+	}
+	if attempts != maxAttempts {
+		t.Errorf("expected %d attempts, got %d attempts", maxAttempts, attempts)
 	}
 }

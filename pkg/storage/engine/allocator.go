@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Peter Mattis (peter@cockroachlabs.com)
 
 package engine
 
@@ -23,9 +21,9 @@ import "github.com/cockroachdb/cockroach/pkg/util/bufalloc"
 func AllocIterKeyValue(
 	a bufalloc.ByteAllocator, iter Iterator,
 ) (bufalloc.ByteAllocator, MVCCKey, []byte) {
-	key := iter.unsafeKey()
+	key := iter.UnsafeKey()
 	a, key.Key = a.Copy(key.Key, 0)
-	value := iter.unsafeValue()
+	value := iter.UnsafeValue()
 	a, value = a.Copy(value, 0)
 	return a, key, value
 }

@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Tamir Duberstein (tamird@gmail.com)
 
 package storage
 
@@ -29,15 +27,26 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 )
 
+func funcName(f interface{}) string {
+	return runtime.FuncForPC(reflect.ValueOf(f).Pointer()).Name()
+}
+
 // TrackRaftProtos instruments proto marshalling to track protos which are
 // marshalled downstream of raft. It returns a function that removes the
 // instrumentation and returns the list of downstream-of-raft protos.
 func TrackRaftProtos() func() []reflect.Type {
 	// Grab the name of the function that roots all raft operations.
-	applyRaftFunc := runtime.FuncForPC(reflect.ValueOf((*Replica).executeBatch).Pointer()).Name()
-	// Some raft operations trigger gossip, but we don't care about proto
-	// serialization in gossip, so we're going to ignore it.
-	addInfoFunc := runtime.FuncForPC(reflect.ValueOf((*gossip.Gossip).AddInfoProto).Pointer()).Name()
+	processRaftFunc := funcName((*Replica).processRaftCommand)
+	// We only need to track protos that could cause replica divergence
+	// by being written to disk downstream of raft.
+	whitelist := []string{
+		// Some raft operations trigger gossip, but we don't require
+		// strict consistency there.
+		funcName((*gossip.Gossip).AddInfoProto),
+		// Replica destroyed errors are written to disk, but they are
+		// deliberately per-replica values.
+		funcName((replicaStateLoader).setReplicaDestroyedError),
+	}
 
 	belowRaftProtos := struct {
 		syncutil.Mutex
@@ -56,21 +65,32 @@ func TrackRaftProtos() func() []reflect.Type {
 			return
 		}
 
-		pcs := make([]uintptr, 100)
-		numCallers := runtime.Callers(0, pcs)
-		if numCallers == len(pcs) {
+		var pcs [100]uintptr
+		if numCallers := runtime.Callers(0, pcs[:]); numCallers == len(pcs) {
 			panic(fmt.Sprintf("number of callers %d might have exceeded slice size %d", numCallers, len(pcs)))
 		}
-		for _, pc := range pcs[:numCallers] {
-			funcName := runtime.FuncForPC(pc).Name()
-			if strings.Contains(funcName, addInfoFunc) {
+		frames := runtime.CallersFrames(pcs[:])
+		for {
+			f, more := frames.Next()
+
+			whitelisted := false
+			for _, s := range whitelist {
+				if strings.Contains(f.Function, s) {
+					whitelisted = true
+					break
+				}
+			}
+			if whitelisted {
 				break
 			}
-			if strings.Contains(funcName, applyRaftFunc) {
+
+			if strings.Contains(f.Function, processRaftFunc) {
 				belowRaftProtos.Lock()
 				belowRaftProtos.inner[t] = struct{}{}
 				belowRaftProtos.Unlock()
-
+				break
+			}
+			if !more {
 				break
 			}
 		}

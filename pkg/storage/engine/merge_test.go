@@ -11,9 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Tobias Schottdorf (tobias.schottdorf@gmail.com)
-// Author: Peter Mattis (peter@cockroachlabs.com)
 
 package engine
 
@@ -42,7 +39,7 @@ type tsSample struct {
 }
 
 func gibberishString(n int) string {
-	b := make([]byte, n, n)
+	b := make([]byte, n)
 	for i := 0; i < n; i++ {
 		b[i] = byte(rand.Intn(math.MaxUint8 + 1))
 	}

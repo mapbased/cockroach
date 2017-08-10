@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Radu Berinde (radu@cockroachlabs.com)
 
 package parser
 
@@ -20,6 +18,8 @@ import (
 	"bytes"
 	"fmt"
 	"testing"
+
+	"golang.org/x/net/context"
 )
 
 type testVarContainer []Datum
@@ -73,11 +73,15 @@ func TestIndexedVars(t *testing.T) {
 
 	// Test formatting using the indexed var format interceptor.
 	var buf bytes.Buffer
-	typedExpr.Format(
+	FormatNode(
 		&buf,
-		FmtIndexedVarFormat(func(buf *bytes.Buffer, _ FmtFlags, _ IndexedVarContainer, idx int) {
-			fmt.Fprintf(buf, "customVar%d", idx)
-		}),
+		FmtIndexedVarFormat(
+			FmtSimple,
+			func(buf *bytes.Buffer, _ FmtFlags, _ IndexedVarContainer, idx int) {
+				fmt.Fprintf(buf, "customVar%d", idx)
+			},
+		),
+		typedExpr,
 	)
 	str = buf.String()
 	expectedStr = "customVar0 + (customVar1 * customVar2)"
@@ -86,14 +90,16 @@ func TestIndexedVars(t *testing.T) {
 	}
 
 	typ := typedExpr.ResolvedType()
-	if !typ.Equal(TypeInt) {
+	if !typ.Equivalent(TypeInt) {
 		t.Errorf("invalid expression type %s", typ)
 	}
-	d, err := typedExpr.Eval(&EvalContext{})
+	evalCtx := NewTestingEvalContext()
+	defer evalCtx.Stop(context.Background())
+	d, err := typedExpr.Eval(evalCtx)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if d.Compare(NewDInt(3+5*6)) != 0 {
+	if d.Compare(evalCtx, NewDInt(3+5*6)) != 0 {
 		t.Errorf("invalid result %s (expected %d)", d, 3+5*6)
 	}
 }

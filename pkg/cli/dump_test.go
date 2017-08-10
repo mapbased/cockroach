@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Matt Jibson (mjibson@cockroachlabs.com)
 
 package cli
 
@@ -20,6 +18,7 @@ import (
 	"bytes"
 	"database/sql/driver"
 	"fmt"
+	"io"
 	"net/url"
 	"reflect"
 	"strings"
@@ -28,10 +27,11 @@ import (
 	"unicode/utf8"
 
 	"github.com/spf13/pflag"
-	"gopkg.in/inf.v0"
 
+	"github.com/cockroachdb/apd"
 	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
+	"github.com/cockroachdb/cockroach/pkg/util/duration"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/randutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
@@ -40,11 +40,8 @@ import (
 func TestDumpRow(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
-	c, err := newCLITest(t, false)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer c.stop(true)
+	c := newCLITest(cliTestParams{t: t})
+	defer c.cleanup()
 
 	const create = `
 	CREATE DATABASE d;
@@ -61,7 +58,11 @@ func TestDumpRow(t *testing.T) {
 		tz timestamptz,
 		e1 decimal(2),
 		e2 decimal(2, 1),
-		s1 string(1)
+		s1 string(1),
+		FAMILY "primary" (i, f, d, t, n, o, tz, e1, e2, s1, rowid),
+		FAMILY fam_1_s (s),
+		FAMILY fam_2_b (b),
+		FAMILY fam_3_e (e)
 	);
 	INSERT INTO d.t VALUES (
 		1,
@@ -114,8 +115,8 @@ CREATE TABLE t (
 	FAMILY fam_3_e (e)
 );
 
-INSERT INTO t VALUES
-	(1, 2.3, 'striiing', b'a1b2c3', '2016-03-26', '2016-01-25 10:10:10+00:00', '2h30m30s', true, 1.2345, '2016-01-25 10:10:10+00:00', 3.4, 4.5, 's'),
+INSERT INTO t (i, f, s, b, d, t, n, o, e, tz, e1, e2, s1) VALUES
+	(1, 2.3, 'striiing', b'a1b2c3', '2016-03-26', '2016-01-25 10:10:10+00:00', '2h30m30s', true, 1.2345, '2016-01-25 10:10:10+00:00', 3, 4.5, 's'),
 	(NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL),
 	(NULL, +Inf, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL),
 	(NULL, -Inf, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL),
@@ -125,18 +126,148 @@ INSERT INTO t VALUES
 	if string(out) != expect {
 		t.Fatalf("expected: %s\ngot: %s", expect, out)
 	}
+
+}
+
+func TestDumpFlags(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	c := newCLITest(cliTestParams{t: t})
+	defer c.cleanup()
+
+	c.RunWithArgs([]string{"sql", "-e", "create database t; create table t.f (x int, y int); insert into t.f values (42, 69)"})
+
+	out, err := c.RunWithCapture("dump t f --dump-mode=both")
+	if err != nil {
+		t.Fatal(err)
+	}
+	expected := `dump t f --dump-mode=both
+CREATE TABLE f (
+	x INT NULL,
+	y INT NULL,
+	FAMILY "primary" (x, y, rowid)
+);
+
+INSERT INTO f (x, y) VALUES
+	(42, 69);
+`
+	if string(out) != expected {
+		t.Fatalf("expected %s\ngot: %s", expected, out)
+	}
+
+	out, err = c.RunWithCapture("dump t f --dump-mode=schema")
+	if err != nil {
+		t.Fatal(err)
+	}
+	expected = `dump t f --dump-mode=schema
+CREATE TABLE f (
+	x INT NULL,
+	y INT NULL,
+	FAMILY "primary" (x, y, rowid)
+);
+`
+	if string(out) != expected {
+		t.Fatalf("expected %s\ngot: %s", expected, out)
+	}
+
+	out, err = c.RunWithCapture("dump t f --dump-mode=data")
+	if err != nil {
+		t.Fatal(err)
+	}
+	expected = `dump t f --dump-mode=data
+
+INSERT INTO f (x, y) VALUES
+	(42, 69);
+`
+	if string(out) != expected {
+		t.Fatalf("expected %s\ngot: %s", expected, out)
+	}
+}
+
+func TestDumpMultipleTables(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	c := newCLITest(cliTestParams{t: t})
+	defer c.cleanup()
+
+	c.RunWithArgs([]string{"sql", "-e", "create database t; create table t.f (x int, y int); insert into t.f values (42, 69)"})
+	c.RunWithArgs([]string{"sql", "-e", "create table t.g (x int, y int); insert into t.g values (3, 4)"})
+
+	out, err := c.RunWithCapture("dump t f g")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	expected := `dump t f g
+CREATE TABLE f (
+	x INT NULL,
+	y INT NULL,
+	FAMILY "primary" (x, y, rowid)
+);
+
+CREATE TABLE g (
+	x INT NULL,
+	y INT NULL,
+	FAMILY "primary" (x, y, rowid)
+);
+
+INSERT INTO f (x, y) VALUES
+	(42, 69);
+
+INSERT INTO g (x, y) VALUES
+	(3, 4);
+`
+	if string(out) != expected {
+		t.Fatalf("expected %s\ngot: %s", expected, out)
+	}
+
+	out, err = c.RunWithCapture("dump t")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	expected = `dump t
+CREATE TABLE f (
+	x INT NULL,
+	y INT NULL,
+	FAMILY "primary" (x, y, rowid)
+);
+
+CREATE TABLE g (
+	x INT NULL,
+	y INT NULL,
+	FAMILY "primary" (x, y, rowid)
+);
+
+INSERT INTO f (x, y) VALUES
+	(42, 69);
+
+INSERT INTO g (x, y) VALUES
+	(3, 4);
+`
+	if string(out) != expected {
+		t.Fatalf("expected %s\ngot: %s", expected, out)
+	}
+}
+
+func dumpSingleTable(w io.Writer, conn *sqlConn, dbName string, tName string) error {
+	mds, ts, err := getDumpMetadata(conn, dbName, []string{tName}, "")
+	if err != nil {
+		return err
+	}
+	if err := dumpCreateTable(w, mds[0]); err != nil {
+		return err
+	}
+	return dumpTableData(w, conn, ts, mds[0])
 }
 
 func TestDumpBytes(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
-	c, err := newCLITest(t, false)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer c.stop(true)
+	c := newCLITest(cliTestParams{t: t})
+	defer c.cleanup()
 
-	url, cleanup := sqlutils.PGUrl(t, c.ServingAddr(), "TestDumpBytes", url.User(security.RootUser))
+	url, cleanup := sqlutils.PGUrl(t, c.ServingAddr(), t.Name(), url.User(security.RootUser))
 	defer cleanup()
 
 	conn := makeSQLConn(url.String())
@@ -157,7 +288,7 @@ func TestDumpBytes(t *testing.T) {
 	}
 
 	var b bytes.Buffer
-	if err := DumpTable(&b, conn, "d", "t"); err != nil {
+	if err := dumpSingleTable(&b, conn, "d", "t"); err != nil {
 		t.Fatal(err)
 	}
 	dump := b.String()
@@ -172,7 +303,7 @@ func TestDumpBytes(t *testing.T) {
 	if err := conn.Exec(dump, nil); err != nil {
 		t.Fatal(err)
 	}
-	if err := DumpTable(&b, conn, "o", "t"); err != nil {
+	if err := dumpSingleTable(&b, conn, "o", "t"); err != nil {
 		t.Fatal(err)
 	}
 	dump2 := b.String()
@@ -197,13 +328,10 @@ func init() {
 func TestDumpRandom(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
-	c, err := newCLITest(t, false)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer c.stop(true)
+	c := newCLITest(cliTestParams{t: t})
+	defer c.cleanup()
 
-	url, cleanup := sqlutils.PGUrl(t, c.ServingAddr(), "TestDumpRandom", url.User(security.RootUser))
+	url, cleanup := sqlutils.PGUrl(t, c.ServingAddr(), t.Name(), url.User(security.RootUser))
 	defer cleanup()
 
 	conn := makeSQLConn(url.String())
@@ -247,9 +375,15 @@ func TestDumpRandom(t *testing.T) {
 			f := rnd.Float64()
 			d := time.Unix(0, rnd.Int63()).Round(time.Hour * 24).UTC()
 			m := time.Unix(0, rnd.Int63()).Round(time.Microsecond).UTC()
-			n := time.Duration(rnd.Int63()).String()
+			sign := 1 - rnd.Int63n(2)*2
+			dur := duration.Duration{
+				Months: sign * rnd.Int63n(1000),
+				Days:   sign * rnd.Int63n(1000),
+				Nanos:  sign * rnd.Int63(),
+			}
+			n := dur.String()
 			o := rnd.Intn(2) == 1
-			e := strings.TrimRight(inf.NewDec(rnd.Int63(), inf.Scale(rnd.Int31n(20)-10)).String(), ".0")
+			e := apd.New(rnd.Int63(), int32(rnd.Int31n(20)-10)).String()
 			sr := make([]byte, rnd.Intn(500))
 			if _, err := rnd.Read(sr); err != nil {
 				t.Fatal(err)
@@ -310,7 +444,7 @@ func TestDumpRandom(t *testing.T) {
 						fetchedVal = t.UTC()
 					}
 					if !reflect.DeepEqual(fetchedVal, generatedVal) {
-						t.Errorf("NOT EQUAL: table %s, row %d, col %d\ngenerated (%T): %v\nselected (%T): %v\n", table, gi, i, generatedVal, generatedVal, fetchedVal, fetchedVal)
+						t.Errorf("NOT EQUAL: table %s, row %d, col %d\ngenerated (%T): %v (%s)\nselected (%T): %v (%s)\n", table, gi, i, generatedVal, generatedVal, generatedVal, fetchedVal, fetchedVal, fetchedVal)
 					}
 				}
 				if t.Failed() {
@@ -322,7 +456,7 @@ func TestDumpRandom(t *testing.T) {
 		check("d.t")
 
 		var buf bytes.Buffer
-		if err := DumpTable(&buf, conn, "d", "t"); err != nil {
+		if err := dumpSingleTable(&buf, conn, "d", "t"); err != nil {
 			t.Fatal(err)
 		}
 		dump := buf.String()
@@ -340,12 +474,93 @@ func TestDumpRandom(t *testing.T) {
 
 		check("o.t")
 
-		if err := DumpTable(&buf, conn, "o", "t"); err != nil {
+		if err := dumpSingleTable(&buf, conn, "o", "t"); err != nil {
 			t.Fatal(err)
 		}
 		dump2 := buf.String()
 		if dump != dump2 {
 			t.Fatalf("unmatching dumps:\nFIRST:\n%s\n\nSECOND:\n%s", dump, dump2)
 		}
+	}
+}
+
+func TestDumpAsOf(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	c := newCLITest(cliTestParams{t: t})
+	defer c.cleanup()
+
+	const create = `
+	CREATE DATABASE d;
+	CREATE TABLE d.t (i int);
+	INSERT INTO d.t VALUES (1);
+	SELECT NOW();
+`
+
+	out, err := c.RunWithCaptureArgs([]string{"sql", "-e", create})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Last line is the timestamp.
+	fs := strings.Split(strings.TrimSpace(out), "\n")
+	ts := fs[len(fs)-1]
+
+	dump1, err := c.RunWithCaptureArgs([]string{"dump", "d", "t"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	const want1 = `dump d t
+CREATE TABLE t (
+	i INT NULL,
+	FAMILY "primary" (i, rowid)
+);
+
+INSERT INTO t (i) VALUES
+	(1);
+`
+	if dump1 != want1 {
+		t.Fatalf("expected: %s\ngot: %s", want1, dump1)
+	}
+
+	c.RunWithArgs([]string{"sql", "-e", `
+		ALTER TABLE d.t ADD COLUMN j int DEFAULT 2;
+		INSERT INTO d.t VALUES (3, 4);
+	`})
+
+	dump2, err := c.RunWithCaptureArgs([]string{"dump", "d", "t"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	const want2 = `dump d t
+CREATE TABLE t (
+	i INT NULL,
+	j INT NULL DEFAULT 2:::INT,
+	FAMILY "primary" (i, rowid, j)
+);
+
+INSERT INTO t (i, j) VALUES
+	(1, 2),
+	(3, 4);
+`
+	if dump2 != want2 {
+		t.Fatalf("expected: %s\ngot: %s", want2, dump2)
+	}
+
+	dumpAsOf, err := c.RunWithCaptureArgs([]string{"dump", "d", "t", "--as-of", ts})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Remove the timestamp from the first line.
+	dumpAsOf = fmt.Sprintf("dump d t\n%s", strings.SplitN(dumpAsOf, "\n", 2)[1])
+	if dumpAsOf != want1 {
+		t.Fatalf("expected: %s\ngot: %s", want1, dumpAsOf)
+	}
+
+	if out, err := c.RunWithCaptureArgs([]string{"dump", "d", "t", "--as-of", "2000-01-01 00:00:00"}); err != nil {
+		t.Fatal(err)
+	} else if !strings.Contains(string(out), "relation d.t does not exist") {
+		t.Fatalf("unexpected output: %s", out)
 	}
 }

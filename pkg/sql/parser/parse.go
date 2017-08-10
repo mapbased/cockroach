@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Peter Mattis (peter@cockroachlabs.com)
 
 // This code was derived from https://github.com/youtube/vitess.
 //
@@ -26,7 +24,9 @@ import (
 	"bytes"
 	"fmt"
 	"strings"
+	"time"
 
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/pkg/errors"
 )
 
@@ -45,16 +45,6 @@ func (l StatementList) Format(buf *bytes.Buffer, f FmtFlags) {
 	}
 }
 
-// Syntax is an enum of the various syntax types.
-type Syntax int
-
-//go:generate stringer -type=Syntax
-const (
-	// Implicit default, must stay in the zero-value position.
-	Traditional Syntax = iota
-	Modern
-)
-
 // Parser wraps a scanner, parser and other utilities present in the parser
 // package.
 type Parser struct {
@@ -66,10 +56,13 @@ type Parser struct {
 }
 
 // Parse parses the sql and returns a list of statements.
-func (p *Parser) Parse(sql string, syntax Syntax) (stmts StatementList, err error) {
-	p.scanner.init(sql, syntax)
+func (p *Parser) Parse(sql string) (stmts StatementList, err error) {
+	p.scanner.init(sql)
 	if p.parserImpl.Parse(&p.scanner) != 0 {
-		return nil, errors.New(p.scanner.lastError)
+		if feat := p.scanner.lastError.unimplementedFeature; feat != "" {
+			return nil, pgerror.Unimplemented(feat, p.scanner.lastError.msg)
+		}
+		return nil, pgerror.NewError(pgerror.CodeSyntaxError, p.scanner.lastError.msg)
 	}
 	return p.scanner.stmts, nil
 }
@@ -88,6 +81,9 @@ func TypeCheck(expr Expr, ctx *SemaContext, desired Type) (TypedExpr, error) {
 	if desired == nil {
 		panic("the desired type for parser.TypeCheck cannot be nil, use TypeAny instead")
 	}
+
+	expr = replacePlaceholders(expr, ctx)
+
 	expr, err := foldConstantLiterals(expr)
 	if err != nil {
 		return nil, err
@@ -104,7 +100,7 @@ func TypeCheckAndRequire(expr Expr, ctx *SemaContext, required Type, op string) 
 	if err != nil {
 		return nil, err
 	}
-	if typ := typedExpr.ResolvedType(); !(typ.Equal(required) || typ == TypeNull) {
+	if typ := typedExpr.ResolvedType(); !(typ.Equivalent(required) || typ == TypeNull) {
 		return typedExpr, fmt.Errorf("argument of %s must be type %s, not type %s", op, required, typ)
 	}
 	return typedExpr, nil
@@ -124,20 +120,16 @@ func (p *Parser) NormalizeExpr(ctx *EvalContext, typedExpr TypedExpr) (TypedExpr
 	return expr.(TypedExpr), nil
 }
 
-// parse parses the sql and returns a list of statements.
-func parse(sql string, syntax Syntax) (StatementList, error) {
+// Parse parses a sql statement string and returns a list of Statements.
+func Parse(sql string) (StatementList, error) {
 	var p Parser
-	return p.Parse(sql, syntax)
+	return p.Parse(sql)
 }
 
-// parseTraditional is short-hand for parse(sql, Traditional)
-func parseTraditional(sql string) (StatementList, error) {
-	return parse(sql, Traditional)
-}
-
-// ParseOne parses a sql statement.
-func ParseOne(sql string, syntax Syntax) (Statement, error) {
-	stmts, err := parse(sql, syntax)
+// ParseOne parses a sql statement string, ensuring that it contains only a
+// single statement, and returns that Statement.
+func ParseOne(sql string) (Statement, error) {
+	stmts, err := Parse(sql)
 	if err != nil {
 		return nil, err
 	}
@@ -147,14 +139,9 @@ func ParseOne(sql string, syntax Syntax) (Statement, error) {
 	return stmts[0], nil
 }
 
-// ParseOneTraditional is short-hand for ParseOne(sql, Traditional)
-func ParseOneTraditional(sql string) (Statement, error) {
-	return ParseOne(sql, Traditional)
-}
-
-// ParseTableNameTraditional parses a table name.
-func ParseTableNameTraditional(sql string) (*TableName, error) {
-	stmt, err := ParseOneTraditional(fmt.Sprintf("ALTER TABLE %s RENAME TO x", sql))
+// ParseTableName parses a table name.
+func ParseTableName(sql string) (*TableName, error) {
+	stmt, err := ParseOne(fmt.Sprintf("ALTER TABLE %s RENAME TO x", sql))
 	if err != nil {
 		return nil, err
 	}
@@ -165,9 +152,9 @@ func ParseTableNameTraditional(sql string) (*TableName, error) {
 	return rename.Name.Normalize()
 }
 
-// parseExprs parses one or more sql expression.
-func parseExprs(exprs []string, syntax Syntax) (Exprs, error) {
-	stmt, err := ParseOne(fmt.Sprintf("SET ROW (%s)", strings.Join(exprs, ",")), syntax)
+// parseExprs parses one or more sql expressions.
+func parseExprs(exprs []string) (Exprs, error) {
+	stmt, err := ParseOne(fmt.Sprintf("SET ROW (%s)", strings.Join(exprs, ",")))
 	if err != nil {
 		return nil, err
 	}
@@ -178,17 +165,17 @@ func parseExprs(exprs []string, syntax Syntax) (Exprs, error) {
 	return set.Values, nil
 }
 
-// ParseExprsTraditional is a short-hand for parseExprs(sql, Traditional)
-func ParseExprsTraditional(sql []string) (Exprs, error) {
+// ParseExprs is a short-hand for parseExprs(sql)
+func ParseExprs(sql []string) (Exprs, error) {
 	if len(sql) == 0 {
 		return Exprs{}, nil
 	}
-	return parseExprs(sql, Traditional)
+	return parseExprs(sql)
 }
 
-// ParseExprTraditional is a short-hand for parseExprs([]string{sql}, Traditional)
-func ParseExprTraditional(sql string) (Expr, error) {
-	exprs, err := parseExprs([]string{sql}, Traditional)
+// ParseExpr is a short-hand for parseExprs([]string{sql})
+func ParseExpr(sql string) (Expr, error) {
+	exprs, err := parseExprs([]string{sql})
 	if err != nil {
 		return nil, err
 	}
@@ -196,4 +183,52 @@ func ParseExprTraditional(sql string) (Expr, error) {
 		return nil, errors.Errorf("expected 1 expression, found %d", len(exprs))
 	}
 	return exprs[0], nil
+}
+
+// ParseType parses a column type.
+func ParseType(sql string) (CastTargetType, error) {
+	expr, err := ParseExpr(fmt.Sprintf("1::%s", sql))
+	if err != nil {
+		return nil, err
+	}
+
+	cast, ok := expr.(*CastExpr)
+	if !ok {
+		return nil, errors.Errorf("expected a CastExpr, but found %T", expr)
+	}
+
+	return cast.Type, nil
+}
+
+// ParseStringAs parses s as type t.
+func ParseStringAs(t Type, s string, location *time.Location) (Datum, error) {
+	var d Datum
+	var err error
+	switch t {
+	case TypeBool:
+		d, err = ParseDBool(s)
+	case TypeBytes:
+		d = NewDBytes(DBytes(s))
+	case TypeDate:
+		d, err = ParseDDate(s, location)
+	case TypeDecimal:
+		d, err = ParseDDecimal(s)
+	case TypeFloat:
+		d, err = ParseDFloat(s)
+	case TypeInt:
+		d, err = ParseDInt(s)
+	case TypeInterval:
+		d, err = ParseDInterval(s)
+	case TypeString:
+		d = NewDString(s)
+	case TypeTimestamp:
+		d, err = ParseDTimestamp(s, time.Microsecond)
+	case TypeTimestampTZ:
+		d, err = ParseDTimestampTZ(s, location, time.Microsecond)
+	case TypeUUID:
+		d, err = ParseDUuidFromString(s)
+	default:
+		return nil, errors.Errorf("unknown type %s", t)
+	}
+	return d, err
 }

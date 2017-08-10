@@ -11,19 +11,22 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Raphael 'kena' Poss (knz@cockroachlabs.com)
 
 package cli
 
 import (
 	"fmt"
+	"strconv"
 	"strings"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/server"
+	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/storage/engine"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/pkg/errors"
 )
 
 // statementsValue is an implementation of pflag.Value that appends any
@@ -47,21 +50,148 @@ type cliContext struct {
 	// Embed the base context.
 	*base.Config
 
-	// prettyFmt indicates whether tables should be pretty-formatted in
-	// the output during non-interactive execution.
-	prettyFmt bool
+	// tableDisplayFormat indicates how to format result tables.
+	tableDisplayFormat tableDisplayFormat
+
+	// showTimes indicates whether to display query times after each result line.
+	showTimes bool
 }
 
-func (ctx *cliContext) InitCLIDefaults() {
-	ctx.prettyFmt = false
+var serverCfg = func() server.Config {
+	st := cluster.MakeClusterSettings()
+	// This is the real cluster settings object that is used by users' servers,
+	// and which should receive updates from associated Updaters.
+	st.Manual.Store(false)
+
+	// The server package has its own copy of the singleton for use in the
+	// /debug/requests handler.
+	server.ClusterSettings = st
+	// A similar singleton exists in the log package. See comment there.
+	f := log.ReportingSettings(st.ReportingSettings)
+	log.ReportingSettingsSingleton.Store(&f)
+
+	return server.MakeConfig(st)
+}()
+
+var baseCfg = serverCfg.Config
+var cliCtx = cliContext{Config: baseCfg}
+
+type tableDisplayFormat int
+
+const (
+	tableDisplayTSV tableDisplayFormat = iota
+	tableDisplayCSV
+	tableDisplayPretty
+	tableDisplayRecords
+	tableDisplaySQL
+	tableDisplayHTML
+	tableDisplayRaw
+)
+
+// Type implements the pflag.Value interface.
+func (f *tableDisplayFormat) Type() string { return "string" }
+
+// String implements the pflag.Value interface.
+func (f *tableDisplayFormat) String() string {
+	switch *f {
+	case tableDisplayTSV:
+		return "tsv"
+	case tableDisplayCSV:
+		return "csv"
+	case tableDisplayPretty:
+		return "pretty"
+	case tableDisplayRecords:
+		return "records"
+	case tableDisplaySQL:
+		return "sql"
+	case tableDisplayHTML:
+		return "html"
+	case tableDisplayRaw:
+		return "raw"
+	}
+	return ""
 }
 
-type sqlContext struct {
-	// Embed the cli context.
+// Set implements the pflag.Value interface.
+func (f *tableDisplayFormat) Set(s string) error {
+	switch s {
+	case "tsv":
+		*f = tableDisplayTSV
+	case "csv":
+		*f = tableDisplayCSV
+	case "pretty":
+		*f = tableDisplayPretty
+	case "records":
+		*f = tableDisplayRecords
+	case "sql":
+		*f = tableDisplaySQL
+	case "html":
+		*f = tableDisplayHTML
+	case "raw":
+		*f = tableDisplayRaw
+	default:
+		return fmt.Errorf("invalid table display format: %s "+
+			"(possible values: tsv, csv, pretty, records, sql, html, raw)", s)
+	}
+	return nil
+}
+
+// sqlCtx captures the command-line parameters of the `sql` command.
+var sqlCtx = struct {
 	*cliContext
 
 	// execStmts is a list of statements to execute.
 	execStmts statementsValue
+}{cliContext: &cliCtx}
+
+// dumpCtx captures the command-line parameters of the `sql` command.
+var dumpCtx = struct {
+	// dumpMode determines which part of the database should be dumped.
+	dumpMode dumpMode
+
+	// asOf determines the time stamp at which the dump should be taken.
+	asOf string
+}{
+	dumpMode: dumpBoth,
+}
+
+type dumpMode int
+
+const (
+	dumpBoth dumpMode = iota
+	dumpSchemaOnly
+	dumpDataOnly
+)
+
+// Type implements the pflag.Value interface.
+func (m *dumpMode) Type() string { return "string" }
+
+// String implements the pflag.Value interface.
+func (m *dumpMode) String() string {
+	switch *m {
+	case dumpBoth:
+		return "both"
+	case dumpSchemaOnly:
+		return "schema"
+	case dumpDataOnly:
+		return "data"
+	}
+	return ""
+}
+
+// Set implements the pflag.Value interface.
+func (m *dumpMode) Set(s string) error {
+	switch s {
+	case "both":
+		*m = dumpBoth
+	case "schema":
+		*m = dumpSchemaOnly
+	case "data":
+		*m = dumpDataOnly
+	default:
+		return fmt.Errorf("invalid value for --dump-mode: %s", s)
+	}
+	return nil
 }
 
 type keyType int
@@ -93,6 +223,16 @@ func parseKeyType(value string) (keyType, error) {
 	return 0, fmt.Errorf("unknown key type '%s'", value)
 }
 
+// unquoteArg unquotes the provided argument using Go double-quoted
+// string literal rules.
+func unquoteArg(arg string) (string, error) {
+	s, err := strconv.Unquote(`"` + arg + `"`)
+	if err != nil {
+		return "", errors.Wrapf(err, "invalid argument %q", arg)
+	}
+	return s, nil
+}
+
 type mvccKey engine.MVCCKey
 
 func (k *mvccKey) String() string {
@@ -116,7 +256,7 @@ func (k *mvccKey) Set(value string) error {
 
 	switch typ {
 	case raw:
-		unquoted, err := unquoteArg(keyStr, false)
+		unquoted, err := unquoteArg(keyStr)
 		if err != nil {
 			return err
 		}
@@ -144,9 +284,79 @@ func (k *mvccKey) Type() string {
 	return "engine.MVCCKey"
 }
 
-type debugContext struct {
-	startKey, endKey engine.MVCCKey
-	values           bool
-	sizes            bool
-	replicated       bool
+// debugCtx captures the command-line parameters of the `debug` command.
+var debugCtx = struct {
+	startKey, endKey  engine.MVCCKey
+	values            bool
+	sizes             bool
+	replicated        bool
+	inputFile         string
+	printSystemConfig bool
+}{
+	startKey: engine.NilKey,
+	endKey:   engine.MVCCKeyMax,
+}
+
+// zoneCtx captures the command-line parameters of the `zone` command.
+var zoneCtx struct {
+	zoneConfig             string
+	zoneDisableReplication bool
+}
+
+// startCtx captures the command-line arguments for the `start` command.
+var startCtx struct {
+	// server-specific values of some flags.
+	serverInsecure    bool
+	serverSSLCertsDir string
+}
+
+// quitCtx captures the command-line parameters of the `quit` command.
+var quitCtx struct {
+	serverDecommission bool
+}
+
+// nodeCtx captures the command-line parameters of the `node` command.
+var nodeCtx = struct {
+	nodeDecommissionWait nodeDecommissionWaitType
+}{
+	nodeDecommissionWait: nodeDecommissionWaitAll,
+}
+
+type nodeDecommissionWaitType int
+
+const (
+	nodeDecommissionWaitAll nodeDecommissionWaitType = iota
+	nodeDecommissionWaitLive
+	nodeDecommissionWaitNone
+)
+
+func (s *nodeDecommissionWaitType) String() string {
+	switch *s {
+	case nodeDecommissionWaitAll:
+		return "all"
+	case nodeDecommissionWaitLive:
+		return "live"
+	case nodeDecommissionWaitNone:
+		return "none"
+	}
+	return ""
+}
+
+func (s *nodeDecommissionWaitType) Type() string {
+	return "string"
+}
+
+func (s *nodeDecommissionWaitType) Set(value string) error {
+	switch value {
+	case "all":
+		*s = nodeDecommissionWaitAll
+	case "live":
+		*s = nodeDecommissionWaitLive
+	case "none":
+		*s = nodeDecommissionWaitNone
+	default:
+		return fmt.Errorf("invalid node decommission parameter: %s "+
+			"(possible values: all, live, none)", value)
+	}
+	return nil
 }

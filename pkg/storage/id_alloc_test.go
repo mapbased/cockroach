@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Spencer Kimball (spencer.kimball@gmail.com)
 
 package storage
 
@@ -31,6 +29,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
+	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 )
 
 // TestIDAllocator creates an ID allocator which allocates from
@@ -42,13 +41,13 @@ import (
 func TestIDAllocator(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	stopper := stop.NewStopper()
-	defer stopper.Stop()
+	defer stopper.Stop(context.TODO())
 	store, _ := createTestStore(t, stopper)
 	const maxI, maxJ = 10, 10
 	allocd := make(chan uint32, maxI*maxJ)
 	errChan := make(chan error, maxI*maxJ)
 	idAlloc, err := newIDAllocator(
-		log.AmbientContext{}, keys.RangeIDGenerator, store.cfg.DB, 2, 10, stopper,
+		log.AmbientContext{Tracer: store.ClusterSettings().Tracer}, keys.RangeIDGenerator, store.cfg.DB, 2, 10, stopper,
 	)
 	if err != nil {
 		t.Errorf("failed to create idAllocator: %v", err)
@@ -95,7 +94,7 @@ func TestIDAllocator(t *testing.T) {
 func TestIDAllocatorNegativeValue(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	stopper := stop.NewStopper()
-	defer stopper.Stop()
+	defer stopper.Stop(context.TODO())
 	store, _ := createTestStore(t, stopper)
 
 	// Increment our key to a negative value.
@@ -107,7 +106,7 @@ func TestIDAllocatorNegativeValue(t *testing.T) {
 		t.Errorf("expected new value to be -1024; got %d", newValue)
 	}
 	idAlloc, err := newIDAllocator(
-		log.AmbientContext{}, keys.RangeIDGenerator, store.cfg.DB, 2, 10, stopper,
+		log.AmbientContext{Tracer: store.ClusterSettings().Tracer}, keys.RangeIDGenerator, store.cfg.DB, 2, 10, stopper,
 	)
 	if err != nil {
 		t.Errorf("failed to create IDAllocator: %v", err)
@@ -130,7 +129,7 @@ func TestNewIDAllocatorInvalidArgs(t *testing.T) {
 	}
 	for i := range args {
 		if _, err := newIDAllocator(
-			log.AmbientContext{}, nil, nil, args[i][0], args[i][1], nil,
+			log.AmbientContext{Tracer: tracing.NewTracer()}, nil, nil, args[i][0], args[i][1], nil,
 		); err == nil {
 			t.Errorf("expect to have error return, but got nil")
 		}
@@ -146,14 +145,14 @@ func TestNewIDAllocatorInvalidArgs(t *testing.T) {
 func TestAllocateErrorAndRecovery(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	stopper := stop.NewStopper()
-	defer stopper.Stop()
+	defer stopper.Stop(context.TODO())
 	store, _ := createTestStore(t, stopper)
 	const routines = 10
 	allocd := make(chan uint32, routines)
 
 	// Firstly create a valid IDAllocator to get some ID.
 	idAlloc, err := newIDAllocator(
-		log.AmbientContext{}, keys.RangeIDGenerator, store.cfg.DB, 2, 10, stopper,
+		log.AmbientContext{Tracer: store.ClusterSettings().Tracer}, keys.RangeIDGenerator, store.cfg.DB, 2, 10, stopper,
 	)
 	if err != nil {
 		t.Errorf("failed to create IDAllocator: %v", err)
@@ -244,10 +243,10 @@ func TestAllocateWithStopper(t *testing.T) {
 	// before the end of the test.
 	idAlloc := func() *idAllocator {
 		stopper := stop.NewStopper()
-		defer stopper.Stop()
+		defer stopper.Stop(context.TODO())
 		store, _ := createTestStore(t, stopper)
 		idAlloc, err := newIDAllocator(
-			log.AmbientContext{}, keys.RangeIDGenerator, store.cfg.DB, 2, 10, stopper,
+			log.AmbientContext{Tracer: store.ClusterSettings().Tracer}, keys.RangeIDGenerator, store.cfg.DB, 2, 10, stopper,
 		)
 		if err != nil {
 			t.Fatal(err)

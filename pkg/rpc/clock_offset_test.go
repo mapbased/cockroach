@@ -11,12 +11,11 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Kathy Spradlin (kathyspradlin@gmail.com)
 
 package rpc
 
 import (
+	"fmt"
 	"math"
 	"strconv"
 	"testing"
@@ -30,7 +29,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
 )
 
-const errOffsetGreaterThanMaxOffset = "fewer than half the known nodes are within the maximum offset"
+const errOffsetGreaterThanMaxOffset = "clock synchronization error: this node is more than .+ away from at least half of the known nodes"
 
 // TestUpdateOffset tests the three cases that UpdateOffset should or should
 // not update the offset for an addr.
@@ -38,9 +37,10 @@ func TestUpdateOffset(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
 	clock := hlc.NewClock(hlc.NewManualClock(123).UnixNano, time.Nanosecond)
-	monitor := newRemoteClockMonitor(context.TODO(), clock, time.Hour)
+	monitor := newRemoteClockMonitor(clock, time.Hour, 0)
 
 	const key = "addr"
+	const latency = 10 * time.Millisecond
 
 	// Case 1: There is no prior offset for the address.
 	offset1 := RemoteOffset{
@@ -48,7 +48,7 @@ func TestUpdateOffset(t *testing.T) {
 		Uncertainty: 20,
 		MeasuredAt:  monitor.clock.PhysicalTime().Add(-(monitor.offsetTTL + 1)).UnixNano(),
 	}
-	monitor.UpdateOffset(key, offset1)
+	monitor.UpdateOffset(context.TODO(), key, offset1, latency)
 	monitor.mu.Lock()
 	if o, ok := monitor.mu.offsets[key]; !ok {
 		t.Errorf("expected key %s to be set in %v, but it was not", key, monitor.mu.offsets)
@@ -63,7 +63,7 @@ func TestUpdateOffset(t *testing.T) {
 		Uncertainty: 20,
 		MeasuredAt:  monitor.clock.PhysicalTime().Add(-(monitor.offsetTTL + 1)).UnixNano(),
 	}
-	monitor.UpdateOffset(key, offset2)
+	monitor.UpdateOffset(context.TODO(), key, offset2, latency)
 	monitor.mu.Lock()
 	if o, ok := monitor.mu.offsets[key]; !ok {
 		t.Errorf("expected key %s to be set in %v, but it was not", key, monitor.mu.offsets)
@@ -78,7 +78,7 @@ func TestUpdateOffset(t *testing.T) {
 		Uncertainty: 10,
 		MeasuredAt:  offset2.MeasuredAt + 1,
 	}
-	monitor.UpdateOffset(key, offset3)
+	monitor.UpdateOffset(context.TODO(), key, offset3, latency)
 	monitor.mu.Lock()
 	if o, ok := monitor.mu.offsets[key]; !ok {
 		t.Errorf("expected key %s to be set in %v, but it was not", key, monitor.mu.offsets)
@@ -88,7 +88,7 @@ func TestUpdateOffset(t *testing.T) {
 	monitor.mu.Unlock()
 
 	// Larger error and offset3 is not stale, so no update.
-	monitor.UpdateOffset(key, offset2)
+	monitor.UpdateOffset(context.TODO(), key, offset2, latency)
 	monitor.mu.Lock()
 	if o, ok := monitor.mu.offsets[key]; !ok {
 		t.Errorf("expected key %s to be set in %v, but it was not", key, monitor.mu.offsets)
@@ -102,7 +102,7 @@ func TestVerifyClockOffset(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
 	clock := hlc.NewClock(hlc.NewManualClock(123).UnixNano, 50*time.Nanosecond)
-	monitor := newRemoteClockMonitor(context.TODO(), clock, time.Hour)
+	monitor := newRemoteClockMonitor(clock, time.Hour, 0)
 
 	for idx, tc := range []struct {
 		offsets       []RemoteOffset
@@ -121,11 +121,11 @@ func TestVerifyClockOffset(t *testing.T) {
 		}
 
 		if tc.expectedError {
-			if err := monitor.VerifyClockOffset(); !testutils.IsError(err, errOffsetGreaterThanMaxOffset) {
+			if err := monitor.VerifyClockOffset(context.TODO()); !testutils.IsError(err, errOffsetGreaterThanMaxOffset) {
 				t.Errorf("%d: unexpected error %v", idx, err)
 			}
 		} else {
-			if err := monitor.VerifyClockOffset(); err != nil {
+			if err := monitor.VerifyClockOffset(context.TODO()); err != nil {
 				t.Errorf("%d: unexpected error %s", idx, err)
 			}
 		}
@@ -164,10 +164,10 @@ func TestIsHealthyOffsetInterval(t *testing.T) {
 func TestClockOffsetMetrics(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	stopper := stop.NewStopper()
-	defer stopper.Stop()
+	defer stopper.Stop(context.TODO())
 
 	clock := hlc.NewClock(hlc.NewManualClock(123).UnixNano, 20*time.Nanosecond)
-	monitor := newRemoteClockMonitor(context.TODO(), clock, time.Hour)
+	monitor := newRemoteClockMonitor(clock, time.Hour, 0)
 	monitor.mu.offsets = map[string]RemoteOffset{
 		"0": {
 			Offset:      13,
@@ -176,7 +176,7 @@ func TestClockOffsetMetrics(t *testing.T) {
 		},
 	}
 
-	if err := monitor.VerifyClockOffset(); err != nil {
+	if err := monitor.VerifyClockOffset(context.TODO()); err != nil {
 		t.Fatal(err)
 	}
 
@@ -185,5 +185,48 @@ func TestClockOffsetMetrics(t *testing.T) {
 	}
 	if a, e := monitor.Metrics().ClockOffsetStdDevNanos.Value(), int64(7); a != e {
 		t.Errorf("stdDev %d != expected %d", a, e)
+	}
+}
+
+// TestLatencies tests the tracking of round-trip latency between nodes.
+func TestLatencies(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	clock := hlc.NewClock(hlc.NewManualClock(123).UnixNano, time.Nanosecond)
+	monitor := newRemoteClockMonitor(clock, time.Hour, 0)
+
+	// All test cases have to have at least 11 measurement values in order for
+	// the exponentially-weighted moving average to work properly. See the
+	// comment on the WARMUP_SAMPLES const in the ewma package for details.
+	const emptyKey = "no measurements"
+	for i := 0; i < 11; i++ {
+		monitor.UpdateOffset(context.Background(), emptyKey, RemoteOffset{}, 0)
+	}
+	if l, ok := monitor.mu.latenciesNanos[emptyKey]; ok {
+		t.Errorf("expected no latency measurement for %q, got %v", emptyKey, l.Value())
+	}
+
+	testCases := []struct {
+		measurements []time.Duration
+		expectedAvg  time.Duration
+	}{
+		{[]time.Duration{10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10}, 10},
+		{[]time.Duration{10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 0}, 10},
+		{[]time.Duration{0, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10}, 10},
+		{[]time.Duration{10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 99}, 18},
+		{[]time.Duration{99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 10}, 90},
+		{[]time.Duration{10, 10, 10, 10, 10, 10, 99, 99, 99, 99, 99}, 50},
+		{[]time.Duration{99, 99, 99, 99, 99, 99, 10, 10, 10, 10, 10}, 58},
+		{[]time.Duration{10, 10, 10, 10, 10, 99, 99, 99, 99, 99, 99}, 58},
+		{[]time.Duration{99, 99, 99, 99, 99, 10, 10, 10, 10, 10, 10}, 50},
+	}
+	for _, tc := range testCases {
+		key := fmt.Sprintf("%v", tc.measurements)
+		for _, measurement := range tc.measurements {
+			monitor.UpdateOffset(context.Background(), key, RemoteOffset{}, measurement)
+		}
+		if val, ok := monitor.Latency(key); !ok || val != tc.expectedAvg {
+			t.Errorf("%q: expected latency %d, got %d", key, tc.expectedAvg, val)
+		}
 	}
 }

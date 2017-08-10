@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Tobias Schottdorf (tobias.schottdorf@gmail.com)
 
 package metric
 
@@ -54,6 +52,18 @@ func TestGauge(t *testing.T) {
 		t.Fatalf("unexpected value: %d", v)
 	}
 	testMarshal(t, g, "10")
+}
+
+func TestFunctionalGauge(t *testing.T) {
+	valToReturn := int64(10)
+	g := NewFunctionalGauge(emptyMetadata, func() int64 { return valToReturn })
+	if v := g.Value(); v != 10 {
+		t.Fatalf("unexpected value: %d", v)
+	}
+	valToReturn = 15
+	if v := g.Value(); v != 15 {
+		t.Fatalf("unexpected value: %d", v)
+	}
 }
 
 func TestGaugeFloat64(t *testing.T) {

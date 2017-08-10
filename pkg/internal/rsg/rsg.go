@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Matt Jibson (mjibson@gmail.com)
 
 package rsg
 
@@ -27,6 +25,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/util/duration"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
+	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 )
 
 // RSG is a random syntax generator.
@@ -144,6 +143,45 @@ func (r *RSG) Int63() int64 {
 	return v
 }
 
+// Int returns a random int. It attempts to distribute results among small,
+// large, and normal scale numbers.
+func (r *RSG) Int() int64 {
+	r.lock.Lock()
+	var i int64
+	switch r.src.Intn(9) {
+	case 0:
+		i = 0
+	case 1:
+		i = 1
+	case 2:
+		i = -1
+	case 3:
+		i = 2
+	case 4:
+		i = -2
+	case 5:
+		i = math.MaxInt64
+	case 6:
+		// math.MinInt64 isn't a valid integer in SQL
+		i = math.MinInt64 + 1
+	case 7:
+		i = r.src.Int63()
+		if r.src.Intn(2) == 1 {
+			i = -i
+		}
+	case 8:
+		for v := r.src.Intn(10) + 1; v > 0; v-- {
+			i *= 10
+			i += r.src.Int63n(10)
+		}
+		if r.src.Intn(2) == 1 {
+			i = -i
+		}
+	}
+	r.lock.Unlock()
+	return i
+}
+
 // Float64 returns a random float. It is sometimes +/-Inf, NaN, and attempts to
 // be distributed among very small, large, and normal scale numbers.
 func (r *RSG) Float64() float64 {
@@ -170,32 +208,26 @@ func (r *RSG) Float64() float64 {
 }
 
 // GenerateRandomArg generates a random, valid, SQL function argument of
-// the spcified type.
+// the specified type.
 func (r *RSG) GenerateRandomArg(typ parser.Type) string {
 	if r.Intn(10) == 0 {
 		return "NULL"
 	}
 	var v interface{}
-	switch typ {
+	switch parser.UnwrapType(typ) {
 	case parser.TypeInt:
-		i := r.Int63()
-		i -= r.Int63()
-		v = i
+		v = r.Int()
 	case parser.TypeFloat, parser.TypeDecimal:
 		v = r.Float64()
 	case parser.TypeString:
-		v = `'string'`
+		v = stringArgs[r.Intn(len(stringArgs))]
 	case parser.TypeBytes:
-		v = `b'bytes'`
+		v = fmt.Sprintf("b%s", stringArgs[r.Intn(len(stringArgs))])
 	case parser.TypeTimestamp, parser.TypeTimestampTZ:
 		t := time.Unix(0, r.Int63())
 		v = fmt.Sprintf(`'%s'`, t.Format(time.RFC3339Nano))
 	case parser.TypeBool:
-		if r.Intn(2) == 0 {
-			v = "false"
-		} else {
-			v = "true"
-		}
+		v = boolArgs[r.Intn(2)]
 	case parser.TypeDate:
 		i := r.Int63()
 		i -= r.Int63()
@@ -204,18 +236,41 @@ func (r *RSG) GenerateRandomArg(typ parser.Type) string {
 	case parser.TypeInterval:
 		d := duration.Duration{Nanos: r.Int63()}
 		v = fmt.Sprintf(`'%s'`, &parser.DInterval{Duration: d})
-	case parser.TypeIntArray,
-		parser.TypeStringArray,
+	case parser.TypeUUID:
+		u := uuid.MakeV4()
+		v = fmt.Sprintf(`'%s'`, u)
+	case parser.TypeOid,
+		parser.TypeRegClass,
+		parser.TypeRegNamespace,
+		parser.TypeRegProc,
+		parser.TypeRegProcedure,
+		parser.TypeRegType,
 		parser.TypeAnyArray,
 		parser.TypeAny:
 		v = "NULL"
 	default:
-		switch typ.(type) {
-		case parser.TTuple:
+		// Check types that can't be compared using equality
+		switch parser.UnwrapType(typ).(type) {
+		case parser.TTuple,
+			parser.TArray:
 			v = "NULL"
 		default:
 			panic(fmt.Errorf("unknown arg type: %s (%T)", typ, typ))
 		}
 	}
 	return fmt.Sprintf("%v::%s", v, typ.String())
+}
+
+var stringArgs = map[int]string{
+	0: `''`,
+	1: `'1'`,
+	2: `'12345'`,
+	3: `'1234567890'`,
+	4: `'12345678901234567890'`,
+	5: `'123456789123456789123456789123456789123456789123456789123456789123456789'`,
+}
+
+var boolArgs = map[int]string{
+	0: "false",
+	1: "true",
 }

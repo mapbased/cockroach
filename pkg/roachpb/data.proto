@@ -11,9 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Jiajia Han (hanjia18@gmail.com)
-// Author: Spencer Kimball (spencer.kimball@gmail.com)
 
 syntax = "proto2";
 package cockroach.roachpb;
@@ -26,6 +23,9 @@ import "gogoproto/gogo.proto";
 
 // Span is supplied with every storage node request.
 message Span {
+  option (gogoproto.equal) = true;
+
+  option (gogoproto.goproto_stringer) = false;
   option (gogoproto.populate) = true;
 
   // The key for request. If the request operates on a range, this
@@ -80,6 +80,8 @@ enum ValueType {
 // TODO(peter): Is a 4-byte checksum overkill when most (all?) values
 // will be less than 64KB?
 message Value {
+  option (gogoproto.equal) = true;
+
   // raw_bytes contains the encoded value and checksum.
   optional bytes raw_bytes = 1;
   // Timestamp of value.
@@ -113,6 +115,8 @@ message StoreIdent {
 // allows the final bookkeeping for the split to be completed and the
 // new range put into operation.
 message SplitTrigger {
+  option (gogoproto.equal) = true;
+
   optional RangeDescriptor left_desc = 1 [(gogoproto.nullable) = false];
   optional RangeDescriptor right_desc = 2 [(gogoproto.nullable) = false];
   reserved 3;
@@ -126,6 +130,8 @@ message SplitTrigger {
 // (right_desc). This information allows the final bookkeeping for the
 // merge to be completed and put into operation.
 message MergeTrigger {
+  option (gogoproto.equal) = true;
+
   optional RangeDescriptor left_desc = 1 [(gogoproto.nullable) = false];
   optional RangeDescriptor right_desc = 2 [(gogoproto.nullable) = false];
 }
@@ -139,6 +145,10 @@ enum ReplicaChangeType {
 }
 
 message ChangeReplicasTrigger {
+  option (gogoproto.equal) = true;
+
+  option (gogoproto.goproto_stringer) = false;
+
   optional ReplicaChangeType change_type = 1 [(gogoproto.nullable) = false];
   // The replica being modified.
   optional ReplicaDescriptor replica = 2 [(gogoproto.nullable) = false];
@@ -151,6 +161,8 @@ message ChangeReplicasTrigger {
 // ModifiedSpanTrigger indicates that a specific span has been modified.
 // This can be used to trigger scan-and-gossip for the given span.
 message ModifiedSpanTrigger {
+  option (gogoproto.equal) = true;
+
   optional bool system_config_span = 1 [(gogoproto.nullable) = false];
   // node_liveness_span is set to indicate that node liveness records
   // need re-gossiping after modification or range lease updates. The
@@ -164,6 +176,8 @@ message ModifiedSpanTrigger {
 // InternalCommitTrigger encapsulates all of the internal-only commit triggers.
 // Only one may be set.
 message InternalCommitTrigger {
+  option (gogoproto.equal) = true;
+
   // InternalCommitTrigger is always nullable, and these getters are
   // nil-safe, which is often convenient.
   option (gogoproto.goproto_getters) = true;
@@ -196,6 +210,16 @@ enum TransactionStatus {
   ABORTED = 2;
 }
 
+message ObservedTimestamp {
+  option (gogoproto.equal) = true;
+
+  option (gogoproto.populate) = true;
+
+  optional int32 node_id = 1 [(gogoproto.nullable) = false,
+      (gogoproto.customname) = "NodeID", (gogoproto.casttype) = "NodeID"];
+  optional util.hlc.Timestamp timestamp = 2 [(gogoproto.nullable) = false];
+}
+
 // A Transaction is a unit of work performed on the database.
 // Cockroach transactions support two isolation levels: snapshot
 // isolation and serializable snapshot isolation. Each Cockroach
@@ -206,6 +230,8 @@ enum TransactionStatus {
 // If you add fields to Transaction you'll need to update
 // Transaction.Clone. Failure to do so will result in test failures.
 message Transaction {
+  option (gogoproto.equal) = true;
+
   option (gogoproto.goproto_stringer) = false;
   option (gogoproto.populate) = true;
 
@@ -214,41 +240,48 @@ message Transaction {
   // A free-text identifier for debug purposes.
   optional string name = 2 [(gogoproto.nullable) = false];
   optional TransactionStatus status = 4 [(gogoproto.nullable) = false];
-  // The last heartbeat timestamp.
-  optional util.hlc.Timestamp last_heartbeat = 5;
+  optional util.hlc.Timestamp last_heartbeat = 5 [(gogoproto.nullable) = false];
   // The original timestamp at which the transaction started. For serializable
   // transactions, if the timestamp drifts from the original timestamp, the
   // transaction will retry.
   //
   // This timestamp is the one at which all transactions will read. It is also,
-  // surprisingly, the timestamp at which transactions will _write_. This is
-  // ultimately because of correctness concerns around SNAPSHOT transactions.
-  // Note first that for SERIALIZABLE transactions, the original and commit
-  // timestamps must not diverge, and so an intent which may be committed is
-  // always written when both timestamps coincide.
+  // surprisingly, the timestamp at which transactions will provisionally
+  // _write_ (i.e. intents are written at this orig_timestamp and, after commit,
+  // when the intents are resolved, their timestamps are bumped to the to the
+  // commit timestamp).
+  // This is ultimately because of correctness concerns around SNAPSHOT
+  // transactions.  Note first that for SERIALIZABLE transactions, the original
+  // and commit timestamps must not diverge, and so an intent which may be
+  // committed is always written when both timestamps coincide.
   //
   // For a SNAPSHOT transaction however, this is not the case. Intuitively,
   // one could think that the timestamp at which intents should be written
   // should be the provisional commit timestamp, and while this is morally
   // true, consider the following scenario, where txn1 is a SNAPSHOT txn:
   //
-  // - txn1 at orig_timestamp=5 reads key1: {Amount: 1, Price: 10}
+  // - txn1 at orig_timestamp=5 reads key1: (value) 1.
   // - txn1 writes elsewhere, has its commit timestamp increased to 20.
-  // - txn2 at orig_timestamp=10 reads key1: {Amount: 1, Price: 10}
-  // - txn2 increases Price by 5: {Amount: 1, Price: 15} and commits
-  // - txn1 increases Amount by 1: {Amount: 2, Price: 10}, attempts commit
+  // - txn2 at orig_timestamp=10 reads key1: 1
+  // - txn2 increases the value by 5: key1: 6 and commits
+  // - txn1 increases the value by 1: key1: 2, attempts commit
   //
   // If txn1 uses its orig_timestamp for updating key1 (as it does), it
   // conflicts with txn2's committed value (which is at timestamp 10, in the
   // future of 5), and restarts.
   // Using instead its candidate commit timestamp, it wouldn't see a conflict
-  // and commit, but this is not the expected outcome {Amount: 2, Price: 15}
-  // and we are experiencing the Lost Update Anomaly.
+  // and commit, but this is not the expected outcome (the expected outcome is
+  // {key1: 6} (since txn2 is not expected to commit)) and we would be
+  // experiencing the Lost Update Anomaly.
   //
   // Note that in practice, before restarting, txn1 would still lay down an
   // intent (just above the committed value) not with the intent to commit it,
   // but to avoid being starved by short-lived transactions on that key which
   // would otherwise not have to go through conflict resolution with txn1.
+  //
+  // Again, keep in mind that, when the transaction commits, all the intents are
+  // bumped to the commit timestamp (otherwise, pushing a transaction wouldn't
+  // achieve anything).
   optional util.hlc.Timestamp orig_timestamp = 6 [(gogoproto.nullable) = false];
   // Initial Timestamp + clock skew. Reads which encounter values with
   // timestamps between timestamp and max_timestamp trigger a txn
@@ -257,15 +290,19 @@ message Transaction {
   // The case max_timestamp < timestamp is possible for transactions which have
   // been pushed; in this case, max_timestamp should be ignored.
   optional util.hlc.Timestamp max_timestamp = 7 [(gogoproto.nullable) = false];
-  // A map of NodeID to timestamps as observed from their local clock during
-  // this transaction. The purpose of this map is to avoid uncertainty related
-  // restarts which normally occur when reading a value in the near future as
-  // per the max_timestamp field.
-  // When this map holds a corresponding entry for the node the current request
-  // is executing on, we can run the command with the map's timestamp as the
-  // top boundary of our uncertainty interval, limiting (and often avoiding)
-  // uncertainty restarts.
-  map<int32, util.hlc.Timestamp> observed_timestamps = 8 [(gogoproto.nullable) = false, (gogoproto.castkey) = "NodeID"];
+  // A list of <NodeID, timestamp> pairs. The list maps NodeIDs to timestamps
+  // as observed from their local clock during this transaction. The purpose of
+  // this map is to avoid uncertainty related restarts which normally occur
+  // when reading a value in the near future as per the max_timestamp field.
+  //
+  // When this list holds a corresponding entry for the node the current
+  // request is executing on, we can run the command with the map's timestamp
+  // as the top boundary of our uncertainty interval, limiting (and often
+  // avoiding) uncertainty restarts.
+  //
+  // The list of observed timestamps is kept sorted by NodeID. Use
+  // Transaction.UpdateObservedTimestamp to maintain the sorted order.
+  repeated ObservedTimestamp observed_timestamps = 8 [(gogoproto.nullable) = false];
   // Writing is true if the transaction has previously executed a successful
   // write request, i.e. a request that may have left intents (across retries).
   optional bool writing = 9 [(gogoproto.nullable) = false];
@@ -287,6 +324,8 @@ message Transaction {
 
 // A Intent is a Span together with a Transaction metadata and its status.
 message Intent {
+  option (gogoproto.equal) = true;
+
   optional Span span = 1 [(gogoproto.nullable) = false, (gogoproto.embed) = true];
   optional storage.engine.enginepb.TxnMeta txn = 2 [(gogoproto.nullable) = false];
   optional TransactionStatus status = 3 [(gogoproto.nullable) = false];
@@ -295,6 +334,8 @@ message Intent {
 // Lease contains information about range leases including the
 // expiration and lease holder.
 message Lease {
+  option (gogoproto.equal) = true;
+
   option (gogoproto.goproto_stringer) = false;
   option (gogoproto.populate) = true;
 

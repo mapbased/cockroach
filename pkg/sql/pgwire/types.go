@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Ben Darnell
 
 package pgwire
 
@@ -20,7 +18,6 @@ import (
 	"bytes"
 	"encoding/binary"
 	"encoding/hex"
-	"fmt"
 	"math"
 	"math/big"
 	"strconv"
@@ -28,7 +25,6 @@ import (
 	"time"
 
 	"golang.org/x/net/context"
-	"gopkg.in/inf.v0"
 
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/util/duration"
@@ -79,60 +75,30 @@ type pgNumeric struct {
 }
 
 func pgTypeForParserType(t parser.Type) pgType {
-	// Compare all types that can rely on == equality.
-	switch t {
-	case parser.TypeNull:
-		return pgType{oid: oid.T_unknown}
-	case parser.TypeBool:
-		return pgType{oid.T_bool, 1}
-	case parser.TypeBytes:
-		return pgType{oid.T_bytea, -1}
-	case parser.TypeInt:
-		return pgType{oid.T_int8, 8}
-	case parser.TypeFloat:
-		return pgType{oid.T_float8, 8}
-	case parser.TypeDecimal:
-		return pgType{oid.T_numeric, -1}
-	case parser.TypeString:
-		return pgType{oid.T_text, -1}
-	case parser.TypeDate:
-		return pgType{oid.T_date, 8}
-	case parser.TypeTimestamp:
-		return pgType{oid.T_timestamp, 8}
-	case parser.TypeTimestampTZ:
-		return pgType{oid.T_timestamptz, 8}
-	case parser.TypeInterval:
-		return pgType{oid.T_interval, 8}
-	case parser.TypeStringArray:
-		return pgType{oid.T__text, -1}
-	case parser.TypeIntArray:
-		return pgType{oid.T__int8, -1}
-	default:
-		// Compare all types that cannot rely on == equality.
-		istype := t.FamilyEqual
-		switch {
-		case istype(parser.TypeCollatedString):
-			return pgType{oid.T_unknown, -1}
-		case istype(parser.TypeTuple):
-			return pgType{oid.T_record, -1}
-		default:
-			panic(fmt.Sprintf("unsupported type %s", t))
-		}
+	size := -1
+	if s, variable := t.Size(); !variable {
+		size = int(s)
+	}
+	return pgType{
+		oid:  t.Oid(),
+		size: size,
 	}
 }
 
 const secondsInDay = 24 * 60 * 60
 
-func (b *writeBuffer) writeTextDatum(d parser.Datum, sessionLoc *time.Location) {
+func (b *writeBuffer) writeTextDatum(
+	ctx context.Context, d parser.Datum, sessionLoc *time.Location,
+) {
 	if log.V(2) {
-		log.Infof(context.TODO(), "pgwire writing TEXT datum of type: %T, %#v", d, d)
+		log.Infof(ctx, "pgwire writing TEXT datum of type: %T, %#v", d, d)
 	}
 	if d == parser.DNull {
 		// NULL is encoded as -1; all other values have a length prefix.
 		b.putInt32(-1)
 		return
 	}
-	switch v := d.(type) {
+	switch v := parser.UnwrapDatum(d).(type) {
 	case *parser.DBool:
 		b.putInt32(1)
 		if *v {
@@ -167,6 +133,9 @@ func (b *writeBuffer) writeTextDatum(d parser.Datum, sessionLoc *time.Location) 
 		b.putInt32(int32(len(result)))
 		b.write(result)
 
+	case *parser.DUuid:
+		b.writeLengthPrefixedString(v.UUID.String())
+
 	case *parser.DString:
 		b.writeLengthPrefixedString(string(*v))
 
@@ -197,7 +166,7 @@ func (b *writeBuffer) writeTextDatum(d parser.Datum, sessionLoc *time.Location) 
 
 	case *parser.DTuple:
 		b.variablePutbuf.WriteString("(")
-		for i, d := range *v {
+		for i, d := range v.D {
 			if i > 0 {
 				b.variablePutbuf.WriteString(",")
 			}
@@ -205,37 +174,52 @@ func (b *writeBuffer) writeTextDatum(d parser.Datum, sessionLoc *time.Location) 
 				// Emit nothing on NULL.
 				continue
 			}
-			d.Format(&b.variablePutbuf, parser.FmtSimple)
+			parser.FormatNode(&b.variablePutbuf, parser.FmtSimple, d)
 		}
 		b.variablePutbuf.WriteString(")")
 		b.writeLengthPrefixedVariablePutbuf()
 
 	case *parser.DArray:
-		b.variablePutbuf.WriteString("{")
+		// Arrays are serialized as a string of comma-separated values, surrounded
+		// by braces.
+		begin, sep, end := "{", ",", "}"
+
+		if d.ResolvedType().Oid() == oid.T_int2vector {
+			// int2vectors are serialized as a string of space-separated values.
+			begin, sep, end = "", " ", ""
+		}
+
+		b.variablePutbuf.WriteString(begin)
 		for i, d := range v.Array {
 			if i > 0 {
-				b.variablePutbuf.WriteString(",")
+				b.variablePutbuf.WriteString(sep)
 			}
-			d.Format(&b.variablePutbuf, parser.FmtBareStrings)
+			// TODO(justin): add a test for nested arrays.
+			parser.FormatNode(&b.variablePutbuf, parser.FmtArrays, d)
 		}
-		b.variablePutbuf.WriteString("}")
+		b.variablePutbuf.WriteString(end)
 		b.writeLengthPrefixedVariablePutbuf()
+
+	case *parser.DOid:
+		b.writeLengthPrefixedDatum(v)
 
 	default:
 		b.setError(errors.Errorf("unsupported type %T", d))
 	}
 }
 
-func (b *writeBuffer) writeBinaryDatum(d parser.Datum, sessionLoc *time.Location) {
+func (b *writeBuffer) writeBinaryDatum(
+	ctx context.Context, d parser.Datum, sessionLoc *time.Location,
+) {
 	if log.V(2) {
-		log.Infof(context.TODO(), "pgwire writing BINARY datum of type: %T, %#v", d, d)
+		log.Infof(ctx, "pgwire writing BINARY datum of type: %T, %#v", d, d)
 	}
 	if d == parser.DNull {
 		// NULL is encoded as -1; all other values have a length prefix.
 		b.putInt32(-1)
 		return
 	}
-	switch v := d.(type) {
+	switch v := parser.UnwrapDatum(d).(type) {
 	case *parser.DBool:
 		b.putInt32(1)
 		if *v {
@@ -259,7 +243,9 @@ func (b *writeBuffer) writeBinaryDatum(d parser.Datum, sessionLoc *time.Location
 			bigI big.Int
 		}{
 			pgNum: pgNumeric{
-				dscale: int16(v.Scale()),
+				// Since we use 2000 as the exponent limits in parser.DecimalCtx, this
+				// conversion should not overflow.
+				dscale: int16(-v.Exponent),
 			},
 		}
 
@@ -274,7 +260,7 @@ func (b *writeBuffer) writeBinaryDatum(d parser.Datum, sessionLoc *time.Location
 		}
 
 		// Mostly cribbed from libpqtypes' str2num.
-		digits := strings.TrimLeftFunc(alloc.bigI.Abs(v.UnscaledBig()).String(), isZero)
+		digits := strings.TrimLeftFunc(alloc.bigI.Abs(&v.Coeff).String(), isZero)
 		dweight := len(digits) - int(alloc.pgNum.dscale) - 1
 		digits = strings.TrimRightFunc(digits, isZero)
 
@@ -319,6 +305,10 @@ func (b *writeBuffer) writeBinaryDatum(d parser.Datum, sessionLoc *time.Location
 		b.putInt32(int32(len(*v)))
 		b.write([]byte(*v))
 
+	case *parser.DUuid:
+		b.putInt32(16)
+		b.write(v.GetBytes())
+
 	case *parser.DString:
 		b.writeLengthPrefixedString(string(*v))
 
@@ -337,6 +327,30 @@ func (b *writeBuffer) writeBinaryDatum(d parser.Datum, sessionLoc *time.Location
 		b.putInt32(4)
 		b.putInt32(dateToPgBinary(v))
 
+	case *parser.DArray:
+		if v.ParamTyp.FamilyEqual(parser.TypeAnyArray) {
+			b.setError(errors.New("unsupported binary serialization of multidimensional arrays"))
+			return
+		}
+		subWriter := &writeBuffer{wrapped: b.variablePutbuf}
+		// Put the number of dimensions. We currently support 1d arrays only.
+		subWriter.putInt32(1)
+		hasNulls := 0
+		if v.HasNulls {
+			hasNulls = 1
+		}
+		subWriter.putInt32(int32(hasNulls))
+		subWriter.putInt32(int32(v.ParamTyp.Oid()))
+		subWriter.putInt32(int32(v.Len()))
+		subWriter.putInt32(int32(v.Len()))
+		for _, elem := range v.Array {
+			subWriter.writeBinaryDatum(ctx, elem, sessionLoc)
+		}
+		b.variablePutbuf = subWriter.wrapped
+		b.writeLengthPrefixedVariablePutbuf()
+	case *parser.DOid:
+		b.putInt32(4)
+		b.putInt32(int32(v.DInt))
 	default:
 		b.setError(errors.Errorf("unsupported type %T", d))
 	}
@@ -375,25 +389,6 @@ func formatTs(t time.Time, offset *time.Location, tmp []byte) (b []byte) {
 		b = append(b, " BC"...)
 	}
 	return b
-}
-
-// parseTs parses timestamps in any of the formats that Postgres accepts over
-// the wire protocol.
-//
-// Postgres is lenient in what it accepts as a timestamp, so we must also be
-// lenient. As new drivers are used with CockroachDB and formats are found that
-// we don't support but Postgres does, add them here. Then create an integration
-// test for the driver and add a case to TestParseTs.
-func parseTs(str string) (time.Time, error) {
-	// RFC3339Nano is sent by github.com/lib/pq (go).
-	if ts, err := time.Parse(time.RFC3339Nano, str); err == nil {
-		return ts, nil
-	}
-
-	// pq.ParseTimestamp parses the timestamp format that both Postgres and
-	// CockroachDB send in responses, so this allows roundtripping of the encoded
-	// timestamps that we send.
-	return pq.ParseTimestamp(nil, str)
 }
 
 var (
@@ -438,122 +433,169 @@ func pgBinaryToDate(i int32) *parser.DDate {
 // decodeOidDatum decodes bytes with specified Oid and format code into
 // a datum.
 func decodeOidDatum(id oid.Oid, code formatCode, b []byte) (parser.Datum, error) {
-	var d parser.Datum
-	switch id {
-	case oid.T_bool:
-		switch code {
-		case formatText:
-			v, err := strconv.ParseBool(string(b))
+	switch code {
+	case formatText:
+		switch id {
+		case oid.T_bool:
+			t, err := strconv.ParseBool(string(b))
 			if err != nil {
-				return d, err
+				return nil, err
 			}
-			d = parser.MakeDBool(parser.DBool(v))
-		case formatBinary:
-			switch b[0] {
-			case 0:
-				d = parser.MakeDBool(false)
-			case 1:
-				d = parser.MakeDBool(true)
-			default:
-				return d, errors.Errorf("unsupported binary bool: %q", b)
-			}
-		default:
-			return d, errors.Errorf("unsupported bool format code: %d", code)
-		}
-	case oid.T_int2:
-		switch code {
-		case formatText:
+			return parser.MakeDBool(parser.DBool(t)), nil
+		case oid.T_int2, oid.T_int4, oid.T_int8:
 			i, err := strconv.ParseInt(string(b), 10, 64)
 			if err != nil {
-				return d, err
+				return nil, err
 			}
-			d = parser.NewDInt(parser.DInt(i))
-		case formatBinary:
-			if len(b) < 2 {
-				return d, errors.Errorf("int2 requires 2 bytes for binary format")
-			}
-			i := int16(binary.BigEndian.Uint16(b))
-			d = parser.NewDInt(parser.DInt(i))
-		default:
-			return d, errors.Errorf("unsupported int2 format code: %d", code)
-		}
-	case oid.T_int4:
-		switch code {
-		case formatText:
-			i, err := strconv.ParseInt(string(b), 10, 64)
+			return parser.NewDInt(parser.DInt(i)), nil
+		case oid.T_oid:
+			u, err := strconv.ParseUint(string(b), 10, 32)
 			if err != nil {
-				return d, err
+				return nil, err
 			}
-			d = parser.NewDInt(parser.DInt(i))
-		case formatBinary:
-			if len(b) < 4 {
-				return d, errors.Errorf("int4 requires 4 bytes for binary format")
-			}
-			i := int32(binary.BigEndian.Uint32(b))
-			d = parser.NewDInt(parser.DInt(i))
-		default:
-			return d, errors.Errorf("unsupported int4 format code: %d", code)
-		}
-	case oid.T_int8:
-		switch code {
-		case formatText:
-			i, err := strconv.ParseInt(string(b), 10, 64)
-			if err != nil {
-				return d, err
-			}
-			d = parser.NewDInt(parser.DInt(i))
-		case formatBinary:
-			if len(b) < 8 {
-				return d, errors.Errorf("int8 requires 8 bytes for binary format")
-			}
-			i := int64(binary.BigEndian.Uint64(b))
-			d = parser.NewDInt(parser.DInt(i))
-		default:
-			return d, errors.Errorf("unsupported int8 format code: %d", code)
-		}
-	case oid.T_float4:
-		switch code {
-		case formatText:
+			return parser.NewDOid(parser.DInt(u)), nil
+		case oid.T_float4, oid.T_float8:
 			f, err := strconv.ParseFloat(string(b), 64)
 			if err != nil {
-				return d, err
+				return nil, err
 			}
-			d = parser.NewDFloat(parser.DFloat(f))
-		case formatBinary:
-			if len(b) < 4 {
-				return d, errors.Errorf("float4 requires 4 bytes for binary format")
-			}
-			f := math.Float32frombits(binary.BigEndian.Uint32(b))
-			d = parser.NewDFloat(parser.DFloat(f))
-		default:
-			return d, errors.Errorf("unsupported float4 format code: %d", code)
-		}
-	case oid.T_float8:
-		switch code {
-		case formatText:
-			f, err := strconv.ParseFloat(string(b), 64)
+			return parser.NewDFloat(parser.DFloat(f)), nil
+		case oid.T_numeric:
+			d, err := parser.ParseDDecimal(string(b))
 			if err != nil {
-				return d, err
-			}
-			d = parser.NewDFloat(parser.DFloat(f))
-		case formatBinary:
-			if len(b) < 8 {
-				return d, errors.Errorf("float8 requires 8 bytes for binary format")
-			}
-			f := math.Float64frombits(binary.BigEndian.Uint64(b))
-			d = parser.NewDFloat(parser.DFloat(f))
-		default:
-			return d, errors.Errorf("unsupported float8 format code: %d", code)
-		}
-	case oid.T_numeric:
-		switch code {
-		case formatText:
-			dd := &parser.DDecimal{}
-			if _, ok := dd.SetString(string(b)); !ok {
 				return nil, errors.Errorf("could not parse string %q as decimal", b)
 			}
-			d = dd
-		case formatBinary:
+			return d, nil
+		case oid.T_bytea:
+			// http://www.postgresql.org/docs/current/static/datatype-binary.html#AEN5667
+			// Code cribbed from github.com/lib/pq.
+
+			// We only support hex encoding.
+			if len(b) >= 2 && bytes.Equal(b[:2], []byte("\\x")) {
+				b = b[2:] // trim off leading "\\x"
+				result := make([]byte, hex.DecodedLen(len(b)))
+				if _, err := hex.Decode(result, b); err != nil {
+					return nil, err
+				}
+				return parser.NewDBytes(parser.DBytes(result)), nil
+			}
+			return nil, errors.Errorf("unsupported bytea encoding: %q", b)
+		case oid.T_timestamp:
+			d, err := parser.ParseDTimestamp(string(b), time.Microsecond)
+			if err != nil {
+				return nil, errors.Errorf("could not parse string %q as timestamp", b)
+			}
+			return d, nil
+		case oid.T_timestamptz:
+			d, err := parser.ParseDTimestampTZ(string(b), time.UTC, time.Microsecond)
+			if err != nil {
+				return nil, errors.Errorf("could not parse string %q as timestamptz", b)
+			}
+			return d, nil
+		case oid.T_date:
+			ts, err := parser.ParseDTimestamp(string(b), time.Microsecond)
+			if err != nil {
+				res, err := parser.ParseDDate(string(b), time.UTC)
+				if err != nil {
+					return nil, errors.Errorf("could not parse string %q as date", b)
+				}
+				return res, nil
+			}
+			daysSinceEpoch := ts.Unix() / secondsInDay
+			return parser.NewDDate(parser.DDate(daysSinceEpoch)), nil
+		case oid.T_interval:
+			d, err := parser.ParseDInterval(string(b))
+			if err != nil {
+				return nil, errors.Errorf("could not parse string %q as interval", b)
+			}
+			return d, nil
+		case oid.T_uuid:
+			d, err := parser.ParseDUuidFromString(string(b))
+			if err != nil {
+				return nil, errors.Errorf("could not parse string %q as uuid", b)
+			}
+			return d, nil
+		case oid.T__int2, oid.T__int4, oid.T__int8:
+			var arr pq.Int64Array
+			if err := (&arr).Scan(b); err != nil {
+				return nil, err
+			}
+			out := parser.NewDArray(parser.TypeInt)
+			for _, v := range arr {
+				if err := out.Append(parser.NewDInt(parser.DInt(v))); err != nil {
+					return nil, err
+				}
+			}
+			return out, nil
+		case oid.T__text, oid.T__name:
+			var arr pq.StringArray
+			if err := (&arr).Scan(b); err != nil {
+				return nil, err
+			}
+			out := parser.NewDArray(parser.TypeString)
+			if id == oid.T__name {
+				out.ParamTyp = parser.TypeName
+			}
+			for _, v := range arr {
+				var s parser.Datum = parser.NewDString(v)
+				if id == oid.T__name {
+					s = parser.NewDNameFromDString(s.(*parser.DString))
+				}
+				if err := out.Append(s); err != nil {
+					return nil, err
+				}
+			}
+			return out, nil
+		}
+	case formatBinary:
+		switch id {
+		case oid.T_bool:
+			if len(b) > 0 {
+				switch b[0] {
+				case 0:
+					return parser.MakeDBool(false), nil
+				case 1:
+					return parser.MakeDBool(true), nil
+				}
+			}
+			return nil, errors.Errorf("unsupported binary bool: %x", b)
+		case oid.T_int2:
+			if len(b) < 2 {
+				return nil, errors.Errorf("int2 requires 2 bytes for binary format")
+			}
+			i := int16(binary.BigEndian.Uint16(b))
+			return parser.NewDInt(parser.DInt(i)), nil
+		case oid.T_int4:
+			if len(b) < 4 {
+				return nil, errors.Errorf("int4 requires 4 bytes for binary format")
+			}
+			i := int32(binary.BigEndian.Uint32(b))
+			return parser.NewDInt(parser.DInt(i)), nil
+		case oid.T_int8:
+			if len(b) < 8 {
+				return nil, errors.Errorf("int8 requires 8 bytes for binary format")
+			}
+			i := int64(binary.BigEndian.Uint64(b))
+			return parser.NewDInt(parser.DInt(i)), nil
+		case oid.T_oid:
+			if len(b) < 4 {
+				return nil, errors.Errorf("oid requires 4 bytes for binary format")
+			}
+			u := binary.BigEndian.Uint32(b)
+			return parser.NewDOid(parser.DInt(u)), nil
+		case oid.T_float4:
+			if len(b) < 4 {
+				return nil, errors.Errorf("float4 requires 4 bytes for binary format")
+			}
+			f := math.Float32frombits(binary.BigEndian.Uint32(b))
+			return parser.NewDFloat(parser.DFloat(f)), nil
+		case oid.T_float8:
+			if len(b) < 8 {
+				return nil, errors.Errorf("float8 requires 8 bytes for binary format")
+			}
+			f := math.Float64frombits(binary.BigEndian.Uint64(b))
+			return parser.NewDFloat(parser.DFloat(f)), nil
+		case oid.T_numeric:
 			r := bytes.NewReader(b)
 
 			alloc := struct {
@@ -570,7 +612,7 @@ func decodeOidDatum(id oid.Oid, code formatCode, b []byte) (parser.Datum, error)
 				&alloc.pgNum.dscale,
 			} {
 				if err := binary.Read(r, binary.BigEndian, ptr); err != nil {
-					return d, err
+					return nil, err
 				}
 			}
 
@@ -592,7 +634,7 @@ func decodeOidDatum(id oid.Oid, code formatCode, b []byte) (parser.Datum, error)
 
 				for i := int16(0); i < alloc.pgNum.ndigits-1; i++ {
 					if err := nextDigit(); err != nil {
-						return d, err
+						return nil, err
 					}
 					if alloc.i16 > 0 {
 						decDigits = strconv.AppendUint(decDigits, uint64(alloc.i16), 10)
@@ -601,7 +643,7 @@ func decodeOidDatum(id oid.Oid, code formatCode, b []byte) (parser.Datum, error)
 
 				// The last digit may contain padding, which we need to deal with.
 				if err := nextDigit(); err != nil {
-					return d, err
+					return nil, err
 				}
 				dscale := (alloc.pgNum.ndigits - (alloc.pgNum.weight + 1)) * pgDecDigits
 				if overScale := dscale - alloc.pgNum.dscale; overScale > 0 {
@@ -612,124 +654,102 @@ func decodeOidDatum(id oid.Oid, code formatCode, b []byte) (parser.Datum, error)
 				}
 				decDigits = strconv.AppendUint(decDigits, uint64(alloc.i16), 10)
 				decString := string(decDigits)
-				if _, ok := alloc.dd.UnscaledBig().SetString(decString, 10); !ok {
+				if _, ok := alloc.dd.Coeff.SetString(decString, 10); !ok {
 					return nil, errors.Errorf("could not parse string %q as decimal", decString)
 				}
-				alloc.dd.SetScale(inf.Scale(dscale))
+				alloc.dd.SetExponent(-int32(dscale))
 			}
 
 			switch alloc.pgNum.sign {
 			case pgNumericPos:
 			case pgNumericNeg:
-				alloc.dd.Neg(&alloc.dd.Dec)
+				alloc.dd.Neg(&alloc.dd.Decimal)
 			default:
-				return d, errors.Errorf("unsupported numeric sign: %d", alloc.pgNum.sign)
+				return nil, errors.Errorf("unsupported numeric sign: %d", alloc.pgNum.sign)
 			}
 
-			d = &alloc.dd
-		default:
-			return d, errors.Errorf("unsupported numeric format code: %d", code)
-		}
-	case oid.T_text, oid.T_varchar:
-		switch code {
-		case formatText, formatBinary:
-			d = parser.NewDString(string(b))
-		default:
-			return d, errors.Errorf("unsupported text format code: %d", code)
-		}
-	case oid.T_bytea:
-		switch code {
-		case formatText:
-			// http://www.postgresql.org/docs/current/static/datatype-binary.html#AEN5667
-			// Code cribbed from github.com/lib/pq.
-
-			// We only support hex encoding.
-			if len(b) >= 2 && bytes.Equal(b[:2], []byte("\\x")) {
-				b = b[2:] // trim off leading "\\x"
-				result := make([]byte, hex.DecodedLen(len(b)))
-				_, err := hex.Decode(result, b)
-				if err != nil {
-					return d, err
-				}
-				d = parser.NewDBytes(parser.DBytes(result))
-			} else {
-				return d, errors.Errorf("unsupported bytea encoding: %q", b)
-			}
-		case formatBinary:
-			d = parser.NewDBytes(parser.DBytes(b))
-		default:
-			return d, errors.Errorf("unsupported bytea format code: %d", code)
-		}
-	case oid.T_timestamp:
-		switch code {
-		case formatText:
-			ts, err := parseTs(string(b))
-			if err != nil {
-				return d, errors.Errorf("could not parse string %q as timestamp", b)
-			}
-			d = parser.MakeDTimestamp(ts, time.Microsecond)
-		case formatBinary:
+			return &alloc.dd, nil
+		case oid.T_bytea:
+			return parser.NewDBytes(parser.DBytes(b)), nil
+		case oid.T_timestamp:
 			if len(b) < 8 {
-				return d, errors.Errorf("timestamp requires 8 bytes for binary format")
+				return nil, errors.Errorf("timestamp requires 8 bytes for binary format")
 			}
 			i := int64(binary.BigEndian.Uint64(b))
-			d = parser.MakeDTimestamp(pgBinaryToTime(i), time.Microsecond)
-		default:
-			return d, errors.Errorf("unsupported timestamp format code: %d", code)
-		}
-	case oid.T_timestamptz:
-		switch code {
-		case formatText:
-			ts, err := parseTs(string(b))
-			if err != nil {
-				return d, errors.Errorf("could not parse string %q as timestamp", b)
-			}
-			d = parser.MakeDTimestampTZ(ts, time.Microsecond)
-		case formatBinary:
+			return parser.MakeDTimestamp(pgBinaryToTime(i), time.Microsecond), nil
+		case oid.T_timestamptz:
 			if len(b) < 8 {
-				return d, errors.Errorf("timestamptz requires 8 bytes for binary format")
+				return nil, errors.Errorf("timestamptz requires 8 bytes for binary format")
 			}
 			i := int64(binary.BigEndian.Uint64(b))
-			d = parser.MakeDTimestampTZ(pgBinaryToTime(i), time.Microsecond)
-		default:
-			return d, errors.Errorf("unsupported timestamptz format code: %d", code)
-		}
-	case oid.T_date:
-		switch code {
-		case formatText:
-			ts, err := parseTs(string(b))
-			if err != nil {
-				res, err := parser.ParseDDate(string(b), time.UTC)
-				if err != nil {
-					return d, errors.Errorf("could not parse string %q as date", b)
-				}
-				d = res
-			} else {
-				daysSinceEpoch := ts.Unix() / secondsInDay
-				d = parser.NewDDate(parser.DDate(daysSinceEpoch))
-			}
-		case formatBinary:
+			return parser.MakeDTimestampTZ(pgBinaryToTime(i), time.Microsecond), nil
+		case oid.T_date:
 			if len(b) < 4 {
-				return d, errors.Errorf("date requires 4 bytes for binary format")
+				return nil, errors.Errorf("date requires 4 bytes for binary format")
 			}
 			i := int32(binary.BigEndian.Uint32(b))
-			d = pgBinaryToDate(i)
-		default:
-			return d, errors.Errorf("unsupported date format code: %d", code)
-		}
-	case oid.T_interval:
-		switch code {
-		case formatText:
-			d, err := parser.ParseDInterval(string(b))
+			return pgBinaryToDate(i), nil
+		case oid.T_uuid:
+			u, err := parser.ParseDUuidFromBytes(b)
 			if err != nil {
-				return d, errors.Errorf("could not parse string %q as interval", b)
+				return nil, err
 			}
-			return d, nil
-		default:
-			return d, errors.Errorf("unsupported interval format code: %d", code)
+			return u, nil
+		case oid.T__int2, oid.T__int4, oid.T__int8, oid.T__text, oid.T__name:
+			return decodeBinaryArray(b, code)
 		}
 	default:
-		return d, errors.Errorf("unsupported OID: %v", id)
+		return nil, errors.Errorf("unsupported format code: %s", code)
 	}
-	return d, nil
+
+	// Types with identical text/binary handling.
+	switch id {
+	case oid.T_text, oid.T_varchar:
+		return parser.NewDString(string(b)), nil
+	case oid.T_name:
+		return parser.NewDName(string(b)), nil
+	default:
+		return nil, errors.Errorf("unsupported OID %v with format code %s", id, code)
+	}
+}
+
+func decodeBinaryArray(b []byte, code formatCode) (parser.Datum, error) {
+	hdr := struct {
+		Ndims int32
+		// Nullflag
+		_       int32
+		ElemOid int32
+		// The next two fields should be arrays of size Ndims. However, since
+		// we only support 1-dimensional arrays for now, for convenience we can
+		// leave them in this struct as such for `binary.Read` to parse for us.
+		DimSize int32
+		// Dim lower bound
+		_ int32
+	}{}
+	r := bytes.NewBuffer(b)
+	if err := binary.Read(r, binary.BigEndian, &hdr); err != nil {
+		return nil, err
+	}
+	// Only 1-dimensional arrays are supported for now.
+	if hdr.Ndims != 1 {
+		return nil, errors.Errorf("unsupported number of array dimensions: %d", hdr.Ndims)
+	}
+
+	elemOid := oid.Oid(hdr.ElemOid)
+	arr := parser.NewDArray(parser.OidToType[elemOid])
+	var vlen int32
+	for i := int32(0); i < hdr.DimSize; i++ {
+		if err := binary.Read(r, binary.BigEndian, &vlen); err != nil {
+			return nil, err
+		}
+		buf := r.Next(int(vlen))
+		elem, err := decodeOidDatum(elemOid, code, buf)
+		if err != nil {
+			return nil, err
+		}
+		if err := arr.Append(elem); err != nil {
+			return nil, err
+		}
+	}
+	return arr, nil
 }

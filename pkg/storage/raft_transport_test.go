@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Timothy Chen
 
 package storage_test
 
@@ -30,6 +28,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/gossip"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/rpc"
+	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/util"
@@ -39,6 +38,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/metric"
 	"github.com/cockroachdb/cockroach/pkg/util/netutil"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
+	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 )
 
 const channelServerBrokenRangeMessage = "channelServer broken range"
@@ -112,20 +112,20 @@ func newRaftTransportTestContext(t testing.TB) *raftTransportTestContext {
 		transports: map[roachpb.NodeID]*storage.RaftTransport{},
 	}
 	rttc.nodeRPCContext = rpc.NewContext(
-		log.AmbientContext{},
+		log.AmbientContext{Tracer: tracing.NewTracer()},
 		testutils.NewNodeTestBaseContext(),
 		hlc.NewClock(hlc.UnixNano, time.Nanosecond),
 		rttc.stopper,
 	)
 	server := rpc.NewServer(rttc.nodeRPCContext) // never started
 	rttc.gossip = gossip.NewTest(
-		1, rttc.nodeRPCContext, server, nil, rttc.stopper, metric.NewRegistry(),
+		1, rttc.nodeRPCContext, server, rttc.stopper, metric.NewRegistry(),
 	)
 	return rttc
 }
 
 func (rttc *raftTransportTestContext) Stop() {
-	rttc.stopper.Stop()
+	rttc.stopper.Stop(context.TODO())
 }
 
 // AddNode registers a node with the cluster. Nodes must be added
@@ -145,17 +145,18 @@ func (rttc *raftTransportTestContext) AddNodeWithoutGossip(
 	nodeID roachpb.NodeID, addr net.Addr, stopper *stop.Stopper,
 ) (*storage.RaftTransport, net.Addr) {
 	grpcServer := rpc.NewServer(rttc.nodeRPCContext)
-	ln, err := netutil.ListenAndServeGRPC(stopper, grpcServer, addr)
-	if err != nil {
-		rttc.t.Fatal(err)
-	}
 	transport := storage.NewRaftTransport(
-		log.AmbientContext{},
+		log.AmbientContext{Tracer: tracing.NewTracer()},
+		cluster.MakeClusterSettings(),
 		storage.GossipAddressResolver(rttc.gossip),
 		grpcServer,
 		rttc.nodeRPCContext,
 	)
 	rttc.transports[nodeID] = transport
+	ln, err := netutil.ListenAndServeGRPC(stopper, grpcServer, addr)
+	if err != nil {
+		rttc.t.Fatal(err)
+	}
 	return transport, ln.Addr()
 }
 
@@ -531,7 +532,7 @@ func TestReopenConnection(t *testing.T) {
 
 	// Take down the old server and start a new one at the same address.
 	serverTransport.Stop(serverReplica.StoreID)
-	serverStopper.Stop()
+	serverStopper.Stop(context.TODO())
 
 	replacementReplica := roachpb.ReplicaDescriptor{
 		NodeID:    3,

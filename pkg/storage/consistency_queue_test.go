@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Spencer Kimball (spencer@cockroachlabs.com)
 
 package storage_test
 
@@ -49,7 +47,7 @@ func TestConsistencyQueueRequiresLive(t *testing.T) {
 
 	// Stop a node and expire leases.
 	mtc.stopStore(2)
-	mtc.expireLeases()
+	mtc.advanceClock(context.TODO())
 
 	if shouldQ, priority := mtc.stores[0].ConsistencyQueueShouldQueue(
 		context.TODO(), mtc.clock.Now(), repl, config.SystemConfig{}); shouldQ {

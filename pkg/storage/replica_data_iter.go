@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Spencer Kimball (spencer.kimball@gmail.com)
 
 package storage
 
@@ -51,6 +49,9 @@ func makeReplicatedKeyRanges(d *roachpb.RangeDescriptor) []keyRange {
 	return makeReplicaKeyRanges(d, keys.MakeRangeIDReplicatedPrefix)
 }
 
+// makeReplicaKeyRanges returns a slice of 3 key ranges. The last key range in
+// the returned slice corresponds to the actual range data (i.e. not the range
+// metadata).
 func makeReplicaKeyRanges(
 	d *roachpb.RangeDescriptor, metaFunc func(roachpb.RangeID) roachpb.Key,
 ) []keyRange {
@@ -112,7 +113,7 @@ func (ri *ReplicaDataIterator) Next() {
 // invalid.
 func (ri *ReplicaDataIterator) advance() {
 	for {
-		if !ri.Valid() || ri.iterator.Less(ri.ranges[ri.curIndex].end) {
+		if ok, _ := ri.Valid(); !ok || ri.iterator.Less(ri.ranges[ri.curIndex].end) {
 			return
 		}
 		ri.curIndex++
@@ -127,7 +128,7 @@ func (ri *ReplicaDataIterator) advance() {
 }
 
 // Valid returns true if the iterator currently points to a valid value.
-func (ri *ReplicaDataIterator) Valid() bool {
+func (ri *ReplicaDataIterator) Valid() (bool, error) {
 	return ri.iterator.Valid()
 }
 
@@ -139,11 +140,6 @@ func (ri *ReplicaDataIterator) Key() engine.MVCCKey {
 // Value returns the current value.
 func (ri *ReplicaDataIterator) Value() []byte {
 	return ri.iterator.Value()
-}
-
-// Error returns the error, if any, which the iterator encountered.
-func (ri *ReplicaDataIterator) Error() error {
-	return ri.iterator.Error()
 }
 
 // allocIterKeyValue returns ri.Key() and ri.Value() with the underlying

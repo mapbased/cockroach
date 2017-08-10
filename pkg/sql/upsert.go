@@ -11,14 +11,14 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Daniel Harrison (daniel.harrison@gmail.com)
 
 package sql
 
 import (
 	"bytes"
 	"fmt"
+
+	"golang.org/x/net/context"
 
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
@@ -34,11 +34,11 @@ var upsertExcludedTable = parser.TableName{TableName: "excluded"}
 type upsertHelper struct {
 	p                  *planner
 	evalExprs          []parser.TypedExpr
+	whereExpr          parser.TypedExpr
 	sourceInfo         *dataSourceInfo
 	excludedSourceInfo *dataSourceInfo
-	allExprsIdentity   bool
-	curSourceRow       parser.DTuple
-	curExcludedRow     parser.DTuple
+	curSourceRow       parser.Datums
+	curExcludedRow     parser.Datums
 
 	// This struct must be allocated on the heap and its location stay
 	// stable after construction because it implements
@@ -79,14 +79,16 @@ func (uh *upsertHelper) IndexedVarFormat(buf *bytes.Buffer, f parser.FmtFlags, i
 }
 
 func (p *planner) makeUpsertHelper(
+	ctx context.Context,
 	tn *parser.TableName,
 	tableDesc *sqlbase.TableDescriptor,
 	insertCols []sqlbase.ColumnDescriptor,
 	updateCols []sqlbase.ColumnDescriptor,
 	updateExprs parser.UpdateExprs,
 	upsertConflictIndex *sqlbase.IndexDescriptor,
+	whereClause *parser.Where,
 ) (*upsertHelper, error) {
-	defaultExprs, err := makeDefaultExprs(updateCols, &p.parser, &p.evalCtx)
+	defaultExprs, err := sqlbase.MakeDefaultExprs(updateCols, &p.parser, &p.evalCtx)
 	if err != nil {
 		return nil, err
 	}
@@ -97,22 +99,24 @@ func (p *planner) makeUpsertHelper(
 		if updateExpr.Tuple {
 			if t, ok := updateExpr.Expr.(*parser.Tuple); ok {
 				for _, e := range t.Exprs {
-					typ := updateCols[i].Type.ToDatumType()
-					e := fillDefault(e, typ, i, defaultExprs)
+					e = fillDefault(e, i, defaultExprs)
 					untupledExprs = append(untupledExprs, e)
 					i++
 				}
 			}
 		} else {
-			typ := updateCols[i].Type.ToDatumType()
-			e := fillDefault(updateExpr.Expr, typ, i, defaultExprs)
+			e := fillDefault(updateExpr.Expr, i, defaultExprs)
 			untupledExprs = append(untupledExprs, e)
 			i++
 		}
 	}
 
-	sourceInfo := newSourceInfoForSingleTable(*tn, makeResultColumns(tableDesc.Columns))
-	excludedSourceInfo := newSourceInfoForSingleTable(upsertExcludedTable, makeResultColumns(insertCols))
+	sourceInfo := newSourceInfoForSingleTable(
+		*tn, sqlbase.ResultColumnsFromColDescs(tableDesc.Columns),
+	)
+	excludedSourceInfo := newSourceInfoForSingleTable(
+		upsertExcludedTable, sqlbase.ResultColumnsFromColDescs(insertCols),
+	)
 
 	helper := &upsertHelper{
 		p:                  p,
@@ -123,8 +127,9 @@ func (p *planner) makeUpsertHelper(
 	var evalExprs []parser.TypedExpr
 	ivarHelper := parser.MakeIndexedVarHelper(helper, len(sourceInfo.sourceColumns)+len(excludedSourceInfo.sourceColumns))
 	sources := multiSourceInfo{sourceInfo, excludedSourceInfo}
-	for _, expr := range untupledExprs {
-		normExpr, err := p.analyzeExpr(expr, sources, ivarHelper, parser.TypeAny, false, "")
+	for i, expr := range untupledExprs {
+		typ := updateCols[i].Type.ToDatumType()
+		normExpr, err := p.analyzeExpr(ctx, expr, sources, ivarHelper, typ, true, "ON CONFLICT")
 		if err != nil {
 			return nil, err
 		}
@@ -132,48 +137,39 @@ func (p *planner) makeUpsertHelper(
 	}
 	helper.evalExprs = evalExprs
 
-	helper.allExprsIdentity = true
-	for i, expr := range evalExprs {
-		// analyzeExpr above has normalized all direct column names to ColumnItems.
-		c, ok := expr.(*parser.ColumnItem)
-		if !ok {
-			helper.allExprsIdentity = false
-			break
+	if whereClause != nil {
+		whereExpr, err := p.analyzeExpr(
+			ctx, whereClause.Expr, sources, ivarHelper, parser.TypeBool, true /* requireType */, "WHERE",
+		)
+		if err != nil {
+			return nil, err
 		}
-		if len(c.Selector) > 0 ||
-			!c.TableName.TableName.Equal(upsertExcludedTable.TableName) ||
-			c.ColumnName.Normalize() != parser.ReNormalizeName(updateCols[i].Name) {
-			helper.allExprsIdentity = false
-			break
+
+		// Make sure there are no aggregation/window functions in the filter
+		// (after subqueries have been expanded).
+		if err := p.parser.AssertNoAggregationOrWindowing(
+			whereExpr, "WHERE", p.session.SearchPath,
+		); err != nil {
+			return nil, err
 		}
+
+		helper.whereExpr = whereExpr
 	}
 
 	return helper, nil
 }
 
-func (uh *upsertHelper) expand() error {
-	for _, evalExpr := range uh.evalExprs {
-		if err := uh.p.expandSubqueryPlans(evalExpr); err != nil {
-			return err
-		}
+func (uh *upsertHelper) walkExprs(walk func(desc string, index int, expr parser.TypedExpr)) {
+	for i, evalExpr := range uh.evalExprs {
+		walk("eval", i, evalExpr)
 	}
-	return nil
-}
-
-func (uh *upsertHelper) start() error {
-	for _, evalExpr := range uh.evalExprs {
-		if err := uh.p.startSubqueryPlans(evalExpr); err != nil {
-			return err
-		}
-	}
-	return nil
 }
 
 // eval returns the values for the update case of an upsert, given the row
 // that would have been inserted and the existing (conflicting) values.
 func (uh *upsertHelper) eval(
-	insertRow parser.DTuple, existingRow parser.DTuple,
-) (parser.DTuple, error) {
+	insertRow parser.Datums, existingRow parser.Datums,
+) (parser.Datums, error) {
 	uh.curSourceRow = existingRow
 	uh.curExcludedRow = insertRow
 
@@ -188,8 +184,15 @@ func (uh *upsertHelper) eval(
 	return ret, nil
 }
 
-func (uh *upsertHelper) isIdentityEvaler() bool {
-	return uh.allExprsIdentity
+// shouldUpdate returns the result of evaluating the WHERE clause of the
+// ON CONFLICT ... DO UPDATE clause.
+func (uh *upsertHelper) shouldUpdate(
+	insertRow parser.Datums, existingRow parser.Datums,
+) (bool, error) {
+	uh.curSourceRow = existingRow
+	uh.curExcludedRow = insertRow
+
+	return sqlbase.RunFilter(uh.whereExpr, &uh.p.evalCtx)
 }
 
 // upsertExprsAndIndex returns the upsert conflict index and the (possibly
@@ -234,7 +237,7 @@ func upsertExprsAndIndex(
 			return false
 		}
 		for i, colName := range index.ColumnNames {
-			if parser.ReNormalizeName(colName) != onConflict.Columns[i].Normalize() {
+			if colName != string(onConflict.Columns[i]) {
 				return false
 			}
 		}

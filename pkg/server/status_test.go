@@ -11,21 +11,16 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Spencer Kimball (spencer.kimball@gmail.com)
-// Author: Bram Gruneir (bram+code@cockroachlabs.com)
 
 package server
 
 import (
 	"bytes"
 	"fmt"
-	"io/ioutil"
-	"os"
+	"path/filepath"
 	"reflect"
 	"regexp"
 	"strconv"
-	"strings"
 	"testing"
 	"time"
 
@@ -39,8 +34,11 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/rpc"
+	"github.com/cockroachdb/cockroach/pkg/security"
+	"github.com/cockroachdb/cockroach/pkg/security/securitytest"
 	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
 	"github.com/cockroachdb/cockroach/pkg/server/status"
+	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/ts"
@@ -62,7 +60,7 @@ func getStatusJSONProto(
 func TestStatusLocalStacks(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
-	defer s.Stopper().Stop()
+	defer s.Stopper().Stop(context.TODO())
 
 	// Verify match with at least two goroutine stacks.
 	re := regexp.MustCompile("(?s)goroutine [0-9]+.*goroutine [0-9]+.*")
@@ -83,7 +81,7 @@ func TestStatusLocalStacks(t *testing.T) {
 func TestStatusJson(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
-	defer s.Stopper().Stop()
+	defer s.Stopper().Stop(context.TODO())
 	ts := s.(*TestServer)
 
 	nodeID := ts.Gossip().NodeID.Get()
@@ -130,7 +128,7 @@ func TestStatusJson(t *testing.T) {
 func TestStatusGossipJson(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
-	defer s.Stopper().Stop()
+	defer s.Stopper().Stop(context.TODO())
 
 	var data gossip.InfoStatus
 	if err := getStatusJSONProto(s, "gossip/local", &data); err != nil {
@@ -185,58 +183,50 @@ func startServer(t *testing.T) *TestServer {
 }
 
 // TestStatusLocalLogs checks to ensure that local/logfiles,
-// local/logfiles/{filename}, local/log and local/log/{level} function
+// local/logfiles/{filename} and local/log function
 // correctly.
 func TestStatusLocalLogs(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	if log.V(3) {
 		t.Skip("Test only works with low verbosity levels")
 	}
-	dir, err := ioutil.TempDir("", "local_log_test")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := log.EnableLogFileOutput(dir); err != nil {
-		t.Fatal(err)
-	}
-	defer func() {
-		log.DisableLogFileOutput()
-		if err := os.RemoveAll(dir); err != nil {
-			t.Fatal(err)
-		}
-	}()
+
+	s := log.ScopeWithoutShowLogs(t)
+	defer s.Close(t)
 
 	ts := startServer(t)
-	defer ts.Stopper().Stop()
+	defer ts.Stopper().Stop(context.TODO())
 
-	// Log an error which we expect to show up on every log file.
+	// Log an error of each main type which we expect to be able to retrieve.
+	// The resolution of our log timestamps is such that it's possible to get
+	// two subsequent log messages with the same timestamp. This test will fail
+	// when that occurs. By adding a small sleep in here after each timestamp to
+	// ensures this isn't the case and that the log filtering doesn't filter out
+	// the log entires we're looking for. The value of 20 μs was chosen because
+	// the log timestamps have a fidelity of 10 μs and thus doubling that should
+	// be a sufficient buffer.
+	// See util/log/clog.go formatHeader() for more details.
+	const sleepBuffer = time.Microsecond * 20
 	timestamp := timeutil.Now().UnixNano()
+	time.Sleep(sleepBuffer)
 	log.Errorf(context.Background(), "TestStatusLocalLogFile test message-Error")
+	time.Sleep(sleepBuffer)
 	timestampE := timeutil.Now().UnixNano()
+	time.Sleep(sleepBuffer)
 	log.Warningf(context.Background(), "TestStatusLocalLogFile test message-Warning")
+	time.Sleep(sleepBuffer)
 	timestampEW := timeutil.Now().UnixNano()
+	time.Sleep(sleepBuffer)
 	log.Infof(context.Background(), "TestStatusLocalLogFile test message-Info")
+	time.Sleep(sleepBuffer)
 	timestampEWI := timeutil.Now().UnixNano()
 
 	var wrapper serverpb.LogFilesListResponse
 	if err := getStatusJSONProto(ts, "logfiles/local", &wrapper); err != nil {
 		t.Fatal(err)
 	}
-	if a, e := len(wrapper.Files), 3; a != e {
+	if a, e := len(wrapper.Files), 1; a != e {
 		t.Fatalf("expected %d log files; got %d", e, a)
-	}
-	for _, fileInfo := range wrapper.Files {
-		fName := fileInfo.Name
-		found := false
-		for _, name := range []string{"ERROR.log", "INFO.log", "WARNING.log"} {
-			if strings.Contains(fName, name) {
-				found = true
-				break
-			}
-		}
-		if !found {
-			t.Errorf("expected log file name %s to contain ERROR, INFO or WARNING.", fName)
-		}
 	}
 
 	// Check each individual log can be fetched and is non-empty.
@@ -267,7 +257,6 @@ func TestStatusLocalLogs(t *testing.T) {
 	}
 
 	testCases := []struct {
-		Level          log.Severity
 		MaxEntities    int
 		StartTimestamp int64
 		EndTimestamp   int64
@@ -275,32 +264,29 @@ func TestStatusLocalLogs(t *testing.T) {
 		levelPresence
 	}{
 		// Test filtering by log severity.
-		{log.Severity_INFO, 0, 0, 0, "", levelPresence{true, true, true}},
-		{log.Severity_WARNING, 0, 0, 0, "", levelPresence{true, true, false}},
-		{log.Severity_ERROR, 0, 0, 0, "", levelPresence{true, false, false}},
 		// // Test entry limit. Ignore Info/Warning/Error filters.
-		{log.Severity_INFO, 1, timestamp, timestampEWI, "", levelPresence{false, false, false}},
-		{log.Severity_INFO, 2, timestamp, timestampEWI, "", levelPresence{false, false, false}},
-		{log.Severity_INFO, 3, timestamp, timestampEWI, "", levelPresence{false, false, false}},
+		{1, timestamp, timestampEWI, "", levelPresence{false, false, false}},
+		{2, timestamp, timestampEWI, "", levelPresence{false, false, false}},
+		{3, timestamp, timestampEWI, "", levelPresence{false, false, false}},
 		// Test filtering in different timestamp windows.
-		{log.Severity_INFO, 0, timestamp, timestamp, "", levelPresence{false, false, false}},
-		{log.Severity_INFO, 0, timestamp, timestampE, "", levelPresence{true, false, false}},
-		{log.Severity_INFO, 0, timestampE, timestampEW, "", levelPresence{false, true, false}},
-		{log.Severity_INFO, 0, timestampEW, timestampEWI, "", levelPresence{false, false, true}},
-		{log.Severity_INFO, 0, timestamp, timestampEW, "", levelPresence{true, true, false}},
-		{log.Severity_INFO, 0, timestampE, timestampEWI, "", levelPresence{false, true, true}},
-		{log.Severity_INFO, 0, timestamp, timestampEWI, "", levelPresence{true, true, true}},
+		{0, timestamp, timestamp, "", levelPresence{false, false, false}},
+		{0, timestamp, timestampE, "", levelPresence{true, false, false}},
+		{0, timestampE, timestampEW, "", levelPresence{false, true, false}},
+		{0, timestampEW, timestampEWI, "", levelPresence{false, false, true}},
+		{0, timestamp, timestampEW, "", levelPresence{true, true, false}},
+		{0, timestampE, timestampEWI, "", levelPresence{false, true, true}},
+		{0, timestamp, timestampEWI, "", levelPresence{true, true, true}},
 		// Test filtering by regexp pattern.
-		{log.Severity_INFO, 0, 0, 0, "Info", levelPresence{false, false, true}},
-		{log.Severity_INFO, 0, 0, 0, "Warning", levelPresence{false, true, false}},
-		{log.Severity_INFO, 0, 0, 0, "Error", levelPresence{true, false, false}},
-		{log.Severity_INFO, 0, 0, 0, "Info|Error|Warning", levelPresence{true, true, true}},
-		{log.Severity_INFO, 0, 0, 0, "Nothing", levelPresence{false, false, false}},
+		{0, 0, 0, "Info", levelPresence{false, false, true}},
+		{0, 0, 0, "Warning", levelPresence{false, true, false}},
+		{0, 0, 0, "Error", levelPresence{true, false, false}},
+		{0, 0, 0, "Info|Error|Warning", levelPresence{true, true, true}},
+		{0, 0, 0, "Nothing", levelPresence{false, false, false}},
 	}
 
 	for i, testCase := range testCases {
 		var url bytes.Buffer
-		fmt.Fprintf(&url, "logs/local?level=%s", testCase.Level.Name())
+		fmt.Fprintf(&url, "logs/local?level=")
 		if testCase.MaxEntities > 0 {
 			fmt.Fprintf(&url, "&max=%d", testCase.MaxEntities)
 		}
@@ -352,7 +338,7 @@ func TestStatusLocalLogs(t *testing.T) {
 func TestNodeStatusResponse(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	s := startServer(t)
-	defer s.Stopper().Stop()
+	defer s.Stopper().Stop(context.TODO())
 
 	// First fetch all the node statuses.
 	wrapper := serverpb.NodesResponse{}
@@ -387,7 +373,7 @@ func TestMetricsRecording(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	s, _, kvDB := serverutils.StartServer(t, base.TestServerArgs{
 		MetricsSampleInterval: 5 * time.Millisecond})
-	defer s.Stopper().Stop()
+	defer s.Stopper().Stop(context.TODO())
 
 	checkTimeSeriesKey := func(now int64, keyName string) error {
 		key := ts.MakeDataKey(keyName, "", ts.Resolution10s, now)
@@ -415,7 +401,7 @@ func TestMetricsRecording(t *testing.T) {
 func TestMetricsEndpoint(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	s := startServer(t)
-	defer s.Stopper().Stop()
+	defer s.Stopper().Stop(context.TODO())
 
 	if _, err := getText(s, s.AdminURL()+statusPrefix+"metrics/"+s.Gossip().NodeID.String()); err != nil {
 		t.Fatal(err)
@@ -424,8 +410,9 @@ func TestMetricsEndpoint(t *testing.T) {
 
 func TestRangesResponse(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer storage.EnableLeaseHistory(100)()
 	ts := startServer(t)
-	defer ts.Stopper().Stop()
+	defer ts.Stopper().Stop(context.TODO())
 
 	// Perform a scan to ensure that all the raft groups are initialized.
 	if _, err := ts.db.Scan(context.TODO(), keys.LocalMax, roachpb.KeyMax, 0); err != nil {
@@ -453,11 +440,14 @@ func TestRangesResponse(t *testing.T) {
 		if len(ri.State.Desc.Replicas) != 1 || ri.State.Desc.Replicas[0] != expReplica {
 			t.Errorf("unexpected replica list %+v", ri.State.Desc.Replicas)
 		}
-		if ri.State.Lease == nil {
+		if ri.State.Lease == nil || *ri.State.Lease == (roachpb.Lease{}) {
 			t.Error("expected a nontrivial Lease")
 		}
 		if ri.State.LastIndex == 0 {
 			t.Error("expected positive LastIndex")
+		}
+		if e, a := 1, len(ri.LeaseHistory); e != a {
+			t.Errorf("expected a lease history length of %d, actual %d\n%+v", e, a, ri)
 		}
 	}
 }
@@ -465,7 +455,7 @@ func TestRangesResponse(t *testing.T) {
 func TestRaftDebug(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	s := startServer(t)
-	defer s.Stopper().Stop()
+	defer s.Stopper().Stop(context.TODO())
 
 	var resp serverpb.RaftDebugResponse
 	if err := getStatusJSONProto(s, "raft", &resp); err != nil {
@@ -474,6 +464,41 @@ func TestRaftDebug(t *testing.T) {
 	if len(resp.Ranges) == 0 {
 		t.Errorf("didn't get any ranges")
 	}
+
+	if len(resp.Ranges) < 3 {
+		t.Errorf("expected more than 2 ranges, got %d", len(resp.Ranges))
+	}
+
+	reqURI := "raft"
+	requestedIDs := []roachpb.RangeID{}
+	for id := range resp.Ranges {
+		if len(requestedIDs) == 0 {
+			reqURI += "?"
+		} else {
+			reqURI += "&"
+		}
+		reqURI += fmt.Sprintf("range_ids=%d", id)
+		requestedIDs = append(requestedIDs, id)
+		if len(requestedIDs) >= 2 {
+			break
+		}
+	}
+
+	if err := getStatusJSONProto(s, reqURI, &resp); err != nil {
+		t.Fatal(err)
+	}
+
+	// Make sure we get exactly two ranges back.
+	if len(resp.Ranges) != 2 {
+		t.Errorf("expected exactly two ranges in response, got %d", len(resp.Ranges))
+	}
+
+	// Make sure the ranges returned are those requested.
+	for _, reqID := range requestedIDs {
+		if _, ok := resp.Ranges[reqID]; !ok {
+			t.Errorf("request URI was %s, but range ID %d not returned: %+v", reqURI, reqID, resp.Ranges)
+		}
+	}
 }
 
 // TestStatusVars verifies that prometheus metrics are available via the
@@ -481,7 +506,7 @@ func TestRaftDebug(t *testing.T) {
 func TestStatusVars(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
-	defer s.Stopper().Stop()
+	defer s.Stopper().Stop(context.TODO())
 
 	if body, err := getText(s, s.AdminURL()+statusPrefix+"vars"); err != nil {
 		t.Fatal(err)
@@ -493,7 +518,7 @@ func TestStatusVars(t *testing.T) {
 func TestSpanStatsResponse(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	ts := startServer(t)
-	defer ts.Stopper().Stop()
+	defer ts.Stopper().Stop(context.TODO())
 
 	httpClient, err := ts.GetHTTPClient()
 	if err != nil {
@@ -511,7 +536,11 @@ func TestSpanStatsResponse(t *testing.T) {
 	if err := httputil.PostJSON(httpClient, url, &request, &response); err != nil {
 		t.Fatal(err)
 	}
-	if a, e := int(response.RangeCount), ExpectedInitialRangeCount(); a != e {
+	initialRanges, err := ts.ExpectedInitialRangeCount()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if a, e := int(response.RangeCount), initialRanges; a != e {
 		t.Errorf("expected %d ranges, found %d", e, a)
 	}
 }
@@ -519,11 +548,11 @@ func TestSpanStatsResponse(t *testing.T) {
 func TestSpanStatsGRPCResponse(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	ts := startServer(t)
-	defer ts.Stopper().Stop()
+	defer ts.Stopper().Stop(context.TODO())
 
 	rpcStopper := stop.NewStopper()
-	defer rpcStopper.Stop()
-	rpcContext := rpc.NewContext(log.AmbientContext{}, ts.RPCContext().Config, ts.Clock(), rpcStopper)
+	defer rpcStopper.Stop(context.TODO())
+	rpcContext := rpc.NewContext(log.AmbientContext{Tracer: ts.ClusterSettings().Tracer}, ts.RPCContext().Config, ts.Clock(), rpcStopper)
 	request := serverpb.SpanStatsRequest{
 		NodeID:   "1",
 		StartKey: []byte(roachpb.RKeyMin),
@@ -541,7 +570,99 @@ func TestSpanStatsGRPCResponse(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if a, e := int(response.RangeCount), ExpectedInitialRangeCount(); a != e {
+	initialRanges, err := ts.ExpectedInitialRangeCount()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if a, e := int(response.RangeCount), initialRanges; a != e {
 		t.Errorf("expected %d ranges, found %d", e, a)
 	}
+}
+
+func TestNodesGRPCResponse(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	ts := startServer(t)
+	defer ts.Stopper().Stop(context.TODO())
+
+	rootConfig := testutils.NewTestBaseContext(security.RootUser)
+	rpcContext := rpc.NewContext(log.AmbientContext{Tracer: ts.ClusterSettings().Tracer}, rootConfig, ts.Clock(), ts.Stopper())
+	var request serverpb.NodesRequest
+
+	url := ts.ServingAddr()
+	conn, err := rpcContext.GRPCDial(url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := serverpb.NewStatusClient(conn)
+
+	response, err := client.Nodes(context.Background(), &request)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if a, e := len(response.Nodes), 1; a != e {
+		t.Errorf("expected %d node(s), found %d", e, a)
+	}
+}
+
+func TestHandleDebugRange(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	s := startServer(t)
+	defer s.Stopper().Stop(context.TODO())
+
+	if body, err := getText(s, s.AdminURL()+rangeDebugEndpoint+"?id=1"); err != nil {
+		t.Fatal(err)
+	} else if !bytes.Contains(body, []byte("<TITLE>Range ID:1</TITLE>")) {
+		t.Errorf("expected \"<title>Range Id: 1</title>\" got: \n%s", body)
+	}
+}
+
+func TestCertificatesResponse(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	ts := startServer(t)
+	defer ts.Stopper().Stop(context.TODO())
+
+	var response serverpb.CertificatesResponse
+	if err := getStatusJSONProto(ts, "certificates/local", &response); err != nil {
+		t.Fatal(err)
+	}
+
+	// We expect two certificates: CA and node.
+	if a, e := len(response.Certificates), 2; a != e {
+		t.Errorf("expected %d certificates, found %d", e, a)
+	}
+
+	// Read the certificates from the embedded assets.
+	caPath := filepath.Join(security.EmbeddedCertsDir, security.EmbeddedCACert)
+	nodePath := filepath.Join(security.EmbeddedCertsDir, security.EmbeddedNodeCert)
+
+	caFile, err := securitytest.EmbeddedAssets.ReadFile(caPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	nodeFile, err := securitytest.EmbeddedAssets.ReadFile(nodePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// The response is ordered: CA cert followed by node cert.
+	cert := response.Certificates[0]
+	if a, e := cert.Type, serverpb.CertificateDetails_CA; a != e {
+		t.Errorf("wrong type %s, expected %s", a, e)
+	} else if cert.ErrorMessage != "" {
+		t.Errorf("expected cert without error, got %v", cert.ErrorMessage)
+	} else if a, e := cert.Data, caFile; !bytes.Equal(a, e) {
+		t.Errorf("mismatched contents: %s vs %s", a, e)
+	}
+
+	cert = response.Certificates[1]
+	if a, e := cert.Type, serverpb.CertificateDetails_NODE; a != e {
+		t.Errorf("wrong type %s, expected %s", a, e)
+	} else if cert.ErrorMessage != "" {
+		t.Errorf("expected cert without error, got %v", cert.ErrorMessage)
+	} else if a, e := cert.Data, nodeFile; !bytes.Equal(a, e) {
+		t.Errorf("mismatched contents: %s vs %s", a, e)
+	}
+
 }

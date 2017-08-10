@@ -12,8 +12,6 @@
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
 //
-// Author: Radu Berinde (radu@cockroachlabs.com)
-//
 // This file implements the select code that deals with column references
 // and resolving column names in expressions.
 
@@ -64,17 +62,13 @@ func (v *nameResolutionVisitor) VisitPre(expr parser.Expr) (recurse bool, newNod
 	case *parser.IndexedVar:
 		// If the indexed var is a standalone ordinal reference, ensure it
 		// becomes a fully bound indexed var.
-		if err := v.iVarHelper.BindIfUnbound(t); err != nil {
-			v.err = err
+		t, v.err = v.iVarHelper.BindIfUnbound(t)
+		if v.err != nil {
 			return false, expr
 		}
 
-		// We allow resolving IndexedVars on expressions that have already been resolved by this
-		// resolver. This is used in some cases when adding render targets for grouping or sorting.
-		v.iVarHelper.AssertSameContainer(t)
-
 		v.foundDependentVars = true
-		return true, expr
+		return false, t
 
 	case parser.UnresolvedName:
 		vn, err := t.NormalizeVarName()
@@ -101,18 +95,14 @@ func (v *nameResolutionVisitor) VisitPre(expr parser.Expr) (recurse bool, newNod
 			return false, expr
 		}
 
-		if strings.EqualFold(fd.Name, "random") {
-			// `random()` changes values every row. So report we found
-			// a dependent variable.
-			// TODO(knz): in the future we may have more than one built-in
-			// function that has different values for every row. In that
-			// case, the property becomes an attribute of the
-			// built-in. However then overload resolution (type checking)
-			// must occur before this property can be detected. This
-			// would be a more significant refactoring, which is why
-			// we don't do this yet.
+		if fd.HasOverloadsNeedingRepeatedEvaluation {
+			// TODO(knz): this property should really be an attribute of the
+			// individual overloads. By looking at the name-level property
+			// indicator, we are marking a function as row-dependent as
+			// soon as one overload is, even if the particular overload
+			// that would be selected by type checking for this FuncExpr
+			// is constant. This could be more fine-grained.
 			v.foundDependentVars = true
-			break
 		}
 
 		// Check for invalid use of *, which, if it is an argument, is the only argument.
@@ -130,35 +120,36 @@ func (v *nameResolutionVisitor) VisitPre(expr parser.Expr) (recurse bool, newNod
 		// Save back to avoid re-doing the work later.
 		t.Exprs[0] = vn
 
-		if strings.EqualFold(fd.Name, "count") {
-			// Special case handling for COUNT(*). This is a special construct to
-			// count the number of rows; in this case * does NOT refer to a set of
-			// columns. A * is invalid elsewhere (and will be caught by TypeCheck()).
-			// Replace the function argument with a special non-NULL VariableExpr.
-			switch arg := vn.(type) {
-			case parser.UnqualifiedStar:
-				// Replace, see below.
-			case *parser.AllColumnsSelector:
-				// Replace, see below.
-				// However we must first properly reject SELECT COUNT(foo.*) FROM bar.
-				if _, err := v.sources.checkDatabaseName(arg.TableName); err != nil {
-					v.err = err
-					return false, expr
+		if strings.EqualFold(fd.Name, "count") && t.Type == 0 {
+			if _, ok := vn.(parser.UnqualifiedStar); ok {
+				// Special case handling for COUNT(*). This is a special construct to
+				// count the number of rows; in this case * does NOT refer to a set of
+				// columns. A * is invalid elsewhere (and will be caught by TypeCheck()).
+				// Replace the function with COUNT_ROWS (which doesn't take any
+				// arguments).
+				e := &parser.FuncExpr{
+					Func: parser.ResolvableFunctionReference{
+						FunctionReference: parser.UnresolvedName{parser.Name("COUNT_ROWS")},
+					},
 				}
-			default:
-				// Nothing to do, recurse.
-				return true, expr
+				// We call TypeCheck to fill in FuncExpr internals. This is a fixed
+				// expression; we should not hit an error here.
+				if _, err := e.TypeCheck(&parser.SemaContext{}, parser.TypeAny); err != nil {
+					panic(err)
+				}
+				e.Filter = t.Filter
+				e.WindowDef = t.WindowDef
+				return true, e
 			}
-
-			t = t.CopyNode()
-			t.Exprs[0] = parser.StarDatumInstance
-
-			// the StartDatumInstance refers implicitly to columns,
-			// so it is a dependent variable.
-			v.foundDependentVars = true
-
-			return true, t
 		}
+		// TODO(#15750): support additional forms:
+		//
+		//   COUNT(t.*): looks like this behaves the same as COUNT(*) in PG (perhaps
+		//               t.* becomes a tuple and the tuple itself is never NULL?)
+		//
+		//   COUNT(DISTINCT t.*): this deduplicates between the tuples. Note that
+		//                        this can be part of a join:
+		//                          SELECT COUNT(DISTINCT t.*) FROM t, u
 		return true, t
 
 	case *parser.Subquery:
@@ -171,7 +162,7 @@ func (v *nameResolutionVisitor) VisitPre(expr parser.Expr) (recurse bool, newNod
 
 func (*nameResolutionVisitor) VisitPost(expr parser.Expr) parser.Expr { return expr }
 
-func (s *selectNode) resolveNames(expr parser.Expr) (parser.Expr, bool, error) {
+func (s *renderNode) resolveNames(expr parser.Expr) (parser.Expr, bool, error) {
 	return s.planner.resolveNames(expr, s.sourceInfo, s.ivarHelper)
 }
 

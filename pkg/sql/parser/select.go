@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Peter Mattis (peter@cockroachlabs.com)
 
 // This code was derived from https://github.com/youtube/vitess.
 //
@@ -27,7 +25,7 @@ import (
 	"fmt"
 )
 
-// SelectStatement any SELECT statement.
+// SelectStatement represents any SELECT statement.
 type SelectStatement interface {
 	Statement
 	selectStatement()
@@ -73,7 +71,6 @@ type SelectClause struct {
 	GroupBy     GroupBy
 	Having      *Where
 	Window      Window
-	Lock        string
 	tableSelect bool
 }
 
@@ -93,7 +90,6 @@ func (node *SelectClause) Format(buf *bytes.Buffer, f FmtFlags) {
 		FormatNode(buf, f, node.GroupBy)
 		FormatNode(buf, f, node.Having)
 		FormatNode(buf, f, node.Window)
-		buf.WriteString(node.Lock)
 	}
 }
 
@@ -217,6 +213,23 @@ func (*ParenTableExpr) tableExpr()   {}
 func (*JoinTableExpr) tableExpr()    {}
 func (*FuncExpr) tableExpr()         {}
 
+// StatementSource encapsulates one of the other statements as a data source.
+type StatementSource struct {
+	Statement Statement
+}
+
+// Format implements the NodeFormatter interface.
+func (node *StatementSource) Format(buf *bytes.Buffer, f FmtFlags) {
+	buf.WriteByte('[')
+	node.Statement.Format(buf, f)
+	buf.WriteByte(']')
+}
+
+func (*StatementSource) tableExpr() {}
+
+// IndexID is a custom type for IndexDescriptor IDs.
+type IndexID uint32
+
 // IndexHints represents "@<index_name>" or "@{param[,param]}" where param is
 // one of:
 //  - FORCE_INDEX=<index_name>
@@ -224,6 +237,7 @@ func (*FuncExpr) tableExpr()         {}
 // It is used optionally after a table name in SELECT statements.
 type IndexHints struct {
 	Index       Name
+	IndexID     IndexID
 	NoIndexJoin bool
 }
 
@@ -231,13 +245,21 @@ type IndexHints struct {
 func (n *IndexHints) Format(buf *bytes.Buffer, f FmtFlags) {
 	if !n.NoIndexJoin {
 		buf.WriteByte('@')
-		FormatNode(buf, f, n.Index)
+		if n.Index != "" {
+			FormatNode(buf, f, n.Index)
+		} else {
+			fmt.Fprintf(buf, "[%d]", n.IndexID)
+		}
 	} else {
-		if n.Index == "" {
+		if n.Index == "" && n.IndexID == 0 {
 			buf.WriteString("@{NO_INDEX_JOIN}")
 		} else {
 			buf.WriteString("@{FORCE_INDEX=")
-			FormatNode(buf, f, n.Index)
+			if n.Index != "" {
+				FormatNode(buf, f, n.Index)
+			} else {
+				fmt.Fprintf(buf, "[%d]", n.IndexID)
+			}
 			buf.WriteString(",NO_INDEX_JOIN}")
 		}
 	}
@@ -442,15 +464,42 @@ func (d Direction) String() string {
 	return directionName[d]
 }
 
+// OrderType indicates which type of expression is used in ORDER BY.
+type OrderType int
+
+const (
+	// OrderByColumn is the regular "by expression/column" ORDER BY specification.
+	OrderByColumn OrderType = iota
+	// OrderByIndex enables the user to specify a given index' columns implicitly.
+	OrderByIndex
+)
+
 // Order represents an ordering expression.
 type Order struct {
+	OrderType OrderType
 	Expr      Expr
 	Direction Direction
+	// Table/Index replaces Expr when OrderType = OrderByIndex.
+	Table NormalizableTableName
+	// If Index is empty, then the order should use the primary key.
+	Index Name
 }
 
 // Format implements the NodeFormatter interface.
 func (node *Order) Format(buf *bytes.Buffer, f FmtFlags) {
-	FormatNode(buf, f, node.Expr)
+	if node.OrderType == OrderByColumn {
+		FormatNode(buf, f, node.Expr)
+	} else {
+		if node.Index == "" {
+			buf.WriteString("PRIMARY KEY ")
+			FormatNode(buf, f, &node.Table)
+		} else {
+			buf.WriteString("INDEX ")
+			FormatNode(buf, f, &node.Table)
+			buf.WriteByte('@')
+			FormatNode(buf, f, node.Index)
+		}
+	}
 	if node.Direction != DefaultDirection {
 		buf.WriteByte(' ')
 		buf.WriteString(node.Direction.String())

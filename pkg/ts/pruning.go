@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Matt Tracy (matt@cockroachlabs.com)
 
 package ts
 
@@ -107,7 +105,12 @@ func findTimeSeries(
 
 	thresholds := computeThresholds(now.WallTime)
 
-	for iter.Seek(next); iter.Valid() && iter.Less(end); iter.Seek(next) {
+	for iter.Seek(next); ; iter.Seek(next) {
+		if ok, err := iter.Valid(); err != nil {
+			return nil, err
+		} else if !ok || !iter.Less(end) {
+			break
+		}
 		foundKey := iter.Key().Key
 
 		// Extract the name and resolution from the discovered key.

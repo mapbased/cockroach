@@ -11,20 +11,38 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Peter Mattis (peter@cockroachlabs.com)
 
 package sql
 
 import (
-	"bytes"
 	"fmt"
+	"sync"
+
+	"golang.org/x/net/context"
 
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
-	"github.com/cockroachdb/cockroach/pkg/util"
 )
+
+var insertNodePool = sync.Pool{
+	New: func() interface{} {
+		return &insertNode{}
+	},
+}
+
+var tableInserterPool = sync.Pool{
+	New: func() interface{} {
+		return &tableInserter{}
+	},
+}
+
+var tableUpserterPool = sync.Pool{
+	New: func() interface{} {
+		return &tableUpserter{}
+	},
+}
 
 type insertNode struct {
 	// The following fields are populated during makePlan.
@@ -37,12 +55,17 @@ type insertNode struct {
 	insertColIDtoRowIndex map[sqlbase.ColumnID]int
 	tw                    tableWriter
 
+	isUpsertReturning bool
+
 	run struct {
 		// The following fields are populated during Start().
 		editNodeRun
 
 		rowIdxToRetIdx []int
-		rowTemplate    parser.DTuple
+		rowTemplate    parser.Datums
+
+		doneUpserting bool
+		rowsUpserted  *sqlbase.RowContainer
 	}
 }
 
@@ -51,26 +74,26 @@ type insertNode struct {
 //   Notes: postgres requires INSERT. No "on duplicate key update" option.
 //          mysql requires INSERT. Also requires UPDATE on "ON DUPLICATE KEY UPDATE".
 func (p *planner) Insert(
-	n *parser.Insert, desiredTypes []parser.Type, autoCommit bool,
+	ctx context.Context, n *parser.Insert, desiredTypes []parser.Type,
 ) (planNode, error) {
 	tn, err := p.getAliasedTableName(n.Table)
 	if err != nil {
 		return nil, err
 	}
 
-	en, err := p.makeEditNode(tn, autoCommit, privilege.INSERT)
+	en, err := p.makeEditNode(ctx, tn, privilege.INSERT)
 	if err != nil {
 		return nil, err
 	}
+	isUpsertReturning := false
 	if n.OnConflict != nil {
 		if !n.OnConflict.DoNothing {
-			if err := p.checkPrivilege(en.tableDesc, privilege.UPDATE); err != nil {
+			if err := p.CheckPrivilege(en.tableDesc, privilege.UPDATE); err != nil {
 				return nil, err
 			}
 		}
-		// TODO(dan): Support RETURNING in UPSERTs.
-		if n.Returning != nil {
-			return nil, fmt.Errorf("RETURNING is not supported with UPSERT")
+		if _, ok := n.Returning.(*parser.ReturningExprs); ok {
+			isUpsertReturning = true
 		}
 	}
 
@@ -88,10 +111,8 @@ func (p *planner) Insert(
 	// columns receiving a default value.
 	numInputColumns := len(cols)
 
-	cols, defaultExprs, err := ProcessDefaultColumns(cols, en.tableDesc, &p.parser, &p.evalCtx)
-	if err != nil {
-		return nil, err
-	}
+	cols, defaultExprs, err :=
+		sqlbase.ProcessDefaultColumns(cols, en.tableDesc, &p.parser, &p.evalCtx)
 	if err != nil {
 		return nil, err
 	}
@@ -119,29 +140,32 @@ func (p *planner) Insert(
 	// Create the plan for the data source.
 	// This performs type checking on source expressions, collecting
 	// types for placeholders in the process.
-	rows, err := p.newPlan(insertRows, desiredTypesFromSelect, false)
+	rows, err := p.newPlan(ctx, insertRows, desiredTypesFromSelect)
 	if err != nil {
 		return nil, err
 	}
 
-	if expressions := len(rows.Columns()); expressions > numInputColumns {
+	if expressions := len(planColumns(rows)); expressions > numInputColumns {
 		return nil, fmt.Errorf("INSERT error: table %s has %d columns but %d values were supplied", n.Table, numInputColumns, expressions)
 	}
 
-	fkTables := tablesNeededForFKs(*en.tableDesc, CheckInserts)
-	if err := p.fillFKTableMap(fkTables); err != nil {
+	fkTables := sqlbase.TablesNeededForFKs(*en.tableDesc, sqlbase.CheckInserts)
+	if err := p.fillFKTableMap(ctx, fkTables); err != nil {
 		return nil, err
 	}
-	ri, err := MakeRowInserter(p.txn, en.tableDesc, fkTables, cols, checkFKs)
+	ri, err := sqlbase.MakeRowInserter(p.txn, en.tableDesc, fkTables, cols,
+		sqlbase.CheckFKs, &p.alloc)
 	if err != nil {
 		return nil, err
 	}
 
 	var tw tableWriter
 	if n.OnConflict == nil {
-		tw = &tableInserter{ri: ri, autoCommit: autoCommit}
+		ti := tableInserterPool.Get().(*tableInserter)
+		*ti = tableInserter{ri: ri, autoCommit: p.autoCommit}
+		tw = ti
 	} else {
-		updateExprs, conflictIndex, err := upsertExprsAndIndex(en.tableDesc, *n.OnConflict, ri.insertCols)
+		updateExprs, conflictIndex, err := upsertExprsAndIndex(en.tableDesc, *n.OnConflict, ri.InsertCols)
 		if err != nil {
 			return nil, err
 		}
@@ -150,7 +174,16 @@ func (p *planner) Insert(
 			// TODO(dan): Postgres allows ON CONFLICT DO NOTHING without specifying a
 			// conflict index, which means do nothing on any conflict. Support this if
 			// someone needs it.
-			tw = &tableUpserter{ri: ri, conflictIndex: *conflictIndex}
+			tu := tableUpserterPool.Get().(*tableUpserter)
+			*tu = tableUpserter{
+				ri:            ri,
+				autoCommit:    p.autoCommit,
+				conflictIndex: *conflictIndex,
+				alloc:         &p.alloc,
+				mon:           &p.session.TxnState.mon,
+				collectRows:   isUpsertReturning,
+			}
+			tw = tu
 		} else {
 			names, err := p.namesForExprs(updateExprs)
 			if err != nil {
@@ -165,102 +198,74 @@ func (p *planner) Insert(
 					return nil, err
 				}
 
-				status, idx, err := en.tableDesc.FindColumnByName(c.ColumnName)
+				col, _, err := en.tableDesc.FindColumnByName(c.ColumnName)
 				if err != nil {
 					return nil, err
 				}
-				if status == sqlbase.DescriptorActive {
-					updateCols[i] = en.tableDesc.Columns[idx]
-				} else {
-					updateCols[i] = *en.tableDesc.Mutations[idx].GetColumn()
-				}
+				updateCols[i] = col
 			}
 
-			helper, err := p.makeUpsertHelper(tn, en.tableDesc, ri.insertCols, updateCols, updateExprs, conflictIndex)
+			helper, err := p.makeUpsertHelper(
+				ctx, tn, en.tableDesc, ri.InsertCols, updateCols, updateExprs, conflictIndex, n.OnConflict.Where,
+			)
 			if err != nil {
 				return nil, err
 			}
 
-			fkTables := tablesNeededForFKs(*en.tableDesc, CheckUpdates)
-			if err := p.fillFKTableMap(fkTables); err != nil {
+			fkTables := sqlbase.TablesNeededForFKs(*en.tableDesc, sqlbase.CheckUpdates)
+			if err := p.fillFKTableMap(ctx, fkTables); err != nil {
 				return nil, err
 			}
-			tw = &tableUpserter{ri: ri, fkTables: fkTables, updateCols: updateCols, conflictIndex: *conflictIndex, evaler: helper}
+			tu := tableUpserterPool.Get().(*tableUpserter)
+			*tu = tableUpserter{
+				ri:            ri,
+				autoCommit:    p.autoCommit,
+				alloc:         &p.alloc,
+				mon:           &p.session.TxnState.mon,
+				collectRows:   isUpsertReturning,
+				fkTables:      fkTables,
+				updateCols:    updateCols,
+				conflictIndex: *conflictIndex,
+				evaler:        helper,
+				isUpsertAlias: n.OnConflict.IsUpsertAlias(),
+			}
+			tw = tu
 		}
 	}
 
-	in := &insertNode{
+	in := insertNodePool.Get().(*insertNode)
+	*in = insertNode{
 		n:                     n,
 		editNodeBase:          en,
 		defaultExprs:          defaultExprs,
-		insertCols:            ri.insertCols,
+		insertCols:            ri.InsertCols,
 		insertColIDtoRowIndex: ri.InsertColIDtoRowIndex,
-		tw: tw,
+		isUpsertReturning:     isUpsertReturning,
+		tw:                    tw,
 	}
 
-	if err := in.checkHelper.init(p, tn, en.tableDesc); err != nil {
+	if err := in.checkHelper.init(ctx, p, tn, en.tableDesc); err != nil {
 		return nil, err
 	}
 
-	if err := in.run.initEditNode(&in.editNodeBase, rows, n.Returning, desiredTypes); err != nil {
+	if err := in.run.initEditNode(
+		ctx, &in.editNodeBase, rows, in.tw, tn, n.Returning, desiredTypes); err != nil {
 		return nil, err
 	}
 
 	return in, nil
 }
 
-// ProcessDefaultColumns adds columns with DEFAULT to cols if not present
-// and returns the defaultExprs for cols.
-func ProcessDefaultColumns(
-	cols []sqlbase.ColumnDescriptor,
-	tableDesc *sqlbase.TableDescriptor,
-	parse *parser.Parser,
-	evalCtx *parser.EvalContext,
-) ([]sqlbase.ColumnDescriptor, []parser.TypedExpr, error) {
-	colIDSet := make(map[sqlbase.ColumnID]struct{}, len(cols))
-	for _, col := range cols {
-		colIDSet[col.ID] = struct{}{}
-	}
-
-	// Add the column if it has a DEFAULT expression.
-	addIfDefault := func(col sqlbase.ColumnDescriptor) {
-		if col.DefaultExpr != nil {
-			if _, ok := colIDSet[col.ID]; !ok {
-				colIDSet[col.ID] = struct{}{}
-				cols = append(cols, col)
-			}
-		}
-	}
-
-	// Add any column that has a DEFAULT expression.
-	for _, col := range tableDesc.Columns {
-		addIfDefault(col)
-	}
-	// Also add any column in a mutation that is WRITE_ONLY and has
-	// a DEFAULT expression.
-	for _, m := range tableDesc.Mutations {
-		if m.State != sqlbase.DescriptorMutation_WRITE_ONLY {
-			continue
-		}
-		if col := m.GetColumn(); col != nil {
-			addIfDefault(*col)
-		}
-	}
-
-	defaultExprs, err := makeDefaultExprs(cols, parse, evalCtx)
-	return cols, defaultExprs, err
-}
-
-func (n *insertNode) expandPlan() error {
-
+func (n *insertNode) Start(params runParams) error {
 	// Prepare structures for building values to pass to rh.
+	// TODO(couchand): Delete this, use tablewriter interface.
 	if n.rh.exprs != nil {
 		// In some cases (e.g. `INSERT INTO t (a) ...`) rowVals does not contain all the table
 		// columns. We need to pass values for all table columns to rh, in the correct order; we
 		// will use rowTemplate for this. We also need a table that maps row indices to rowTemplate indices
 		// to fill in the row values; any absent values will be NULLs.
 
-		n.run.rowTemplate = make(parser.DTuple, len(n.tableDesc.Columns))
+		n.run.rowTemplate = make(parser.Datums, len(n.tableDesc.Columns))
 		for i := range n.run.rowTemplate {
 			n.run.rowTemplate[i] = parser.DNull
 		}
@@ -276,65 +281,120 @@ func (n *insertNode) expandPlan() error {
 		}
 	}
 
-	return n.run.expandEditNodePlan(&n.editNodeBase, n.tw)
-}
-
-func (n *insertNode) Start() error {
-	if err := n.rh.startPlans(); err != nil {
+	if err := n.run.startEditNode(params, &n.editNodeBase); err != nil {
 		return err
 	}
 
-	if err := n.run.startEditNode(); err != nil {
-		return err
+	return n.run.tw.init(params.p.txn)
+}
+
+func (n *insertNode) Close(ctx context.Context) {
+	n.tw.close(ctx)
+	n.run.rows.Close(ctx)
+	n.run.rows = nil
+	if n.run.rowsUpserted != nil {
+		n.run.rowsUpserted.Close(ctx)
+		n.run.rowsUpserted = nil
+	}
+	switch t := n.tw.(type) {
+	case *tableInserter:
+		*t = tableInserter{}
+		tableInserterPool.Put(t)
+	case *tableUpserter:
+		*t = tableUpserter{}
+		tableUpserterPool.Put(t)
+	}
+	*n = insertNode{}
+	insertNodePool.Put(n)
+}
+
+func (n *insertNode) Next(params runParams) (bool, error) {
+	if n.isUpsertReturning {
+		return n.drain(params)
 	}
 
-	return n.run.tw.init(n.p.txn)
+	return n.internalNext(params)
 }
 
-func (n *insertNode) Close() {
-	n.run.rows.Close()
+// Because TableUpserter batches the upserts, we need to completely drain the
+// source and handle all the rows before returning from the first call to Next,
+// so that we can return an upserted row from each call to Values.
+func (n *insertNode) drain(params runParams) (bool, error) {
+	for !n.run.doneUpserting {
+		_, err := n.internalNext(params)
+		if err != nil {
+			return false, err
+		}
+	}
+	hasRows := n.run.rowsUpserted.Len() > 0
+	return hasRows, nil
 }
 
-func (n *insertNode) Next() (bool, error) {
-	ctx := n.editNodeBase.p.ctx()
-	if next, err := n.run.rows.Next(); !next {
+func (n *insertNode) internalNext(params runParams) (bool, error) {
+	if next, err := n.run.rows.Next(params); !next {
 		if err == nil {
+			if err := params.p.cancelChecker.Check(); err != nil {
+				return false, err
+			}
 			// We're done. Finish the batch.
-			err = n.tw.finalize(ctx)
+			rows, err := n.tw.finalize(params.ctx, params.p.session.Tracing.KVTracingEnabled())
+			if err != nil {
+				return false, err
+			}
+
+			if n.isUpsertReturning {
+				n.run.rowsUpserted = sqlbase.NewRowContainer(
+					params.p.session.TxnState.makeBoundAccount(),
+					sqlbase.ColTypeInfoFromResCols(n.rh.columns),
+					rows.Len(),
+				)
+				for i := 0; i < rows.Len(); i++ {
+					cooked, err := n.rh.cookResultRow(rows.At(i))
+					if err != nil {
+						return false, err
+					}
+					_, err = n.run.rowsUpserted.AddRow(params.ctx, cooked)
+					if err != nil {
+						return false, err
+					}
+				}
+				n.run.doneUpserting = true
+			}
 		}
 		return false, err
 	}
 
-	if n.run.explain == explainDebug {
-		return true, nil
-	}
-
-	rowVals, err := GenerateInsertRow(n.defaultExprs, n.insertColIDtoRowIndex, n.insertCols, n.p.evalCtx, n.tableDesc, n.run.rows.Values())
+	rowVals, err := GenerateInsertRow(n.defaultExprs, n.insertColIDtoRowIndex, n.insertCols, params.p.evalCtx, n.tableDesc, n.run.rows.Values())
 	if err != nil {
 		return false, err
 	}
 
-	n.checkHelper.loadRow(n.insertColIDtoRowIndex, rowVals, false)
-	if err := n.checkHelper.check(&n.p.evalCtx); err != nil {
+	if err := n.checkHelper.loadRow(n.insertColIDtoRowIndex, rowVals, false); err != nil {
+		return false, err
+	}
+	if err := n.checkHelper.check(&params.p.evalCtx); err != nil {
 		return false, err
 	}
 
-	_, err = n.tw.row(ctx, rowVals)
+	_, err = n.tw.row(params.ctx, rowVals, params.p.session.Tracing.KVTracingEnabled())
 	if err != nil {
 		return false, err
 	}
 
-	for i, val := range rowVals {
-		if n.run.rowTemplate != nil {
-			n.run.rowTemplate[n.run.rowIdxToRetIdx[i]] = val
+	// Handle regular INSERT ... RETURNING without ON CONFLICT clause
+	if !n.isUpsertReturning {
+		for i, val := range rowVals {
+			if n.run.rowTemplate != nil {
+				n.run.rowTemplate[n.run.rowIdxToRetIdx[i]] = val
+			}
 		}
-	}
 
-	resultRow, err := n.rh.cookResultRow(n.run.rowTemplate)
-	if err != nil {
-		return false, err
+		resultRow, err := n.rh.cookResultRow(n.run.rowTemplate)
+		if err != nil {
+			return false, err
+		}
+		n.run.resultRow = resultRow
 	}
-	n.run.resultRow = resultRow
 
 	return true, nil
 }
@@ -347,8 +407,8 @@ func GenerateInsertRow(
 	insertCols []sqlbase.ColumnDescriptor,
 	evalCtx parser.EvalContext,
 	tableDesc *sqlbase.TableDescriptor,
-	rowVals parser.DTuple,
-) (parser.DTuple, error) {
+	rowVals parser.Datums,
+) (parser.Datums, error) {
 	// The values for the row may be shorter than the number of columns being
 	// inserted into. Generate default values for those columns using the
 	// default expressions.
@@ -356,7 +416,7 @@ func GenerateInsertRow(
 	if len(rowVals) < len(insertCols) {
 		// It's not cool to append to the slice returned by a node; make a copy.
 		oldVals := rowVals
-		rowVals = make(parser.DTuple, len(insertCols))
+		rowVals = make(parser.Datums, len(insertCols))
 		copy(rowVals, oldVals)
 
 		for i := len(oldVals); i < len(insertCols); i++ {
@@ -410,10 +470,10 @@ func (p *planner) processColumns(
 		}
 
 		if len(c.Selector) > 0 {
-			return nil, util.UnimplementedWithIssueErrorf(8318, "compound types not supported yet: %q", n)
+			return nil, pgerror.UnimplementedWithIssueErrorf(8318, "compound types not supported yet: %q", n)
 		}
 
-		col, err := tableDesc.FindActiveColumnByName(c.ColumnName)
+		col, err := tableDesc.FindActiveColumnByName(string(c.ColumnName))
 		if err != nil {
 			return nil, err
 		}
@@ -506,125 +566,12 @@ func fillDefaults(
 	return ret
 }
 
-func makeDefaultExprs(
-	cols []sqlbase.ColumnDescriptor, parse *parser.Parser, evalCtx *parser.EvalContext,
-) ([]parser.TypedExpr, error) {
-	// Check to see if any of the columns have DEFAULT expressions. If there
-	// are no DEFAULT expressions, we don't bother with constructing the
-	// defaults map as the defaults are all NULL.
-	haveDefaults := false
-	for _, col := range cols {
-		if col.DefaultExpr != nil {
-			haveDefaults = true
-			break
-		}
-	}
-	if !haveDefaults {
-		return nil, nil
+func (n *insertNode) Values() parser.Datums {
+	if !n.isUpsertReturning {
+		return n.run.resultRow
 	}
 
-	// Build the default expressions map from the parsed SELECT statement.
-	defaultExprs := make([]parser.TypedExpr, 0, len(cols))
-	exprStrings := make([]string, 0, len(cols))
-	for _, col := range cols {
-		if col.DefaultExpr != nil {
-			exprStrings = append(exprStrings, *col.DefaultExpr)
-		}
-	}
-	exprs, err := parser.ParseExprsTraditional(exprStrings)
-	if err != nil {
-		return nil, err
-	}
-
-	defExprIdx := 0
-	for _, col := range cols {
-		if col.DefaultExpr == nil {
-			defaultExprs = append(defaultExprs, parser.DNull)
-			continue
-		}
-		expr := exprs[defExprIdx]
-		typedExpr, err := parser.TypeCheck(expr, nil, col.Type.ToDatumType())
-		if err != nil {
-			return nil, err
-		}
-		if typedExpr, err = parse.NormalizeExpr(evalCtx, typedExpr); err != nil {
-			return nil, err
-		}
-		defaultExprs = append(defaultExprs, typedExpr)
-		defExprIdx++
-	}
-	return defaultExprs, nil
+	row := n.run.rowsUpserted.At(0)
+	n.run.rowsUpserted.PopFirst()
+	return row
 }
-
-func (n *insertNode) Columns() ResultColumns {
-	return n.rh.columns
-}
-
-func (n *insertNode) Values() parser.DTuple {
-	return n.run.resultRow
-}
-
-func (n *insertNode) MarkDebug(mode explainMode) {
-	if mode != explainDebug {
-		panic(fmt.Sprintf("unknown debug mode %d", mode))
-	}
-	n.run.explain = mode
-	n.run.rows.MarkDebug(mode)
-}
-
-func (n *insertNode) DebugValues() debugValues {
-	return n.run.rows.DebugValues()
-}
-
-func (n *insertNode) Ordering() orderingInfo {
-	return n.run.rows.Ordering()
-}
-
-func (n *insertNode) ExplainPlan(v bool) (name, description string, children []planNode) {
-	var buf bytes.Buffer
-	if v {
-		fmt.Fprintf(&buf, "into %s (", n.tableDesc.Name)
-		for i, col := range n.insertCols {
-			if i > 0 {
-				fmt.Fprintf(&buf, ", ")
-			}
-			fmt.Fprintf(&buf, "%s", col.Name)
-		}
-		fmt.Fprintf(&buf, ") returning (")
-		for i, col := range n.rh.columns {
-			if i > 0 {
-				fmt.Fprintf(&buf, ", ")
-			}
-			fmt.Fprintf(&buf, "%s", col.Name)
-		}
-		fmt.Fprintf(&buf, ")")
-	}
-
-	subplans := []planNode{n.run.rows}
-	for _, e := range n.defaultExprs {
-		subplans = n.p.collectSubqueryPlans(e, subplans)
-	}
-	for _, e := range n.checkHelper.exprs {
-		subplans = n.p.collectSubqueryPlans(e, subplans)
-	}
-	for _, e := range n.rh.exprs {
-		subplans = n.p.collectSubqueryPlans(e, subplans)
-	}
-	return "insert", buf.String(), subplans
-}
-
-func (n *insertNode) ExplainTypes(regTypes func(string, string)) {
-	for i, dexpr := range n.defaultExprs {
-		regTypes(fmt.Sprintf("default %d", i), parser.AsStringWithFlags(dexpr, parser.FmtShowTypes))
-	}
-	for i, cexpr := range n.checkHelper.exprs {
-		regTypes(fmt.Sprintf("check %d", i), parser.AsStringWithFlags(cexpr, parser.FmtShowTypes))
-	}
-	cols := n.rh.columns
-	for i, rexpr := range n.rh.exprs {
-		regTypes(fmt.Sprintf("returning %s", cols[i].Name), parser.AsStringWithFlags(rexpr, parser.FmtShowTypes))
-	}
-}
-
-func (n *insertNode) SetLimitHint(numRows int64, soft bool) {}
-func (n *insertNode) setNeededColumns(_ []bool)             {}

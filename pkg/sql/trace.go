@@ -11,208 +11,142 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Tobias Schottdorf (tobias.schottdorf@gmail.com)
 
 package sql
 
 import (
-	"fmt"
-	"time"
+	"errors"
 
-	"github.com/cockroachdb/cockroach/pkg/internal/client"
+	"golang.org/x/net/context"
+
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
-	"github.com/cockroachdb/cockroach/pkg/util/encoding"
-	basictracer "github.com/opentracing/basictracer-go"
-	opentracing "github.com/opentracing/opentracing-go"
-	otlog "github.com/opentracing/opentracing-go/log"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 )
 
-// explainTraceNode is a planNode that wraps another node and converts DebugValues() results to a
-// row of Values(). It is used as the top-level node for EXPLAIN (TRACE) statements.
-type explainTraceNode struct {
-	plan planNode
-	txn  *client.Txn
-	// Internal state, not to be initialized.
-	earliest  time.Time
-	exhausted bool
-	rows      []parser.DTuple
-	lastTS    time.Time
-	lastPos   int
+// traceNode is a planNode that wraps another node and uses session
+// tracing to report all the database events that occur during its
+// execution.
+// It is used as the top-level node for SHOW TRACE FOR statements.
+type traceNode struct {
+	plan    planNode
+	columns sqlbase.ResultColumns
+	p       *planner
+
+	execDone bool
+
+	traceRows []traceRow
+	curRow    int
 }
 
-var traceColumns = append(ResultColumns{
-	{Name: "Cumulative Time", Typ: parser.TypeString},
-	{Name: "Duration", Typ: parser.TypeString},
-	{Name: "Span Pos", Typ: parser.TypeInt},
-	{Name: "Operation", Typ: parser.TypeString},
-	{Name: "Event", Typ: parser.TypeString},
-}, debugColumns...)
-
-// Internally, the explainTraceNode also returns a timestamp column which is
-// used during sorting.
-var traceColumnsWithTS = append(traceColumns, ResultColumn{
-	Name: "Timestamp", Typ: parser.TypeTimestamp,
-})
-
-var traceOrdering = sqlbase.ColumnOrdering{
-	{ColIdx: len(traceColumns), Direction: encoding.Ascending}, /* Start time */
-	{ColIdx: 2, Direction: encoding.Ascending},                 /* Span pos */
+var sessionTraceTableName = parser.TableName{
+	DatabaseName: parser.Name("crdb_internal"),
+	TableName:    parser.Name("session_trace"),
 }
 
-func (p *planner) makeTraceNode(plan planNode, txn *client.Txn) planNode {
-	return &selectTopNode{
-		source: &explainTraceNode{
-			plan: plan,
-			txn:  txn,
-		},
-		sort: &sortNode{
-			// Generally, sortNode uses its ctx field to log sorting
-			// details.  However the user of EXPLAIN(TRACE) only wants
-			// details about the traced statement, not about the sortNode
-			// that does work on behalf of the EXPLAIN statement itself.  So
-			// we connect this sortNode to a different context, so its log
-			// messages do not go to the planner's context which will be
-			// responsible to collect the trace.
-
-			// TODO(andrei): I think ideally we would also use the planner's
-			// Span, but create a sub-span for the Sorting with a special
-			// tag that is ignored by the EXPLAIN TRACE logic. This way,
-			// this sorting would still appear in our debug tracing, it just
-			// wouldn't be reported. Of course, currently statements under
-			// EXPLAIN TRACE are not present in our normal debug tracing at
-			// all since we override the tracer, but I'm hoping to stop
-			// doing that. And even then I'm not completely sure how this
-			// would work exactly, since the sort node "wraps" the inner
-			// select node, but we can probably do something using
-			// opentracing's "follows-from" spans as opposed to
-			// "parent-child" spans when expressing this relationship
-			// between the sort and the select.
-			ctx:      opentracing.ContextWithSpan(p.ctx(), nil),
-			p:        p,
-			ordering: traceOrdering,
-			// These are the columns that the sortNode (and thus the selectTopNode)
-			// presents as the output.
-			columns: traceColumns,
-		},
+func (p *planner) makeTraceNode(plan planNode) (planNode, error) {
+	desc, err := p.getVirtualTabler().getVirtualTableDesc(&sessionTraceTableName)
+	if err != nil {
+		return nil, err
 	}
+	return &traceNode{
+		plan:    plan,
+		p:       p,
+		columns: sqlbase.ResultColumnsFromColDescs(desc.Columns),
+	}, nil
 }
 
-func (*explainTraceNode) Columns() ResultColumns { return traceColumnsWithTS }
-func (*explainTraceNode) Ordering() orderingInfo { return orderingInfo{} }
+var errTracingAlreadyEnabled = errors.New(
+	"cannot run SHOW TRACE FOR on statement while session tracing is enabled" +
+		" - did you mean SHOW TRACE FOR SESSION?")
 
-func (n *explainTraceNode) expandPlan() error {
-	if err := n.plan.expandPlan(); err != nil {
+func (n *traceNode) Start(params runParams) error {
+	if n.p.session.Tracing.Enabled() {
+		return errTracingAlreadyEnabled
+	}
+	if err := n.p.session.Tracing.StartTracing(tracing.SnowballRecording, true); err != nil {
 		return err
 	}
 
-	n.plan.MarkDebug(explainDebug)
-	return nil
+	startCtx, sp := tracing.ChildSpan(params.ctx, "starting plan")
+	defer sp.Finish()
+	params.ctx = startCtx
+	return n.plan.Start(params)
 }
 
-func (n *explainTraceNode) Start() error { return n.plan.Start() }
-func (n *explainTraceNode) Close()       { n.plan.Close() }
-
-func (n *explainTraceNode) Next() (bool, error) {
-	first := n.rows == nil
-	if first {
-		n.rows = []parser.DTuple{}
+func (n *traceNode) Close(ctx context.Context) {
+	if n.plan != nil {
+		n.plan.Close(ctx)
 	}
-	for !n.exhausted && len(n.rows) <= 1 {
-		var vals debugValues
-		if next, err := n.plan.Next(); !next {
-			n.exhausted = true
-			sp := opentracing.SpanFromContext(n.txn.Context)
-			if err != nil {
-				sp.LogFields(otlog.String("event", err.Error()))
-				return false, err
-			}
-			sp.LogFields(otlog.String("event", "tracing completed"))
-			sp.Finish()
-			sp = nil
-			n.txn.Context = opentracing.ContextWithSpan(n.txn.Context, nil)
-		} else {
-			vals = n.plan.DebugValues()
+	n.traceRows = nil
+	if n.p.session.Tracing.Enabled() {
+		// Start has already ran and enabled tracing. Stop it.
+		if err := stopTracing(n.p.session); err != nil {
+			log.Errorf(ctx, "error stopping tracing at end of SHOW TRACE FOR: %v", err)
 		}
-		var basePos int
-		if len(n.txn.CollectedSpans) == 0 {
-			if !n.exhausted {
-				n.txn.CollectedSpans = append(n.txn.CollectedSpans, basictracer.RawSpan{
-					Logs: []opentracing.LogRecord{{Timestamp: n.lastTS}},
-				})
-			}
-			basePos = n.lastPos + 1
-		}
+	}
+}
 
-		// Iterate through once to determine earliest timestamp.
-		var earliest time.Time
-		for _, sp := range n.txn.CollectedSpans {
-			for _, entry := range sp.Logs {
-				if n.earliest.IsZero() || entry.Timestamp.Before(earliest) {
-					n.earliest = entry.Timestamp
+func (n *traceNode) Next(params runParams) (bool, error) {
+	if !n.execDone {
+		// We need to run the entire statement upfront. Subsequent
+		// invocations of Next() will merely return the trace.
+
+		func() {
+			consumeCtx, sp := tracing.ChildSpan(params.ctx, "consuming rows")
+			defer sp.Finish()
+
+			slowPath := true
+			if a, ok := n.plan.(planNodeFastPath); ok {
+				if count, res := a.FastPathResults(); res {
+					log.VEventf(consumeCtx, 2, "fast path - rows affected: %d", count)
+					slowPath = false
 				}
 			}
-		}
-
-		for _, sp := range n.txn.CollectedSpans {
-			for i, entry := range sp.Logs {
-				commulativeDuration := fmt.Sprintf("%.3fms", entry.Timestamp.Sub(n.earliest).Seconds()*1000)
-				var duration string
-				if i > 0 {
-					duration = fmt.Sprintf("%.3fms", entry.Timestamp.Sub(n.lastTS).Seconds()*1000)
-				}
-				// Extract the message of the event, which is either in an "event" or
-				// "error" field.
-				var msg string
-				for _, f := range entry.Fields {
-					key := f.Key()
-					if key == "event" {
-						msg = fmt.Sprint(f.Value())
+			if slowPath {
+				for {
+					hasNext, err := n.plan.Next(params)
+					if err != nil {
+						log.VEventf(consumeCtx, 2, "execution failed: %v", err)
 						break
 					}
-					if key == "error" {
-						msg = fmt.Sprint("error:", f.Value())
+					if !hasNext {
 						break
 					}
+
+					values := n.plan.Values()
+					log.VEventf(consumeCtx, 2, "output row: %s", values)
 				}
-				cols := append(parser.DTuple{
-					parser.NewDString(commulativeDuration),
-					parser.NewDString(duration),
-					parser.NewDInt(parser.DInt(basePos + i)),
-					parser.NewDString(sp.Operation),
-					parser.NewDString(msg),
-				}, vals.AsRow()...)
-
-				// Timestamp is added for sorting, but will be removed after sort.
-				n.rows = append(n.rows, append(cols, parser.MakeDTimestamp(entry.Timestamp, time.Nanosecond)))
-				n.lastTS, n.lastPos = entry.Timestamp, i
 			}
+			log.VEventf(consumeCtx, 2, "plan completed execution")
+
+			// Release the plan's resources early.
+			n.plan.Close(consumeCtx)
+			n.plan = nil
+
+			log.VEventf(consumeCtx, 2, "resources released, stopping trace")
+		}()
+
+		if err := stopTracing(n.p.session); err != nil {
+			return false, err
 		}
-		n.txn.CollectedSpans = nil
+
+		var err error
+		n.traceRows, err = n.p.session.Tracing.generateSessionTraceVTable()
+		if err != nil {
+			return false, err
+		}
+		n.execDone = true
 	}
 
-	if first {
-		return len(n.rows) > 0, nil
-	}
-	if len(n.rows) <= 1 {
+	if n.curRow >= len(n.traceRows) {
 		return false, nil
 	}
-	n.rows = n.rows[1:]
+	n.curRow++
 	return true, nil
 }
 
-func (n *explainTraceNode) ExplainPlan(v bool) (name, description string, children []planNode) {
-	return "explain", "trace", []planNode{n.plan}
+func (n *traceNode) Values() parser.Datums {
+	return n.traceRows[n.curRow-1][:]
 }
-
-func (n *explainTraceNode) ExplainTypes(fn func(string, string)) {}
-
-func (n *explainTraceNode) Values() parser.DTuple {
-	return n.rows[0]
-}
-
-func (*explainTraceNode) MarkDebug(_ explainMode)      {}
-func (*explainTraceNode) DebugValues() debugValues     { return debugValues{} }
-func (*explainTraceNode) SetLimitHint(_ int64, _ bool) {}
-func (*explainTraceNode) setNeededColumns(_ []bool)    {}

@@ -11,12 +11,11 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Raphael 'kena' Poss (knz@cockroachlabs.com)
 
 package util
 
 import (
+	"fmt"
 	"runtime"
 	"strings"
 )
@@ -24,16 +23,19 @@ import (
 // GetSmallTrace produces a ":"-separated single line containing the
 // topmost 5 callers from a given skip level.
 func GetSmallTrace(skip int) string {
-	pc := make([]uintptr, 5)
-	nCallers := runtime.Callers(skip, pc[:])
-	callers := make([]string, nCallers)
+	var pcs [5]uintptr
+	nCallers := runtime.Callers(skip, pcs[:])
+	callers := make([]string, 0, nCallers)
+	frames := runtime.CallersFrames(pcs[:])
 
-	for i := range callers {
-		callers[i] = strings.TrimPrefix(
-			runtime.FuncForPC(pc[i]).Name(),
-			"github.com/cockroachdb/cockroach/pkg/",
-		)
+	for {
+		f, more := frames.Next()
+		function := strings.TrimPrefix(f.Function, "github.com/cockroachdb/cockroach/pkg/")
+		callers = append(callers, fmt.Sprintf("%s:%d", function, f.Line))
+		if !more {
+			break
+		}
 	}
 
-	return strings.Join(callers, ":")
+	return strings.Join(callers, ",")
 }

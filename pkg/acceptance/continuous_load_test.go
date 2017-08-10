@@ -18,7 +18,6 @@ import (
 	"flag"
 	"net/http"
 	"regexp"
-	"strconv"
 	"testing"
 	"time"
 
@@ -38,7 +37,7 @@ import (
 //   PKG=./pkg/acceptance \
 //   TESTTIMEOUT=6h \
 //   TESTS=ContinuousLoad_BlockWriter \
-//   TESTFLAGS='-v -remote -key-name google_compute_engine -cwd terraform -nodes 4 -tf.keep-cluster=failed'
+//   TESTFLAGS='-v -remote -key-name azure -cwd terraform/azure -nodes 4 -tf.keep-cluster=failed'
 //
 // Load is generated for the duration specified by TESTTIMEOUT, minus some time
 // required for the orderly teardown of resources created by the test.  Because
@@ -62,18 +61,13 @@ type continuousLoadTest struct {
 	// Process must be one of the processes (e.g. block_writer) that's
 	// downloaded by the Terraform configuration.
 	Process string
-	// CockroachDiskSizeGB is the size, in gigabytes, of the disks allocated
-	// for CockroachDB nodes. Leaving this as 0 accepts the default in the
-	// Terraform configs. This must be in GB, because Terraform only accepts
-	// disk size for GCE in GB.
-	CockroachDiskSizeGB int
 }
 
 // queryCount returns the total SQL queries executed by the cluster.
 func (cl continuousLoadTest) queryCount(f *terrafarm.Farmer) (float64, error) {
 	var client http.Client
 	var resp status.NodeStatus
-	host := f.Nodes()[0]
+	host := f.Hostname(0)
 	if err := httputil.GetJSON(client, "http://"+host+":8080/_status/nodes/local", &resp); err != nil {
 		return 0, err
 	}
@@ -90,6 +84,9 @@ func (cl continuousLoadTest) queryCount(f *terrafarm.Farmer) (float64, error) {
 // by the `test.timeout` flag, minus the time it takes to reliably tear down
 // the test cluster.
 func (cl continuousLoadTest) Run(ctx context.Context, t testing.TB) {
+	s := log.Scope(t)
+	defer s.Close(t)
+
 	f := MakeFarmer(t, cl.Prefix+cl.shortTestTimeout(), stopper)
 	// If the timeout flag was set, calculate an appropriate lower timeout by
 	// subtracting expected cluster creation and teardown times to allow for
@@ -122,14 +119,14 @@ func (cl continuousLoadTest) Run(ctx context.Context, t testing.TB) {
 		}
 		f.MustDestroy(t)
 	}()
-	f.AddVars["benchmark_name"] = cl.BenchmarkPrefix + cl.shortTestTimeout()
-	if cl.CockroachDiskSizeGB != 0 {
-		f.AddVars["cockroach_disk_size"] = strconv.Itoa(cl.CockroachDiskSizeGB)
-	}
+	f.BenchmarkName = cl.BenchmarkPrefix + cl.shortTestTimeout()
+
 	if err := f.Resize(cl.NumNodes); err != nil {
 		t.Fatal(err)
 	}
-	CheckGossip(ctx, t, f, longWaitTime, HasPeers(cl.NumNodes))
+	if err := CheckGossip(ctx, f, longWaitTime, HasPeers(cl.NumNodes)); err != nil {
+		t.Fatal(err)
+	}
 	start := timeutil.Now()
 	if err := f.StartLoad(ctx, cl.Process, *flagCLTWriters); err != nil {
 		t.Fatal(err)
@@ -195,21 +192,19 @@ func (cl continuousLoadTest) shortTestTimeout() string {
 func TestContinuousLoad_BlockWriter(t *testing.T) {
 	ctx := context.Background()
 	continuousLoadTest{
-		Prefix:              "bwriter",
-		BenchmarkPrefix:     "BenchmarkBlockWriter",
-		NumNodes:            *flagNodes,
-		Process:             "block_writer",
-		CockroachDiskSizeGB: 200,
+		Prefix:          "bwriter",
+		BenchmarkPrefix: "BenchmarkBlockWriter",
+		NumNodes:        *flagNodes,
+		Process:         "block_writer",
 	}.Run(ctx, t)
 }
 
 func TestContinuousLoad_Photos(t *testing.T) {
 	ctx := context.Background()
 	continuousLoadTest{
-		Prefix:              "photos",
-		BenchmarkPrefix:     "BenchmarkPhotos",
-		NumNodes:            *flagNodes,
-		Process:             "photos",
-		CockroachDiskSizeGB: 200,
+		Prefix:          "photos",
+		BenchmarkPrefix: "BenchmarkPhotos",
+		NumNodes:        *flagNodes,
+		Process:         "photos",
 	}.Run(ctx, t)
 }

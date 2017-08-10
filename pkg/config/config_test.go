@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Marc Berhault (marc@cockroachlabs.com)
 
 package config_test
 
@@ -209,13 +207,89 @@ func TestGetLargestID(t *testing.T) {
 	}
 }
 
-func TestComputeSplits(t *testing.T) {
+func TestStaticSplits(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	for i := range config.StaticSplits {
+		if config.StaticSplits[i].SplitKey.Less(config.StaticSplits[i].SplitPoint) {
+			t.Errorf("SplitKey %q should not be less than SplitPoint %q",
+				config.StaticSplits[i].SplitKey, config.StaticSplits[i].SplitPoint)
+		}
+		if i == 0 {
+			continue
+		}
+		if !config.StaticSplits[i-1].SplitKey.Less(config.StaticSplits[i].SplitPoint) {
+			t.Errorf("previous SplitKey %q should be less than next SplitPoint %q",
+				config.StaticSplits[i-1].SplitKey, config.StaticSplits[i].SplitPoint)
+		}
+	}
+}
+
+// TestComputeSplitKeyTableIDs tests ComputeSplitKey for cases where the split
+// is within the system ranges. Other cases are tested below by
+// TestComputeSplitKeyTableIDs.
+func TestComputeSplitKeySystemRanges(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	testCases := []struct {
+		start, end roachpb.RKey
+		split      roachpb.Key
+	}{
+		{roachpb.RKeyMin, roachpb.RKeyMax, keys.SystemPrefix},
+		{roachpb.RKeyMin, keys.MakeTablePrefix(1), keys.SystemPrefix},
+		{roachpb.RKeyMin, roachpb.RKey(keys.TimeseriesPrefix), keys.SystemPrefix},
+		{roachpb.RKeyMin, roachpb.RKey(keys.SystemPrefix.Next()), keys.SystemPrefix},
+		{roachpb.RKeyMin, roachpb.RKey(keys.SystemPrefix), nil},
+		{roachpb.RKeyMin, roachpb.RKey(keys.MetaMax), nil},
+		{roachpb.RKeyMin, roachpb.RKey(keys.Meta2KeyMax), nil},
+		{roachpb.RKeyMin, roachpb.RKey(keys.Meta1KeyMax), nil},
+		{roachpb.RKey(keys.Meta1KeyMax), roachpb.RKey(keys.SystemPrefix), nil},
+		{roachpb.RKey(keys.Meta1KeyMax), roachpb.RKey(keys.SystemPrefix.Next()), keys.SystemPrefix},
+		{roachpb.RKey(keys.Meta1KeyMax), roachpb.RKeyMax, keys.SystemPrefix},
+		{roachpb.RKey(keys.SystemPrefix), roachpb.RKey(keys.SystemPrefix), nil},
+		{roachpb.RKey(keys.SystemPrefix), roachpb.RKey(keys.SystemPrefix.Next()), nil},
+		{roachpb.RKey(keys.SystemPrefix), roachpb.RKeyMax, keys.TimeseriesPrefix},
+		{roachpb.RKey(keys.MigrationPrefix), roachpb.RKey(keys.NodeLivenessPrefix), nil},
+		{roachpb.RKey(keys.MigrationPrefix), roachpb.RKey(keys.NodeLivenessKeyMax), nil},
+		{roachpb.RKey(keys.MigrationPrefix), roachpb.RKey(keys.StoreIDGenerator), nil},
+		{roachpb.RKey(keys.MigrationPrefix), roachpb.RKey(keys.TimeseriesPrefix), nil},
+		{roachpb.RKey(keys.MigrationPrefix), roachpb.RKey(keys.TimeseriesPrefix.Next()), keys.TimeseriesPrefix},
+		{roachpb.RKey(keys.MigrationPrefix), roachpb.RKeyMax, keys.TimeseriesPrefix},
+		{roachpb.RKey(keys.TimeseriesPrefix), roachpb.RKey(keys.TimeseriesPrefix.Next()), nil},
+		{roachpb.RKey(keys.TimeseriesPrefix), roachpb.RKey(keys.TimeseriesPrefix.PrefixEnd()), nil},
+		{roachpb.RKey(keys.TimeseriesPrefix), roachpb.RKeyMax, keys.TimeseriesPrefix.PrefixEnd()},
+		{roachpb.RKey(keys.TimeseriesPrefix.PrefixEnd()), roachpb.RKey(keys.TimeseriesPrefix.PrefixEnd()), nil},
+		{roachpb.RKey(keys.TimeseriesPrefix.PrefixEnd()), roachpb.RKeyMax, keys.SystemConfigSplitKey},
+	}
+
+	cfg := config.SystemConfig{
+		Values: sqlbase.MakeMetadataSchema().GetInitialValues(),
+	}
+	for tcNum, tc := range testCases {
+		splitKey := cfg.ComputeSplitKey(tc.start, tc.end)
+		expected := roachpb.RKey(tc.split)
+		if !splitKey.Equal(expected) {
+			t.Errorf("#%d: bad split:\ngot: %v\nexpected: %v", tcNum, splitKey, expected)
+		}
+	}
+}
+
+// TestComputeSplitKeyTableIDs tests ComputeSplitKey for cases where the split
+// is at the start of a SQL table. Other cases are tested above by
+// TestComputeSplitKeySystemRanges.
+func TestComputeSplitKeyTableIDs(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
 	const (
 		start         = keys.MaxReservedDescID + 1
 		reservedStart = keys.MaxSystemConfigDescID + 1
 	)
+
+	// Used in place of roachpb.RKeyMin in order to test the behavior of splits
+	// at the start of the system config and user tables rather than within the
+	// system ranges that come earlier in the keyspace. Those splits are tested
+	// separately above.
+	minKey := roachpb.RKey(keys.TimeseriesPrefix.PrefixEnd())
 
 	schema := sqlbase.MakeMetadataSchema()
 	// Real system tables only.
@@ -225,77 +299,126 @@ func TestComputeSplits(t *testing.T) {
 		descriptor(start), descriptor(start+1), descriptor(start+5))
 	sort.Sort(roachpb.KeyValueByKey(allSql))
 
-	allUserSplits := []uint32{start, start + 1, start + 2, start + 3, start + 4, start + 5}
-	var allReservedSplits []uint32
-	for i := 0; i < schema.SystemDescriptorCount()-schema.SystemConfigDescriptorCount(); i++ {
-		allReservedSplits = append(allReservedSplits, reservedStart+uint32(i))
-	}
-	allSplits := append(allReservedSplits, allUserSplits...)
-
 	testCases := []struct {
 		values     []roachpb.KeyValue
 		start, end roachpb.RKey
-		// Use ints in the testcase definitions, more readable.
-		splits []uint32
+		split      int32 // -1 to indicate no split is expected
 	}{
 		// No data.
-		{nil, roachpb.RKeyMin, roachpb.RKeyMax, nil},
-		{nil, keys.MakeTablePrefix(start), roachpb.RKeyMax, nil},
-		{nil, keys.MakeTablePrefix(start), keys.MakeTablePrefix(start + 10), nil},
-		{nil, roachpb.RKeyMin, keys.MakeTablePrefix(start + 10), nil},
+		{nil, minKey, roachpb.RKeyMax, 0},
+		{nil, keys.MakeTablePrefix(start), roachpb.RKeyMax, -1},
+		{nil, keys.MakeTablePrefix(start), keys.MakeTablePrefix(start + 10), -1},
+		{nil, minKey, keys.MakeTablePrefix(start + 10), 0},
 
 		// Reserved descriptors.
-		{baseSql, roachpb.RKeyMin, roachpb.RKeyMax, allReservedSplits},
-		{baseSql, keys.MakeTablePrefix(start), roachpb.RKeyMax, nil},
-		{baseSql, keys.MakeTablePrefix(start), keys.MakeTablePrefix(start + 10), nil},
-		{baseSql, roachpb.RKeyMin, keys.MakeTablePrefix(start + 10), allReservedSplits},
-		{baseSql, keys.MakeTablePrefix(reservedStart), roachpb.RKeyMax, allReservedSplits[1:]},
-		{baseSql, keys.MakeTablePrefix(reservedStart), keys.MakeTablePrefix(start + 10), allReservedSplits[1:]},
-		{baseSql, roachpb.RKeyMin, keys.MakeTablePrefix(reservedStart + 2), allReservedSplits[:2]},
-		{baseSql, roachpb.RKeyMin, keys.MakeTablePrefix(reservedStart + 10), allReservedSplits},
-		{baseSql, keys.MakeTablePrefix(reservedStart), keys.MakeTablePrefix(reservedStart + 2), allReservedSplits[1:2]},
+		{baseSql, minKey, roachpb.RKeyMax, 0},
+		{baseSql, keys.MakeTablePrefix(start), roachpb.RKeyMax, -1},
+		{baseSql, keys.MakeTablePrefix(start), keys.MakeTablePrefix(start + 10), -1},
+		{baseSql, minKey, keys.MakeTablePrefix(start + 10), 0},
+		{baseSql, keys.MakeTablePrefix(reservedStart), roachpb.RKeyMax, reservedStart + 1},
+		{baseSql, keys.MakeTablePrefix(reservedStart), keys.MakeTablePrefix(start + 10), reservedStart + 1},
+		{baseSql, minKey, keys.MakeTablePrefix(reservedStart + 2), 0},
+		{baseSql, minKey, keys.MakeTablePrefix(reservedStart + 10), 0},
+		{baseSql, keys.MakeTablePrefix(reservedStart), keys.MakeTablePrefix(reservedStart + 2), reservedStart + 1},
 		{baseSql, testutils.MakeKey(keys.MakeTablePrefix(reservedStart), roachpb.RKey("foo")),
-			testutils.MakeKey(keys.MakeTablePrefix(start+10), roachpb.RKey("foo")), allReservedSplits[1:]},
+			testutils.MakeKey(keys.MakeTablePrefix(start+10), roachpb.RKey("foo")), reservedStart + 1},
 
 		// Reserved + User descriptors.
-		{allSql, keys.MakeTablePrefix(start - 1), roachpb.RKeyMax, allUserSplits},
-		{allSql, keys.MakeTablePrefix(start), roachpb.RKeyMax, allUserSplits[1:]},
-		{allSql, keys.MakeTablePrefix(start), keys.MakeTablePrefix(start + 10), allUserSplits[1:]},
-		{allSql, keys.MakeTablePrefix(start - 1), keys.MakeTablePrefix(start + 10), allUserSplits},
-		{allSql, keys.MakeTablePrefix(start + 4), keys.MakeTablePrefix(start + 10), allUserSplits[5:]},
-		{allSql, keys.MakeTablePrefix(start + 5), keys.MakeTablePrefix(start + 10), nil},
-		{allSql, keys.MakeTablePrefix(start + 6), keys.MakeTablePrefix(start + 10), nil},
+		{allSql, keys.MakeTablePrefix(start - 1), roachpb.RKeyMax, start},
+		{allSql, keys.MakeTablePrefix(start), roachpb.RKeyMax, start + 1},
+		{allSql, keys.MakeTablePrefix(start), keys.MakeTablePrefix(start + 10), start + 1},
+		{allSql, keys.MakeTablePrefix(start - 1), keys.MakeTablePrefix(start + 10), start},
+		{allSql, keys.MakeTablePrefix(start + 4), keys.MakeTablePrefix(start + 10), start + 5},
+		{allSql, keys.MakeTablePrefix(start + 5), keys.MakeTablePrefix(start + 10), -1},
+		{allSql, keys.MakeTablePrefix(start + 6), keys.MakeTablePrefix(start + 10), -1},
 		{allSql, testutils.MakeKey(keys.MakeTablePrefix(start), roachpb.RKey("foo")),
-			keys.MakeTablePrefix(start + 10), allUserSplits[1:]},
+			keys.MakeTablePrefix(start + 10), start + 1},
 		{allSql, testutils.MakeKey(keys.MakeTablePrefix(start), roachpb.RKey("foo")),
-			keys.MakeTablePrefix(start + 5), allUserSplits[1:5]},
+			keys.MakeTablePrefix(start + 5), start + 1},
 		{allSql, testutils.MakeKey(keys.MakeTablePrefix(start), roachpb.RKey("foo")),
-			testutils.MakeKey(keys.MakeTablePrefix(start+5), roachpb.RKey("bar")), allUserSplits[1:5]},
+			testutils.MakeKey(keys.MakeTablePrefix(start+5), roachpb.RKey("bar")), start + 1},
 		{allSql, testutils.MakeKey(keys.MakeTablePrefix(start), roachpb.RKey("foo")),
-			testutils.MakeKey(keys.MakeTablePrefix(start), roachpb.RKey("morefoo")), nil},
-		{allSql, roachpb.RKeyMin, roachpb.RKeyMax, allSplits},
-		{allSql, keys.MakeTablePrefix(reservedStart + 1), roachpb.RKeyMax, allSplits[2:]},
-		{allSql, keys.MakeTablePrefix(reservedStart), keys.MakeTablePrefix(start + 10), allSplits[1:]},
-		{allSql, roachpb.RKeyMin, keys.MakeTablePrefix(start + 2), allSplits[:6]},
+			testutils.MakeKey(keys.MakeTablePrefix(start), roachpb.RKey("morefoo")), -1},
+		{allSql, minKey, roachpb.RKeyMax, 0},
+		{allSql, keys.MakeTablePrefix(reservedStart + 1), roachpb.RKeyMax, reservedStart + 2},
+		{allSql, keys.MakeTablePrefix(reservedStart), keys.MakeTablePrefix(start + 10), reservedStart + 1},
+		{allSql, minKey, keys.MakeTablePrefix(start + 2), 0},
 		{allSql, testutils.MakeKey(keys.MakeTablePrefix(reservedStart), roachpb.RKey("foo")),
-			testutils.MakeKey(keys.MakeTablePrefix(start+5), roachpb.RKey("foo")), allSplits[1:9]},
+			testutils.MakeKey(keys.MakeTablePrefix(start+5), roachpb.RKey("foo")), reservedStart + 1},
 	}
 
 	cfg := config.SystemConfig{}
 	for tcNum, tc := range testCases {
 		cfg.Values = tc.values
-		splits := cfg.ComputeSplitKeys(tc.start, tc.end)
-		if len(splits) == 0 && len(tc.splits) == 0 {
+		splitKey := cfg.ComputeSplitKey(tc.start, tc.end)
+		if splitKey == nil && tc.split == -1 {
 			continue
 		}
-
-		// Convert ints to actual keys.
-		expected := []roachpb.RKey{}
-		for _, s := range tc.splits {
-			expected = append(expected, keys.MakeRowSentinelKey(keys.MakeTablePrefix(s)))
+		var expected roachpb.RKey
+		if tc.split != -1 {
+			expected = keys.MakeTablePrefix(uint32(tc.split))
 		}
-		if !reflect.DeepEqual(splits, expected) {
-			t.Errorf("#%d: bad splits:\ngot: %v\nexpected: %v", tcNum, splits, expected)
+		if !splitKey.Equal(expected) {
+			t.Errorf("#%d: bad split:\ngot: %v\nexpected: %v", tcNum, splitKey, expected)
+		}
+	}
+}
+
+func TestGetZoneConfigForKey(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	testCases := []struct {
+		key        roachpb.RKey
+		expectedID uint32
+	}{
+		{roachpb.RKeyMin, keys.MetaRangesID},
+		{roachpb.RKey(keys.Meta1Prefix), keys.MetaRangesID},
+		{roachpb.RKey(keys.Meta1Prefix.Next()), keys.MetaRangesID},
+		{roachpb.RKey(keys.Meta2Prefix), keys.MetaRangesID},
+		{roachpb.RKey(keys.Meta2Prefix.Next()), keys.MetaRangesID},
+		{roachpb.RKey(keys.MetaMax), keys.SystemRangesID},
+		{roachpb.RKey(keys.SystemPrefix), keys.SystemRangesID},
+		{roachpb.RKey(keys.SystemPrefix.Next()), keys.SystemRangesID},
+		{roachpb.RKey(keys.MigrationLease), keys.SystemRangesID},
+		{roachpb.RKey(keys.NodeLivenessPrefix), keys.SystemRangesID},
+		{roachpb.RKey(keys.DescIDGenerator), keys.SystemRangesID},
+		{roachpb.RKey(keys.NodeIDGenerator), keys.SystemRangesID},
+		{roachpb.RKey(keys.RangeIDGenerator), keys.SystemRangesID},
+		{roachpb.RKey(keys.StoreIDGenerator), keys.SystemRangesID},
+		{roachpb.RKey(keys.StatusPrefix), keys.SystemRangesID},
+		{roachpb.RKey(keys.TimeseriesPrefix), keys.TimeseriesRangesID},
+		{roachpb.RKey(keys.TimeseriesPrefix.Next()), keys.TimeseriesRangesID},
+		{roachpb.RKey(keys.TimeseriesPrefix.PrefixEnd()), keys.SystemRangesID},
+		{roachpb.RKey(keys.TableDataMin), keys.SystemDatabaseID},
+		{roachpb.RKey(keys.SystemConfigSplitKey), keys.SystemDatabaseID},
+		{keys.MakeTablePrefix(keys.NamespaceTableID), keys.SystemDatabaseID},
+		{keys.MakeTablePrefix(keys.ZonesTableID), keys.SystemDatabaseID},
+		{keys.MakeTablePrefix(keys.LeaseTableID), keys.SystemDatabaseID},
+		{keys.MakeTablePrefix(keys.JobsTableID), keys.SystemDatabaseID},
+		{keys.MakeTablePrefix(keys.MaxReservedDescID + 1), keys.MaxReservedDescID + 1},
+		{keys.MakeTablePrefix(keys.MaxReservedDescID + 23), keys.MaxReservedDescID + 23},
+		{roachpb.RKeyMax, keys.RootNamespaceID},
+	}
+
+	originalZoneConfigHook := config.ZoneConfigHook
+	defer func() {
+		config.ZoneConfigHook = originalZoneConfigHook
+	}()
+	cfg := config.SystemConfig{
+		Values: sqlbase.MakeMetadataSchema().GetInitialValues(),
+	}
+	for tcNum, tc := range testCases {
+		var objectID uint32
+		config.ZoneConfigHook = func(_ config.SystemConfig, id uint32) (config.ZoneConfig, bool, error) {
+			objectID = id
+			return config.ZoneConfig{}, false, nil
+		}
+		_, err := cfg.GetZoneConfigForKey(tc.key)
+		if err != nil {
+			t.Errorf("#%d: GetZoneConfigForKey(%v) got error: %v", tcNum, tc.key, err)
+		}
+		if objectID != tc.expectedID {
+			t.Errorf("#%d: GetZoneConfigForKey(%v) got %d; want %d", tcNum, tc.key, objectID, tc.expectedID)
 		}
 	}
 }

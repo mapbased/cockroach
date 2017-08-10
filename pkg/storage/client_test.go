@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Spencer Kimball (spencer.kimball@gmail.com)
 
 /* Package storage_test provides a means of testing store
 functionality which depends on a fully-functional KV client. This
@@ -31,7 +29,6 @@ import (
 	"reflect"
 	"sort"
 	"sync"
-	"sync/atomic"
 	"testing"
 	"time"
 
@@ -51,6 +48,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/rpc"
+	"github.com/cockroachdb/cockroach/pkg/settings"
+	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/storage/engine"
@@ -64,7 +63,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/netutil"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
-	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 )
 
 // rg1 returns a wrapping sender that changes all requests to range 0 to
@@ -113,7 +111,7 @@ func createTestStoreWithEngine(
 	storeCfg storage.StoreConfig,
 	stopper *stop.Stopper,
 ) *storage.Store {
-	tracer := tracing.NewTracer()
+	tracer := storeCfg.Settings.Tracer
 	ac := log.AmbientContext{Tracer: tracer}
 	storeCfg.AmbientCtx = ac
 
@@ -121,7 +119,7 @@ func createTestStoreWithEngine(
 	nodeDesc := &roachpb.NodeDescriptor{NodeID: 1}
 	server := rpc.NewServer(rpcContext) // never started
 	storeCfg.Gossip = gossip.NewTest(
-		nodeDesc.NodeID, rpcContext, server, nil, stopper, metric.NewRegistry(),
+		nodeDesc.NodeID, rpcContext, server, stopper, metric.NewRegistry(),
 	)
 	storeCfg.ScanMaxIdleTime = 1 * time.Second
 	stores := storage.NewStores(ac, storeCfg.Clock)
@@ -133,35 +131,31 @@ func createTestStoreWithEngine(
 	retryOpts := base.DefaultRetryOptions()
 	retryOpts.Closer = stopper.ShouldQuiesce()
 	distSender := kv.NewDistSender(kv.DistSenderConfig{
-		Clock:            storeCfg.Clock,
-		TransportFactory: kv.SenderTransportFactory(tracer, stores),
-		RPCRetryOptions:  &retryOpts,
+		AmbientCtx: ac,
+		Clock:      storeCfg.Clock,
+		TestingKnobs: kv.DistSenderTestingKnobs{
+			TransportFactory: kv.SenderTransportFactory(tracer, stores),
+		},
+		RPCRetryOptions: &retryOpts,
 	}, storeCfg.Gossip)
 
 	sender := kv.NewTxnCoordSender(
 		ac,
+		storeCfg.Settings,
 		distSender,
 		storeCfg.Clock,
 		false,
 		stopper,
 		kv.MakeTxnMetrics(metric.TestSampleInterval),
 	)
-	storeCfg.DB = client.NewDB(sender)
-	storeCfg.StorePool = storage.NewStorePool(
-		log.AmbientContext{},
-		storeCfg.Gossip,
-		storeCfg.Clock,
-		storage.StorePoolNodeLivenessTrue,
-		storage.TestTimeUntilStoreDeadOff,
-		/* deterministic */ false,
-	)
+	storeCfg.DB = client.NewDB(sender, storeCfg.Clock)
+	storeCfg.StorePool = storage.NewTestStorePool(storeCfg)
 	storeCfg.Transport = storage.NewDummyRaftTransport()
 	// TODO(bdarnell): arrange to have the transport closed.
 	store := storage.NewStore(storeCfg, eng, nodeDesc)
-	// Disable consistency queue because it uses NodeLiveness which we aren't initializing.
-	store.SetConsistencyQueueActive(false)
+	ctx := context.Background()
 	if bootstrap {
-		if err := store.Bootstrap(roachpb.StoreIdent{NodeID: 1, StoreID: 1}); err != nil {
+		if err := store.Bootstrap(ctx, roachpb.StoreIdent{NodeID: 1, StoreID: 1}); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -172,9 +166,24 @@ func createTestStoreWithEngine(
 			t.Fatal(err)
 		}
 	}
-	if err := store.Start(context.Background(), stopper); err != nil {
+	if err := store.Start(ctx, stopper); err != nil {
 		t.Fatal(err)
 	}
+
+	// Connect to gossip and gossip the store's capacity.
+	<-store.Gossip().Connected
+	if err := store.GossipStore(ctx); err != nil {
+		t.Fatal(err)
+	}
+	// Wait for the store's single range to have quorum before proceeding.
+	repl := store.LookupReplica(roachpb.RKeyMin, nil)
+	testutils.SucceedsSoon(t, func() error {
+		if !repl.HasQuorum() {
+			return errors.New("first range has not reached quorum")
+		}
+		return nil
+	})
+
 	return store
 }
 
@@ -185,21 +194,23 @@ type multiTestContext struct {
 	clock       *hlc.Clock
 	rpcContext  *rpc.Context
 
-	nodeIDtoAddr map[roachpb.NodeID]net.Addr
+	nodeIDtoAddrMu struct {
+		*syncutil.RWMutex
+		nodeIDtoAddr map[roachpb.NodeID]net.Addr
+	}
 
 	transport *storage.RaftTransport
 
 	// The per-store clocks slice normally contains aliases of
 	// multiTestContext.clock, but it may be populated before Start() to
 	// use distinct clocks per store.
-	clocks         []*hlc.Clock
-	engines        []engine.Engine
-	grpcServers    []*grpc.Server
-	distSenders    []*kv.DistSender
-	dbs            []*client.DB
-	gossips        []*gossip.Gossip
-	nodeLivenesses []*storage.NodeLiveness
-	storePools     []*storage.StorePool
+	clocks      []*hlc.Clock
+	engines     []engine.Engine
+	grpcServers []*grpc.Server
+	distSenders []*kv.DistSender
+	dbs         []*client.DB
+	gossips     []*gossip.Gossip
+	storePools  []*storage.StorePool
 	// We use multiple stoppers so we can restart different parts of the
 	// test individually. transportStopper is for 'transport', and the
 	// 'stoppers' slice corresponds to the 'stores'.
@@ -209,22 +220,18 @@ type multiTestContext struct {
 
 	// The fields below may mutate at runtime so the pointers they contain are
 	// protected by 'mu'.
-	mu       *syncutil.RWMutex
-	senders  []*storage.Stores
-	stores   []*storage.Store
-	stoppers []*stop.Stopper
-	idents   []roachpb.StoreIdent
-
-	// expireLeasesActive restricts expiration of leases so only os is
-	// active at a time. This int32 value is set to 1 atomically to
-	// indicate that an expiration is active.
-	expireLeasesActive int32
+	mu             *syncutil.RWMutex
+	senders        []*storage.Stores
+	stores         []*storage.Store
+	stoppers       []*stop.Stopper
+	idents         []roachpb.StoreIdent
+	nodeLivenesses []*storage.NodeLiveness
 }
 
 func (m *multiTestContext) getNodeIDAddress(nodeID roachpb.NodeID) (net.Addr, error) {
-	m.mu.RLock()
-	addr, ok := m.nodeIDtoAddr[nodeID]
-	m.mu.RUnlock()
+	m.nodeIDtoAddrMu.RLock()
+	addr, ok := m.nodeIDtoAddrMu.nodeIDtoAddr[nodeID]
+	m.nodeIDtoAddrMu.RUnlock()
 	if ok {
 		return addr, nil
 	}
@@ -248,6 +255,7 @@ func (m *multiTestContext) Start(t *testing.T, numStores int) {
 	}
 	m.t = t
 
+	m.nodeIDtoAddrMu.RWMutex = &syncutil.RWMutex{}
 	m.mu = &syncutil.RWMutex{}
 	m.stores = make([]*storage.Store, numStores)
 	m.storePools = make([]*storage.StorePool, numStores)
@@ -269,8 +277,9 @@ func (m *multiTestContext) Start(t *testing.T, numStores int) {
 	if m.transportStopper == nil {
 		m.transportStopper = stop.NewStopper()
 	}
+	st := cluster.MakeClusterSettings()
 	if m.rpcContext == nil {
-		m.rpcContext = rpc.NewContext(log.AmbientContext{}, &base.Config{Insecure: true}, m.clock,
+		m.rpcContext = rpc.NewContext(log.AmbientContext{Tracer: st.Tracer}, &base.Config{Insecure: true}, m.clock,
 			m.transportStopper)
 		// Create a breaker which never trips and never backs off to avoid
 		// introducing timing-based flakes.
@@ -281,7 +290,7 @@ func (m *multiTestContext) Start(t *testing.T, numStores int) {
 		}
 	}
 	m.transport = storage.NewRaftTransport(
-		log.AmbientContext{}, m.getNodeIDAddress, nil, m.rpcContext,
+		log.AmbientContext{Tracer: st.Tracer}, st, m.getNodeIDAddress, nil, m.rpcContext,
 	)
 
 	for idx := 0; idx < numStores; idx++ {
@@ -319,7 +328,7 @@ func (m *multiTestContext) Stop() {
 					// any test (TestRaftAfterRemove is a good example) results
 					// in deadlocks where a task can't finish because of
 					// getting stuck in addWriteCommand.
-					s.Quiesce()
+					s.Quiesce(context.TODO())
 				}
 			}(s)
 		}
@@ -330,13 +339,13 @@ func (m *multiTestContext) Stop() {
 		defer m.mu.RUnlock()
 		for _, stopper := range m.stoppers {
 			if stopper != nil {
-				stopper.Stop()
+				stopper.Stop(context.TODO())
 			}
 		}
-		m.transportStopper.Stop()
+		m.transportStopper.Stop(context.TODO())
 
 		for _, s := range m.engineStoppers {
-			s.Stop()
+			s.Stop(context.TODO())
 		}
 		close(done)
 	}()
@@ -407,8 +416,6 @@ func (m *multiTestContext) initGossipNetwork() {
 
 type multiTestContextKVTransport struct {
 	mtc      *multiTestContext
-	ctx      context.Context
-	cancel   func()
 	idx      int
 	replicas kv.ReplicaSlice
 	args     roachpb.BatchRequest
@@ -421,11 +428,8 @@ type multiTestContextKVTransport struct {
 func (m *multiTestContext) kvTransportFactory(
 	_ kv.SendOptions, _ *rpc.Context, replicas kv.ReplicaSlice, args roachpb.BatchRequest,
 ) (kv.Transport, error) {
-	ctx, cancel := context.WithCancel(context.Background())
 	t := &multiTestContextKVTransport{
 		mtc:      m,
-		ctx:      ctx,
-		cancel:   cancel,
 		replicas: replicas,
 		args:     args,
 	}
@@ -433,11 +437,15 @@ func (m *multiTestContext) kvTransportFactory(
 	return t, nil
 }
 
+func (t *multiTestContextKVTransport) String() string {
+	return fmt.Sprintf("%T: replicas=%v, idx=%d", t, t.replicas, t.idx)
+}
+
 func (t *multiTestContextKVTransport) IsExhausted() bool {
 	return t.idx == len(t.replicas)
 }
 
-func (t *multiTestContextKVTransport) SendNext(done chan<- kv.BatchCall) {
+func (t *multiTestContextKVTransport) SendNext(ctx context.Context, done chan<- kv.BatchCall) {
 	rep := t.replicas[t.idx]
 	t.idx++
 	t.setPending(rep.ReplicaID, true)
@@ -447,7 +455,7 @@ func (t *multiTestContextKVTransport) SendNext(done chan<- kv.BatchCall) {
 	// and senders by subtracting 1 from the node ID.
 	nodeIndex := int(rep.NodeID) - 1
 	if log.V(1) {
-		log.Infof(context.TODO(), "SendNext nodeIndex=%d", nodeIndex)
+		log.Infof(ctx, "SendNext nodeIndex=%d", nodeIndex)
 	}
 
 	// This method crosses store boundaries: it is possible that the
@@ -457,12 +465,13 @@ func (t *multiTestContextKVTransport) SendNext(done chan<- kv.BatchCall) {
 	t.mtc.mu.RLock()
 	s := t.mtc.stoppers[nodeIndex]
 	t.mtc.mu.RUnlock()
-	if s == nil || s.RunAsyncTask(t.ctx, func(ctx context.Context) {
+	if s == nil || s.RunAsyncTask(ctx, "storage.multiTestContextKVTransport: calling next replica", func(ctx context.Context) {
 		t.mtc.mu.RLock()
 		sender := t.mtc.senders[nodeIndex]
 		t.mtc.mu.RUnlock()
 		// Make a copy and clone txn of batch args for sending.
 		baCopy := t.args
+		baCopy.Replica = rep.ReplicaDescriptor
 		if txn := baCopy.Txn; txn != nil {
 			txnClone := baCopy.Txn.Clone()
 			baCopy.Txn = &txnClone
@@ -486,14 +495,14 @@ func (t *multiTestContextKVTransport) SendNext(done chan<- kv.BatchCall) {
 				t.mtc.mu.RUnlock()
 				if leaseHolderStore == nil {
 					// The lease holder is known but down, so expire its lease.
-					t.mtc.expireLeases()
+					t.mtc.advanceClock(ctx)
 				}
 			} else {
 				// stores has the range, is *not* the lease holder, but the
 				// lease holder is not known; this can happen if the lease
 				// holder is removed from the group. Move the manual clock
 				// forward in an attempt to expire the lease.
-				t.mtc.expireLeases()
+				t.mtc.advanceClock(ctx)
 			}
 		}
 		t.setPending(rep.ReplicaID, false)
@@ -502,6 +511,13 @@ func (t *multiTestContextKVTransport) SendNext(done chan<- kv.BatchCall) {
 		t.setPending(rep.ReplicaID, false)
 		done <- kv.BatchCall{Err: roachpb.NewSendError("store is stopped")}
 	}
+}
+
+func (t *multiTestContextKVTransport) NextReplica() roachpb.ReplicaDescriptor {
+	if t.IsExhausted() {
+		return roachpb.ReplicaDescriptor{}
+	}
+	return t.replicas[t.idx].ReplicaDescriptor
 }
 
 func (t *multiTestContextKVTransport) MoveToFront(replica roachpb.ReplicaDescriptor) {
@@ -532,9 +548,7 @@ func (t *multiTestContextKVTransport) setPending(repID roachpb.ReplicaID, pendin
 	}
 }
 
-func (t *multiTestContextKVTransport) Close() {
-	t.cancel()
-}
+func (*multiTestContextKVTransport) Close() {}
 
 // rangeDescByAge implements sort.Interface for RangeDescriptor, sorting by the
 // age of the RangeDescriptor. This is intended to find the most recent version
@@ -601,6 +615,7 @@ func (m *multiTestContext) makeStoreConfig(i int) storage.StoreConfig {
 		cfg.Clock = m.clocks[i]
 	} else {
 		cfg = storage.TestStoreConfig(m.clocks[i])
+		m.storeConfig = &cfg
 	}
 	cfg.Transport = m.transport
 	cfg.Gossip = m.gossips[i]
@@ -625,34 +640,39 @@ func (mrdb mtcRangeDescriptorDB) RangeLookup(
 func (m *multiTestContext) populateDB(idx int, stopper *stop.Stopper) {
 	retryOpts := base.DefaultRetryOptions()
 	retryOpts.Closer = stopper.ShouldQuiesce()
+	ambient := log.AmbientContext{Tracer: m.storeConfig.Settings.Tracer}
 	m.distSenders[idx] = kv.NewDistSender(kv.DistSenderConfig{
-		Clock: m.clock,
+		AmbientCtx: ambient,
+		Clock:      m.clock,
 		RangeDescriptorDB: mtcRangeDescriptorDB{
 			multiTestContext: m,
 			ds:               &m.distSenders[idx],
 		},
-		TransportFactory: m.kvTransportFactory,
-		RPCRetryOptions:  &retryOpts,
+		TestingKnobs: kv.DistSenderTestingKnobs{
+			TransportFactory: m.kvTransportFactory,
+		},
+		RPCRetryOptions: &retryOpts,
 	}, m.gossips[idx])
-	ambient := log.AmbientContext{Tracer: tracing.NewTracer()}
 	sender := kv.NewTxnCoordSender(
 		ambient,
+		m.storeConfig.Settings,
 		m.distSenders[idx],
 		m.clock,
 		false,
 		stopper,
 		kv.MakeTxnMetrics(metric.TestSampleInterval),
 	)
-	m.dbs[idx] = client.NewDB(sender)
+	m.dbs[idx] = client.NewDB(sender, m.clock)
 }
 
 func (m *multiTestContext) populateStorePool(idx int, nodeLiveness *storage.NodeLiveness) {
 	m.storePools[idx] = storage.NewStorePool(
-		log.AmbientContext{},
+		log.AmbientContext{Tracer: m.storeConfig.Settings.Tracer},
+		m.storeConfig.Settings,
 		m.gossips[idx],
 		m.clock,
 		storage.MakeStorePoolNodeLivenessFunc(nodeLiveness),
-		m.timeUntilStoreDead,
+		settings.TestingDuration(m.timeUntilStoreDead),
 		/* deterministic */ false,
 	)
 }
@@ -682,17 +702,15 @@ func (m *multiTestContext) addStore(idx int) {
 	m.grpcServers[idx] = grpcServer
 	storage.RegisterMultiRaftServer(grpcServer, m.transport)
 
-	ambient := log.AmbientContext{Tracer: tracing.NewTracer()}
-
 	stopper := stop.NewStopper()
 
 	// Give this store the first store as a resolver. We don't provide all of the
 	// previous stores as resolvers as doing so can cause delays in bringing the
 	// gossip network up.
 	resolvers := func() []resolver.Resolver {
-		m.mu.Lock()
-		defer m.mu.Unlock()
-		addr := m.nodeIDtoAddr[1]
+		m.nodeIDtoAddrMu.Lock()
+		defer m.nodeIDtoAddrMu.Unlock()
+		addr := m.nodeIDtoAddrMu.nodeIDtoAddr[1]
 		if addr == nil {
 			return nil
 		}
@@ -706,7 +724,6 @@ func (m *multiTestContext) addStore(idx int) {
 		roachpb.NodeID(idx+1),
 		m.rpcContext,
 		grpcServer,
-		resolvers,
 		m.transportStopper,
 		metric.NewRegistry(),
 	)
@@ -716,11 +733,12 @@ func (m *multiTestContext) addStore(idx int) {
 
 	nodeID := roachpb.NodeID(idx + 1)
 	cfg := m.makeStoreConfig(idx)
-	cfg.SetDefaults()
+	ambient := log.AmbientContext{Tracer: cfg.Settings.Tracer}
 	m.populateDB(idx, stopper)
+	nlActive, nlRenewal := cfg.NodeLivenessDurations()
 	m.nodeLivenesses[idx] = storage.NewNodeLiveness(
 		ambient, m.clocks[idx], m.dbs[idx], m.gossips[idx],
-		cfg.RangeLeaseActiveDuration, cfg.RangeLeaseRenewalDuration,
+		nlActive, nlRenewal,
 	)
 	m.populateStorePool(idx, m.nodeLivenesses[idx])
 	cfg.DB = m.dbs[idx]
@@ -728,8 +746,9 @@ func (m *multiTestContext) addStore(idx int) {
 	cfg.StorePool = m.storePools[idx]
 
 	store := storage.NewStore(cfg, eng, &roachpb.NodeDescriptor{NodeID: nodeID})
+	ctx := context.Background()
 	if needBootstrap {
-		if err := store.Bootstrap(roachpb.StoreIdent{
+		if err := store.Bootstrap(ctx, roachpb.StoreIdent{
 			NodeID:  roachpb.NodeID(idx + 1),
 			StoreID: roachpb.StoreID(idx + 1),
 		}); err != nil {
@@ -745,28 +764,27 @@ func (m *multiTestContext) addStore(idx int) {
 		}
 	}
 
+	sender := storage.NewStores(ambient, clock)
+	sender.AddStore(store)
+	storesServer := storage.MakeServer(&roachpb.NodeDescriptor{NodeID: nodeID}, sender)
+	storage.RegisterConsistencyServer(grpcServer, storesServer)
+
 	ln, err := netutil.ListenAndServeGRPC(m.transportStopper, grpcServer, util.TestAddr)
 	if err != nil {
 		m.t.Fatal(err)
 	}
-	m.mu.Lock()
-	if m.nodeIDtoAddr == nil {
-		m.nodeIDtoAddr = make(map[roachpb.NodeID]net.Addr)
+	m.nodeIDtoAddrMu.Lock()
+	if m.nodeIDtoAddrMu.nodeIDtoAddr == nil {
+		m.nodeIDtoAddrMu.nodeIDtoAddr = make(map[roachpb.NodeID]net.Addr)
 	}
-	_, ok := m.nodeIDtoAddr[nodeID]
+	_, ok := m.nodeIDtoAddrMu.nodeIDtoAddr[nodeID]
 	if !ok {
-		m.nodeIDtoAddr[nodeID] = ln.Addr()
+		m.nodeIDtoAddrMu.nodeIDtoAddr[nodeID] = ln.Addr()
 	}
-	m.mu.Unlock()
+	m.nodeIDtoAddrMu.Unlock()
 	if ok {
 		m.t.Fatalf("node %d already listening", nodeID)
 	}
-
-	sender := storage.NewStores(ambient, clock)
-	sender.AddStore(store)
-	storesServer := storage.MakeServer(m.nodeDesc(nodeID), sender)
-	storage.RegisterConsistencyServer(grpcServer, storesServer)
-	storage.RegisterFreezeServer(grpcServer, storesServer)
 
 	// Add newly created objects to the multiTestContext's collections.
 	// (these must be populated before the store is started so that
@@ -789,9 +807,9 @@ func (m *multiTestContext) addStore(idx int) {
 		m.t.Fatal(err)
 	}
 
-	m.gossips[idx].Start(ln.Addr())
+	m.gossips[idx].Start(ln.Addr(), resolvers)
 
-	if err := store.Start(context.Background(), stopper); err != nil {
+	if err := store.Start(ctx, stopper); err != nil {
 		m.t.Fatal(err)
 	}
 	if err := m.gossipNodeDesc(m.gossips[idx], nodeID); err != nil {
@@ -799,7 +817,12 @@ func (m *multiTestContext) addStore(idx int) {
 	}
 	store.WaitForInit()
 
-	m.nodeLivenesses[idx].StartHeartbeat(context.Background(), stopper)
+	m.nodeLivenesses[idx].StartHeartbeat(ctx, stopper, func(ctx context.Context) {
+		now := m.clock.Now()
+		if err := store.WriteLastUpTimestamp(ctx, now); err != nil {
+			log.Warning(ctx, err)
+		}
+	})
 	// Wait until we see the first heartbeat.
 	testutils.SucceedsSoon(m.t, func() error {
 		if live, err := m.nodeLivenesses[idx].IsLive(nodeID); err != nil {
@@ -812,7 +835,7 @@ func (m *multiTestContext) addStore(idx int) {
 }
 
 func (m *multiTestContext) nodeDesc(nodeID roachpb.NodeID) *roachpb.NodeDescriptor {
-	addr := m.nodeIDtoAddr[nodeID]
+	addr := m.nodeIDtoAddrMu.nodeIDtoAddr[nodeID]
 	return &roachpb.NodeDescriptor{
 		NodeID:  nodeID,
 		Address: util.MakeUnresolvedAddr(addr.Network(), addr.String()),
@@ -845,7 +868,7 @@ func (m *multiTestContext) stopStore(i int) {
 	stopper := m.stoppers[i]
 	m.mu.RUnlock()
 
-	stopper.Stop()
+	stopper.Stop(context.TODO())
 
 	m.mu.Lock()
 	m.stoppers[i] = nil
@@ -860,11 +883,11 @@ func (m *multiTestContext) restartStore(i int) {
 	stopper := stop.NewStopper()
 	m.stoppers[i] = stopper
 	cfg := m.makeStoreConfig(i)
-	cfg.SetDefaults()
 	m.populateDB(i, stopper)
+	nlActive, nlRenewal := cfg.NodeLivenessDurations()
 	m.nodeLivenesses[i] = storage.NewNodeLiveness(
-		log.AmbientContext{Tracer: tracing.NewTracer()}, m.clocks[i], m.dbs[i], m.gossips[i],
-		cfg.RangeLeaseActiveDuration, cfg.RangeLeaseRenewalDuration,
+		log.AmbientContext{Tracer: m.storeConfig.Settings.Tracer}, m.clocks[i], m.dbs[i], m.gossips[i],
+		nlActive, nlRenewal,
 	)
 	m.populateStorePool(i, m.nodeLivenesses[i])
 	cfg.DB = m.dbs[i]
@@ -873,14 +896,20 @@ func (m *multiTestContext) restartStore(i int) {
 	store := storage.NewStore(cfg, m.engines[i], &roachpb.NodeDescriptor{NodeID: roachpb.NodeID(i + 1)})
 	m.stores[i] = store
 
+	ctx := context.Background()
+
 	// Need to start the store before adding it so that the store ID is initialized.
-	if err := store.Start(context.Background(), stopper); err != nil {
+	if err := store.Start(ctx, stopper); err != nil {
 		m.t.Fatal(err)
 	}
 	m.senders[i].AddStore(store)
 	m.mu.Unlock()
-
-	cfg.NodeLiveness.StartHeartbeat(context.Background(), stopper)
+	cfg.NodeLiveness.StartHeartbeat(ctx, stopper, func(ctx context.Context) {
+		now := m.clock.Now()
+		if err := store.WriteLastUpTimestamp(ctx, now); err != nil {
+			log.Warning(ctx, err)
+		}
+	})
 	// Wait until we see the first heartbeat.
 	testutils.SucceedsSoon(m.t, func() error {
 		if live, err := cfg.NodeLiveness.IsLive(roachpb.NodeID(i + 1)); err != nil || !live {
@@ -888,6 +917,11 @@ func (m *multiTestContext) restartStore(i int) {
 		}
 		return nil
 	})
+
+	// Normally, the newly restarted store would not be able to accept rebalances
+	// until the election timeout passed. But we're using a manual clock which
+	// won't advance the time properly, so manually enable rebalances.
+	m.stores[i].SetRebalancesDisabled(false)
 }
 
 func (m *multiTestContext) Store(i int) *storage.Store {
@@ -939,8 +973,75 @@ func (m *multiTestContext) restart() {
 	}
 }
 
+// changeReplicasLocked performs a ChangeReplicas operation, retrying
+// until the destination store has been addded or removed. m.mu must
+// be locked in read mode. Returns the range's NextReplicaID, which
+// is the ID of the newly-added replica if this is an add.
+func (m *multiTestContext) changeReplicasLocked(
+	rangeID roachpb.RangeID, dest int, changeType roachpb.ReplicaChangeType,
+) (roachpb.ReplicaID, error) {
+	ctx := context.Background()
+	startKey := m.findStartKeyLocked(rangeID)
+
+	// Perform a consistent read to get the updated range descriptor (as
+	// opposed to just going to one of the stores), to make sure we have
+	// the effects of any previous ChangeReplicas call. By the time
+	// ChangeReplicas returns the raft leader is guaranteed to have the
+	// updated version, but followers are not.
+	var desc roachpb.RangeDescriptor
+	if err := m.dbs[0].GetProto(ctx, keys.RangeDescriptorKey(startKey), &desc); err != nil {
+		return 0, err
+	}
+
+	var alreadyDoneErr string
+	switch changeType {
+	case roachpb.ADD_REPLICA:
+		alreadyDoneErr = "unable to add replica .* which is already present"
+	case roachpb.REMOVE_REPLICA:
+		alreadyDoneErr = "unable to remove replica .* which is not present"
+	}
+
+	for {
+		err := m.dbs[0].AdminChangeReplicas(
+			ctx, startKey.AsRawKey(), changeType,
+			[]roachpb.ReplicationTarget{{
+				NodeID:  m.idents[dest].NodeID,
+				StoreID: m.idents[dest].StoreID,
+			}},
+		)
+
+		if err == nil || testutils.IsError(err, alreadyDoneErr) {
+			break
+		}
+
+		if _, ok := errors.Cause(err).(*roachpb.AmbiguousResultError); ok {
+			// Try again after an AmbiguousResultError. If the operation
+			// succeeded, then the next attempt will return alreadyDoneErr;
+			// if it failed then the next attempt should succeed.
+			continue
+		}
+
+		// We can't use storage.IsSnapshotError() because the original error object
+		// is lost. We could make a this into a roachpb.Error but it seems overkill
+		// for this one usage.
+		if testutils.IsError(err, "snapshot failed: .*") {
+			continue
+		}
+		return 0, err
+	}
+
+	return desc.NextReplicaID, nil
+}
+
 // replicateRange replicates the given range onto the given stores.
 func (m *multiTestContext) replicateRange(rangeID roachpb.RangeID, dests ...int) {
+	if err := m.replicateRangeNonFatal(rangeID, dests...); err != nil {
+		m.t.Fatal(err)
+	}
+}
+
+// replicateRangeNonFatal replicates the given range onto the given stores.
+func (m *multiTestContext) replicateRangeNonFatal(rangeID roachpb.RangeID, dests ...int) error {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
@@ -948,48 +1049,15 @@ func (m *multiTestContext) replicateRange(rangeID roachpb.RangeID, dests ...int)
 
 	expectedReplicaIDs := make([]roachpb.ReplicaID, len(dests))
 	for i, dest := range dests {
-		// Perform a consistent read to get the updated range descriptor (as opposed
-		// to just going to one of the stores), to make sure we have the effects of
-		// the previous ChangeReplicas call. By the time ChangeReplicas returns the
-		// raft leader is guaranteed to have the updated version, but followers are
-		// not.
-		var desc roachpb.RangeDescriptor
-		if err := m.dbs[dest].GetProto(context.Background(), keys.RangeDescriptorKey(startKey), &desc); err != nil {
-			m.t.Fatal(err)
-		}
-
-		repl, err := m.findMemberStoreLocked(desc).GetReplica(rangeID)
+		var err error
+		expectedReplicaIDs[i], err = m.changeReplicasLocked(rangeID, dest, roachpb.ADD_REPLICA)
 		if err != nil {
-			m.t.Fatal(err)
+			return err
 		}
-
-		ctx := repl.AnnotateCtx(context.Background())
-
-		// Assume AmbiguousResultErrors are due to re-proposals and the
-		// underlying change replicas succeeded.
-		for {
-			if err := repl.ChangeReplicas(
-				ctx,
-				roachpb.ADD_REPLICA,
-				roachpb.ReplicaDescriptor{
-					NodeID:  m.stores[dest].Ident.NodeID,
-					StoreID: m.stores[dest].Ident.StoreID,
-				},
-				&desc,
-			); err == nil || testutils.IsError(err, "unable to add replica .* which is already present") {
-				break
-			} else if _, ok := errors.Cause(err).(*roachpb.AmbiguousResultError); ok {
-				continue
-			} else {
-				m.t.Fatal(err)
-			}
-		}
-
-		expectedReplicaIDs[i] = desc.NextReplicaID
 	}
 
 	// Wait for the replication to complete on all destination nodes.
-	testutils.SucceedsSoon(m.t, func() error {
+	return util.RetryForDuration(testutils.DefaultSucceedsSoonDuration, func() error {
 		for i, dest := range dests {
 			repl, err := m.stores[dest].GetReplica(rangeID)
 			if err != nil {
@@ -1012,42 +1080,19 @@ func (m *multiTestContext) replicateRange(rangeID roachpb.RangeID, dests ...int)
 
 // unreplicateRange removes a replica of the range from the dest store.
 func (m *multiTestContext) unreplicateRange(rangeID roachpb.RangeID, dest int) {
+	if err := m.unreplicateRangeNonFatal(rangeID, dest); err != nil {
+		m.t.Fatal(err)
+	}
+}
+
+// unreplicateRangeNonFatal removes a replica of the range from the dest store.
+// Returns an error rather than calling m.t.Fatal upon error.
+func (m *multiTestContext) unreplicateRangeNonFatal(rangeID roachpb.RangeID, dest int) error {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
-	startKey := m.findStartKeyLocked(rangeID)
-
-	var desc roachpb.RangeDescriptor
-	if err := m.dbs[0].GetProto(context.Background(), keys.RangeDescriptorKey(startKey), &desc); err != nil {
-		m.t.Fatal(err)
-	}
-
-	rep, err := m.findMemberStoreLocked(desc).GetReplica(rangeID)
-	if err != nil {
-		m.t.Fatal(err)
-	}
-
-	ctx := rep.AnnotateCtx(context.Background())
-
-	// Assume AmbiguousResultErrors are due to re-proposals and the
-	// underlying change replicas succeeded.
-	for {
-		if err := rep.ChangeReplicas(
-			ctx,
-			roachpb.REMOVE_REPLICA,
-			roachpb.ReplicaDescriptor{
-				NodeID:  m.idents[dest].NodeID,
-				StoreID: m.idents[dest].StoreID,
-			},
-			&desc,
-		); err == nil || testutils.IsError(err, "unable to remove replica .* which is not present") {
-			break
-		} else if _, ok := errors.Cause(err).(*roachpb.AmbiguousResultError); ok {
-			continue
-		} else {
-			m.t.Fatal(err)
-		}
-	}
+	_, err := m.changeReplicasLocked(rangeID, dest, roachpb.REMOVE_REPLICA)
+	return err
 }
 
 // readIntFromEngines reads the current integer value at the given key
@@ -1084,63 +1129,60 @@ func (m *multiTestContext) waitForValues(key roachpb.Key, expected []int64) {
 	})
 }
 
-// expireLeases increments the context's manual clock far enough into
-// the future that current range leases are expired.  To also expire
-// epoch-based range leases, each node's epoch is incremented and live
-// nodes are heartbeat so they are able to reacquire leases.
-//
-// Useful for tests which modify replica sets.
-func (m *multiTestContext) expireLeases() {
-	// Allow only one expiration in progress at a time.
-	if !atomic.CompareAndSwapInt32(&m.expireLeasesActive, 0, 1) {
-		return
+// transferLease transfers the lease for the given range from the source
+// replica to the target replica. Assumes that the caller knows who the
+// current leaseholder is.
+func (m *multiTestContext) transferLease(
+	ctx context.Context, rangeID roachpb.RangeID, source int, dest int,
+) {
+	live := m.stores[dest] != nil && !m.stores[dest].IsDraining()
+	if !live {
+		m.t.Fatalf("can't transfer lease to down or draining node at index %d", dest)
 	}
 
-	m.expireLeasesWithoutIncrementingEpochs()
-
-	// Increment epochs.
+	// Heartbeat the liveness record of the destination node to make sure that the
+	// lease we're about to transfer can be used afterwards. Otherwise, the
+	// liveness record might be expired and the node is considered down, making
+	// this transfer irrelevant. In particular, this can happen if the clock was
+	// advanced recently, so all the liveness records (including the destination)
+	// are expired. In that case, the simple fact that the transfer succeeded
+	// doesn't mean that the destination now has a usable lease.
 	m.mu.RLock()
-	nls := append([]*storage.NodeLiveness(nil), m.nodeLivenesses...)
+	nl := m.nodeLivenesses[dest]
 	m.mu.RUnlock()
-
-	ctx := context.Background()
-	for idx, nl := range nls {
-		l, err := nl.Self()
-		if err != nil {
-			continue
-		}
-		if err = nl.IncrementEpoch(ctx, l); err != nil {
-			log.Error(ctx, err)
-			continue
-		}
-		m.mu.RLock()
-		live := m.stores[idx] != nil && !m.stores[idx].IsDrainingLeases()
-		m.mu.RUnlock()
-		if live {
-			l, err := nl.Self()
-			if err != nil {
-				log.Error(ctx, err)
-				continue
-			}
-			if err := nl.Heartbeat(ctx, l); err != nil {
-				log.Error(ctx, err)
-				continue
-			}
-		}
+	l, err := nl.Self()
+	if err != nil {
+		m.t.Fatal(err)
+	}
+	if err := nl.Heartbeat(ctx, l); err != nil {
+		m.t.Fatal(err)
 	}
 
-	atomic.StoreInt32(&m.expireLeasesActive, 0)
+	sourceRepl, err := m.stores[source].GetReplica(rangeID)
+	if err != nil {
+		m.t.Fatal(err)
+	}
+	if err := sourceRepl.AdminTransferLease(context.Background(), m.idents[dest].StoreID); err != nil {
+		m.t.Fatal(err)
+	}
 }
 
-func (m *multiTestContext) expireLeasesWithoutIncrementingEpochs() {
-	m.mu.RLock()
-	for _, store := range m.stores {
-		if store != nil {
-			m.manualClock.Increment(store.LeaseExpiration(m.clock))
-			break
+// advanceClock advances the mtc's manual clock such that all
+// expiration-based leases become expired. The liveness records of all the nodes
+// will also become expired on the new clock value (and this will cause all the
+// epoch-based leases to be considered expired until the liveness record is
+// heartbeated).
+//
+// This method asserts that all the stores share the manual clock. Otherwise,
+// the desired effect would be ambiguous.
+func (m *multiTestContext) advanceClock(ctx context.Context) {
+	for i, clock := range m.clocks {
+		if clock != m.clock {
+			log.Fatalf(ctx, "clock at index %d is different from the shared clock", i)
 		}
 	}
-	m.mu.RUnlock()
+	m.manualClock.Increment(m.storeConfig.LeaseExpiration())
+	log.Infof(ctx, "test clock advanced to: %s", m.clock.Now())
 }
 
 // getRaftLeader returns the replica that is the current raft leader for the

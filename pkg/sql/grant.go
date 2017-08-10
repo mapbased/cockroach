@@ -11,29 +11,30 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Marc Berhault (marc@cockroachlabs.com)
 
 package sql
 
 import (
+	"golang.org/x/net/context"
+
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 )
 
 func (p *planner) changePrivileges(
+	ctx context.Context,
 	targets parser.TargetList,
 	grantees parser.NameList,
 	changePrivilege func(*sqlbase.PrivilegeDescriptor, string),
 ) (planNode, error) {
-	descriptors, err := p.getDescriptorsFromTargetList(targets)
+	descriptors, err := getDescriptorsFromTargetList(ctx, p.txn, p.getVirtualTabler(), p.session.Database, targets)
 	if err != nil {
 		return nil, err
 	}
 
 	for _, descriptor := range descriptors {
-		if err := p.checkPrivilege(descriptor, privilege.GRANT); err != nil {
+		if err := p.CheckPrivilege(descriptor, privilege.GRANT); err != nil {
 			return nil, err
 		}
 		privileges := descriptor.GetPrivileges()
@@ -47,13 +48,13 @@ func (p *planner) changePrivileges(
 				return nil, err
 			}
 		case *sqlbase.TableDescriptor:
-			if err := d.Validate(p.txn); err != nil {
+			if err := d.Validate(ctx, p.txn); err != nil {
 				return nil, err
 			}
 			if err := d.SetUpVersion(); err != nil {
 				return nil, err
 			}
-			p.notifySchemaChange(d.ID, sqlbase.InvalidMutationID)
+			p.notifySchemaChange(d, sqlbase.InvalidMutationID)
 		}
 	}
 
@@ -63,7 +64,7 @@ func (p *planner) changePrivileges(
 		descKey := sqlbase.MakeDescMetadataKey(descriptor.GetID())
 		b.Put(descKey, sqlbase.WrapDescriptor(descriptor))
 	}
-	if err := p.txn.Run(b); err != nil {
+	if err := p.txn.Run(ctx, b); err != nil {
 		return nil, err
 	}
 	return &emptyNode{}, nil
@@ -78,8 +79,8 @@ func (p *planner) changePrivileges(
 // Privileges: GRANT on database/table/view.
 //   Notes: postgres requires the object owner.
 //          mysql requires the "grant option" and the same privileges, and sometimes superuser.
-func (p *planner) Grant(n *parser.Grant) (planNode, error) {
-	return p.changePrivileges(n.Targets, n.Grantees, func(privDesc *sqlbase.PrivilegeDescriptor, grantee string) {
+func (p *planner) Grant(ctx context.Context, n *parser.Grant) (planNode, error) {
+	return p.changePrivileges(ctx, n.Targets, n.Grantees, func(privDesc *sqlbase.PrivilegeDescriptor, grantee string) {
 		privDesc.Grant(grantee, n.Privileges)
 	})
 }
@@ -93,8 +94,8 @@ func (p *planner) Grant(n *parser.Grant) (planNode, error) {
 // Privileges: GRANT on database/table/view.
 //   Notes: postgres requires the object owner.
 //          mysql requires the "grant option" and the same privileges, and sometimes superuser.
-func (p *planner) Revoke(n *parser.Revoke) (planNode, error) {
-	return p.changePrivileges(n.Targets, n.Grantees, func(privDesc *sqlbase.PrivilegeDescriptor, grantee string) {
+func (p *planner) Revoke(ctx context.Context, n *parser.Revoke) (planNode, error) {
+	return p.changePrivileges(ctx, n.Targets, n.Grantees, func(privDesc *sqlbase.PrivilegeDescriptor, grantee string) {
 		privDesc.Revoke(grantee, n.Privileges)
 	})
 }

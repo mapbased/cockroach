@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Spencer Kimball (spencer.kimball@gmail.com)
 
 package storage
 
@@ -23,12 +21,15 @@ import (
 	"reflect"
 	"sort"
 	"testing"
+	"time"
 
 	"golang.org/x/net/context"
 
 	"github.com/cockroachdb/cockroach/pkg/internal/client"
 	"github.com/cockroachdb/cockroach/pkg/keys"
+	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/storage/engine"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
@@ -69,7 +70,7 @@ func metaKey(key roachpb.RKey) []byte {
 func TestUpdateRangeAddressing(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	stopper := stop.NewStopper()
-	defer stopper.Stop()
+	defer stopper.Stop(context.TODO())
 	store, _ := createTestStore(t, stopper)
 
 	// When split is false, merging treats the right range as the merged
@@ -139,11 +140,31 @@ func TestUpdateRangeAddressing(t *testing.T) {
 				t.Fatal(err)
 			}
 		}
-		if err := store.DB().Run(context.TODO(), b); err != nil {
+
+		st := cluster.MakeClusterSettings()
+
+		// This test constructs an overlapping batch (delete then put on the same
+		// key), which is only allowed in a transaction. The test wants to send the
+		// batch through the "client" interface (because that's what it used to
+		// construct it); unfortunately we can't use the client's transactional
+		// interface without sending through a TxnCoordSender (which initializes a
+		// transaction id). Also, we need the TxnCoordSender to clean up the
+		// intents, otherwise the MVCCScan that the test does below fails.
+		tcs := kv.NewTxnCoordSender(log.AmbientContext{Tracer: st.Tracer},
+			st,
+			store.testSender(), store.cfg.Clock,
+			false, stopper, kv.MakeTxnMetrics(time.Second))
+		db := client.NewDB(tcs, store.cfg.Clock)
+		txn := client.NewTxn(db)
+		ctx := context.Background()
+		if err := txn.Run(ctx, b); err != nil {
+			t.Fatal(err)
+		}
+		if err := txn.Commit(ctx); err != nil {
 			t.Fatal(err)
 		}
 		// Scan meta keys directly from engine.
-		kvs, _, _, err := engine.MVCCScan(context.Background(), store.Engine(), keys.MetaMin, keys.MetaMax, math.MaxInt64, hlc.MaxTimestamp, true, nil)
+		kvs, _, _, err := engine.MVCCScan(ctx, store.Engine(), keys.MetaMin, keys.MetaMax, math.MaxInt64, hlc.MaxTimestamp, true, nil)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -181,16 +202,16 @@ func TestUpdateRangeAddressing(t *testing.T) {
 
 		if test.split {
 			if log.V(1) {
-				log.Infof(context.Background(), "test case %d: split %q-%q at %q", i, left.StartKey, right.EndKey, left.EndKey)
+				log.Infof(ctx, "test case %d: split %q-%q at %q", i, left.StartKey, right.EndKey, left.EndKey)
 			}
 		} else {
 			if log.V(1) {
-				log.Infof(context.Background(), "test case %d: merge %q-%q + %q-%q", i, left.StartKey, left.EndKey, left.EndKey, right.EndKey)
+				log.Infof(ctx, "test case %d: merge %q-%q + %q-%q", i, left.StartKey, left.EndKey, left.EndKey, right.EndKey)
 			}
 		}
 		for _, meta := range metas {
 			if log.V(1) {
-				log.Infof(context.Background(), "%q", meta.key)
+				log.Infof(ctx, "%q", meta.key)
 			}
 		}
 

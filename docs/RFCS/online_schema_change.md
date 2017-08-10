@@ -25,7 +25,7 @@ from accessing the table and yet never leave table or index data in an
 invalid state.
 
 Online schema change will be built on top of [table descriptor
-leases](https://github.com/cockroachdb/cockroach/docs/RFCS/table_descriptor_lease.md)
+leases](https://github.com/cockroachdb/cockroach/blob/master/docs/RFCS/table_descriptor_lease.md)
 which describes the mechanism for asynchronously distributing
 modifications to table descriptors. This RFC is concerned with the
 actual steps of performing a schema change.
@@ -97,7 +97,7 @@ transactions that process a fraction of the table at a time:
   endKey := startKey.PrefixEnd()
   for startKey != endKey {
     var lastKey roachpb.Key
-    err := db.Txn(func(txn *Txn) error {
+    err := db.Txn(func(ctx context.Context, txn *Txn) error {
       txn.SetPriority(VeryLowPriority)
       scan, err := txn.Scan(startKey, endKey, 1000)
       if err != nil {
@@ -105,7 +105,7 @@ transactions that process a fraction of the table at a time:
       }
       lastKey = getLastKeyOfFullRowInScan(scan)
       b := makeIndexKeysBatch(scan)
-      return txn.CommitInBatch(b)
+      return txn.CommitInBatch(ctx, b)
     })
     if err != nil {
       // Abort!

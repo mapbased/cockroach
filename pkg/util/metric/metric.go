@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Tobias Schottdorf (tobias.schottdorf@gmail.com)
 
 package metric
 
@@ -187,10 +185,10 @@ func NewHistogram(metadata Metadata, duration time.Duration, maxVal int64, sigFi
 // with one digit of precision (i.e. errors of <10ms at 100ms, <6s at 60s).
 //
 // The windowed portion of the Histogram retains values for approximately
-// sampleDuration.
-func NewLatency(metadata Metadata, sampleDuration time.Duration) *Histogram {
+// histogramWindow.
+func NewLatency(metadata Metadata, histogramWindow time.Duration) *Histogram {
 	return NewHistogram(
-		metadata, sampleDuration, MaxLatency.Nanoseconds(), 1,
+		metadata, histogramWindow, MaxLatency.Nanoseconds(), 1,
 	)
 }
 
@@ -323,11 +321,20 @@ func (c *Counter) ToPrometheusMetric() *prometheusgo.Metric {
 type Gauge struct {
 	Metadata
 	value *int64
+	fn    func() int64
 }
 
 // NewGauge creates a Gauge.
 func NewGauge(metadata Metadata) *Gauge {
-	return &Gauge{metadata, new(int64)}
+	return &Gauge{metadata, new(int64), nil}
+}
+
+// NewFunctionalGauge creates a Gauge metric whose value is determined when
+// asked for by calling the provided function.
+// Note that Update, Inc, and Dec should NOT be called on a Gauge returned
+// from NewFunctionalGauge.
+func NewFunctionalGauge(metadata Metadata, f func() int64) *Gauge {
+	return &Gauge{metadata, nil, f}
 }
 
 // Snapshot returns a read-only copy of the gauge.
@@ -342,6 +349,9 @@ func (g *Gauge) Update(v int64) {
 
 // Value returns the gauge's current value.
 func (g *Gauge) Value() int64 {
+	if g.fn != nil {
+		return g.fn()
+	}
 	return atomic.LoadInt64(g.value)
 }
 

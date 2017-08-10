@@ -11,9 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Peter Mattis (peter@cockroachlabs.com)
-// Author: Radu Berinde (radu@cockroachlabs.com)
 
 package sqlbase
 
@@ -21,15 +18,15 @@ import (
 	"bytes"
 	"fmt"
 
+	"github.com/pkg/errors"
 	"golang.org/x/net/context"
 
 	"github.com/cockroachdb/cockroach/pkg/internal/client"
-	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
+	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
-	"github.com/pkg/errors"
 )
 
 // RowFetcher handles fetching kvs and forming table rows.
@@ -61,9 +58,8 @@ type RowFetcher struct {
 	// schema changes.
 	cols []ColumnDescriptor
 
-	// For each column in cols, indicates if the value is needed (used as an
-	// optimization when the upper layer doesn't need all values).
-	valNeededForCol []bool
+	// The set of ColumnIDs that are required.
+	neededCols util.FastIntSet
 
 	// Map used to get the index for columns in cols.
 	colIdxMap map[ColumnID]int
@@ -72,15 +68,23 @@ type RowFetcher struct {
 	// index (into cols).
 	indexColIdx []int
 
+	// returnRangeInfo, if set, causes the underlying kvFetcher to return
+	// information about the ranges descriptors/leases uses in servicing the
+	// requests. This has some cost, so it's only enabled by DistSQL when this
+	// info is actually useful for correcting the plan (e.g. not for the PK-side
+	// of an index-join).
+	// If set, GetRangeInfo() can be used to retrieve the accumulated info.
+	returnRangeInfo bool
+
 	// -- Fields updated during a scan --
 
 	kvFetcher      kvFetcher
 	keyVals        []EncDatum  // the index key values for the current row
-	implicitVals   EncDatumRow // the implicit values for unique indexes
+	extraVals      EncDatumRow // the extra column values for unique indexes
 	indexKey       []byte      // the index key of the current row
 	row            EncDatumRow
-	decodedRow     parser.DTuple
-	prettyValueBuf bytes.Buffer
+	decodedRow     parser.Datums
+	prettyValueBuf *bytes.Buffer
 
 	// The current key/value, unless kvEnd is true.
 	kv                client.KeyValue
@@ -88,8 +92,17 @@ type RowFetcher struct {
 	kvEnd             bool
 
 	// Buffered allocation of decoded datums.
-	alloc DatumAlloc
+	alloc *DatumAlloc
 }
+
+type kvFetcher interface {
+	nextKV(ctx context.Context) (bool, client.KeyValue, error)
+	getRangesInfo() []roachpb.RangeInfo
+}
+
+// debugRowFetch can be used to turn on some low-level debugging logs. We use
+// this to avoid using log.V in the hot path.
+const debugRowFetch = false
 
 // Init sets up a RowFetcher for a given table and index. If we are using a
 // non-primary index, valNeededForCol can only be true for the columns in the
@@ -101,6 +114,8 @@ func (rf *RowFetcher) Init(
 	reverse, isSecondaryIndex bool,
 	cols []ColumnDescriptor,
 	valNeededForCol []bool,
+	returnRangeInfo bool,
+	alloc *DatumAlloc,
 ) error {
 	rf.desc = desc
 	rf.colIdxMap = colIdxMap
@@ -108,9 +123,24 @@ func (rf *RowFetcher) Init(
 	rf.reverse = reverse
 	rf.isSecondaryIndex = isSecondaryIndex
 	rf.cols = cols
-	rf.valNeededForCol = valNeededForCol
+	rf.returnRangeInfo = returnRangeInfo
 	rf.row = make([]EncDatum, len(rf.cols))
 	rf.decodedRow = make([]parser.Datum, len(rf.cols))
+	rf.alloc = alloc
+
+	for i, v := range valNeededForCol {
+		if !v {
+			continue
+		}
+		// The i-th column is required. Search the colIdxMap to find the
+		// corresponding ColumnID.
+		for col, idx := range colIdxMap {
+			if idx == i {
+				rf.neededCols.Add(uint32(col))
+				break
+			}
+		}
+	}
 
 	var indexColumnIDs []ColumnID
 	indexColumnIDs, rf.indexColumnDirs = index.FullColumnIDs()
@@ -121,9 +151,9 @@ func (rf *RowFetcher) Init(
 	}
 
 	if isSecondaryIndex {
-		for i, needed := range valNeededForCol {
-			if needed && !index.ContainsColumnID(rf.cols[i].ID) {
-				return errors.Errorf("requested column %s not in index", rf.cols[i].Name)
+		for i := range rf.cols {
+			if rf.neededCols.Contains(uint32(rf.cols[i].ID)) && !index.ContainsColumnID(rf.cols[i].ID) {
+				return fmt.Errorf("requested column %s not in index", rf.cols[i].Name)
 			}
 		}
 	}
@@ -137,65 +167,64 @@ func (rf *RowFetcher) Init(
 
 	if isSecondaryIndex && index.Unique {
 		// Unique secondary indexes have a value that is the primary index
-		// key. Prepare implicitVals for use in decoding this value.
+		// key. Prepare extraVals for use in decoding this value.
 		// Primary indexes only contain ascendingly-encoded values. If this
 		// ever changes, we'll probably have to figure out the directions here too.
-		rf.implicitVals, err = MakeEncodedKeyVals(desc, index.ImplicitColumnIDs)
+		rf.extraVals, err = MakeEncodedKeyVals(desc, index.ExtraColumnIDs)
 		if err != nil {
 			return err
 		}
 	}
+
 	return nil
 }
 
 // StartScan initializes and starts the key-value scan. Can be used multiple
 // times.
 func (rf *RowFetcher) StartScan(
-	txn *client.Txn, spans roachpb.Spans, limitBatches bool, limitHint int64,
+	ctx context.Context, txn *client.Txn, spans roachpb.Spans, limitBatches bool, limitHint int64,
 ) error {
 	if len(spans) == 0 {
-		// If no spans were specified retrieve all of the keys that start with our
-		// index key prefix.
-		start := roachpb.Key(MakeIndexKeyPrefix(rf.desc, rf.index.ID))
-		spans = []roachpb.Span{{Key: start, EndKey: start.PrefixEnd()}}
+		panic("no spans")
 	}
-
-	rf.indexKey = nil
 
 	// If we have a limit hint, we limit the first batch size. Subsequent
 	// batches get larger to avoid making things too slow (e.g. in case we have
 	// a very restrictive filter and actually have to retrieve a lot of rows).
 	firstBatchLimit := limitHint
 	if firstBatchLimit != 0 {
-		// For a secondary index, we have one key per row.
-		if !rf.isSecondaryIndex {
-			// We have a sentinel key per row plus at most one key per non-PK column. Of course, we
-			// may have other keys due to a schema change, but this is only a hint.
-			firstBatchLimit *= int64(1 + len(rf.cols) - len(rf.index.ColumnIDs))
-		}
+		// The limitHint is a row limit, but each row could be made up of more
+		// than one key.
+		firstBatchLimit = limitHint * int64(rf.desc.KeysPerRow(rf.index.ID))
 		// We need an extra key to make sure we form the last row.
 		firstBatchLimit++
 	}
 
-	var err error
-	rf.kvFetcher, err = makeKVFetcher(txn, spans, rf.reverse, limitBatches, firstBatchLimit)
+	f, err := makeKVFetcher(txn, spans, rf.reverse, limitBatches, firstBatchLimit, rf.returnRangeInfo)
 	if err != nil {
 		return err
 	}
+	return rf.StartScanFrom(ctx, &f)
+}
 
+// StartScanFrom initializes and starts a scan from the given kvFetcher. Can be
+// used multiple times.
+func (rf *RowFetcher) StartScanFrom(ctx context.Context, f kvFetcher) error {
+	rf.indexKey = nil
+	rf.kvFetcher = f
 	// Retrieve the first key.
-	_, err = rf.NextKey()
+	_, err := rf.NextKey(ctx)
 	return err
 }
 
 // NextKey retrieves the next key/value and sets kv/kvEnd. Returns whether a row
 // has been completed.
 // TODO(andrei): change to return error
-func (rf *RowFetcher) NextKey() (rowDone bool, err error) {
+func (rf *RowFetcher) NextKey(ctx context.Context) (rowDone bool, err error) {
 	var ok bool
 
 	for {
-		ok, rf.kv, err = rf.kvFetcher.nextKV()
+		ok, rf.kv, err = rf.kvFetcher.nextKV(ctx)
 		if err != nil {
 			return false, err
 		}
@@ -249,15 +278,15 @@ func prettyEncDatums(vals []EncDatum) string {
 
 // ReadIndexKey decodes an index key for the fetcher's table.
 func (rf *RowFetcher) ReadIndexKey(k roachpb.Key) (remaining []byte, ok bool, err error) {
-	return DecodeIndexKey(&rf.alloc, rf.desc, rf.index.ID, rf.keyVals,
+	return DecodeIndexKey(rf.alloc, rf.desc, rf.index.ID, rf.keyVals,
 		rf.indexColumnDirs, k)
 }
 
-// ProcessKV processes the given key/value, setting values in the row
+// processKV processes the given key/value, setting values in the row
 // accordingly. If debugStrings is true, returns pretty printed key and value
 // information in prettyKey/prettyValue (otherwise they are empty strings).
-func (rf *RowFetcher) ProcessKV(
-	kv client.KeyValue, debugStrings bool,
+func (rf *RowFetcher) processKV(
+	ctx context.Context, kv client.KeyValue, debugStrings bool,
 ) (prettyKey string, prettyValue string, err error) {
 	if debugStrings {
 		prettyKey = fmt.Sprintf("/%s/%s%s", rf.desc.Name, rf.index.Name, prettyEncDatums(rf.keyVals))
@@ -279,6 +308,15 @@ func (rf *RowFetcher) ProcessKV(
 		}
 	}
 
+	if rf.neededCols.Empty() {
+		// We don't need to decode any values.
+		if debugStrings {
+			prettyValue = parser.DNull.String()
+		}
+
+		return prettyKey, prettyValue, nil
+	}
+
 	if !rf.isSecondaryIndex && len(rf.keyRemainingBytes) > 0 {
 		_, familyID, err := encoding.DecodeUvarintAscending(rf.keyRemainingBytes)
 		if err != nil {
@@ -290,38 +328,59 @@ func (rf *RowFetcher) ProcessKV(
 			return "", "", err
 		}
 
+		// If familyID is 0, kv.Value contains values for composite key columns.
+		// These columns already have a rf.row value assigned above, but that value
+		// (obtained from the key encoding) might not be correct (e.g. for decimals,
+		// it might not contain the right number of trailing 0s; for collated
+		// strings, it is one of potentially many strings with the same collation
+		// key).
+		//
+		// In these cases, the correct value will be present in family 0 and the
+		// rf.row value gets overwritten.
+
 		switch kv.Value.GetTag() {
 		case roachpb.ValueType_TUPLE:
-			prettyKey, prettyValue, err = rf.processValueTuple(family, kv, debugStrings, prettyKey)
+			prettyKey, prettyValue, err = rf.processValueTuple(ctx, kv, debugStrings, prettyKey)
 		default:
-			prettyKey, prettyValue, err = rf.processValueSingle(family, kv, debugStrings, prettyKey)
+			prettyKey, prettyValue, err = rf.processValueSingle(ctx, family, kv, debugStrings, prettyKey)
 		}
 		if err != nil {
 			return "", "", err
 		}
 	} else {
-		if rf.implicitVals != nil {
-			// This is a unique index; decode the implicit column values from
+		valueBytes := kv.ValueBytes()
+		if rf.extraVals != nil {
+			// This is a unique index; decode the extra column values from
 			// the value.
-			_, err := DecodeKeyVals(&rf.alloc, rf.implicitVals, nil, kv.ValueBytes())
+			var err error
+			valueBytes, err = DecodeKeyVals(rf.extraVals, nil, valueBytes)
 			if err != nil {
 				return "", "", err
 			}
-			for i, id := range rf.index.ImplicitColumnIDs {
-				if idx, ok := rf.colIdxMap[id]; ok && rf.valNeededForCol[idx] {
-					rf.row[idx] = rf.implicitVals[i]
+			for i, id := range rf.index.ExtraColumnIDs {
+				if rf.neededCols.Contains(uint32(id)) {
+					rf.row[rf.colIdxMap[id]] = rf.extraVals[i]
 				}
 			}
 			if debugStrings {
-				prettyValue = prettyEncDatums(rf.implicitVals)
+				prettyValue = prettyEncDatums(rf.extraVals)
 			}
 		}
 
-		if log.V(2) {
-			if rf.implicitVals != nil {
-				log.Infof(context.TODO(), "Scan %s -> %s", kv.Key, prettyEncDatums(rf.implicitVals))
+		if debugRowFetch {
+			if rf.extraVals != nil {
+				log.Infof(ctx, "Scan %s -> %s", kv.Key, prettyEncDatums(rf.extraVals))
 			} else {
-				log.Infof(context.TODO(), "Scan %s", kv.Key)
+				log.Infof(ctx, "Scan %s", kv.Key)
+			}
+		}
+
+		if len(valueBytes) > 0 {
+			prettyKey, prettyValue, err = rf.processValueBytes(
+				ctx, kv, valueBytes, debugStrings, prettyKey,
+			)
+			if err != nil {
+				return "", "", err
 			}
 		}
 	}
@@ -337,130 +396,135 @@ func (rf *RowFetcher) ProcessKV(
 // family.DefaultColumnID), setting values in the rf.row accordingly. The key is
 // only used for logging.
 func (rf *RowFetcher) processValueSingle(
-	family *ColumnFamilyDescriptor, kv client.KeyValue, debugStrings bool, prettyKeyPrefix string,
+	ctx context.Context,
+	family *ColumnFamilyDescriptor,
+	kv client.KeyValue,
+	debugStrings bool,
+	prettyKeyPrefix string,
 ) (prettyKey string, prettyValue string, err error) {
 	prettyKey = prettyKeyPrefix
 
+	// If this is the row sentinel (in the legacy pre-family format),
+	// a value is not expected, so we're done.
+	if family.ID == 0 {
+		return "", "", nil
+	}
+
 	colID := family.DefaultColumnID
 	if colID == 0 {
-		// If this is the sentinel family, a value is not expected, so we're done.
-		// Otherwise, this means something went wrong in the TableDescriptor
-		// bookkeeping.
-		if family.ID == keys.SentinelFamilyID {
-			return "", "", nil
-		}
 		return "", "", errors.Errorf("single entry value with no default column id")
 	}
 
-	idx, ok := rf.colIdxMap[colID]
-	if ok && (debugStrings || rf.valNeededForCol[idx]) {
+	if debugStrings || rf.neededCols.Contains(uint32(colID)) {
+		if idx, ok := rf.colIdxMap[colID]; ok {
+			if debugStrings {
+				prettyKey = fmt.Sprintf("%s/%s", prettyKey, rf.desc.Columns[idx].Name)
+			}
+			typ := rf.cols[idx].Type
+			// TODO(arjun): The value is a directly marshaled single value, so we
+			// unmarshal it eagerly here. This can potentially be optimized out,
+			// although that would require changing UnmarshalColumnValue to operate
+			// on bytes, and for Encode/DecodeTableValue to operate on marshaled
+			// single values.
+			value, err := UnmarshalColumnValue(rf.alloc, typ, kv.Value)
+			if err != nil {
+				return "", "", err
+			}
+			if debugStrings {
+				prettyValue = value.String()
+			}
+			rf.row[idx] = DatumToEncDatum(typ, value)
+			if debugRowFetch {
+				log.Infof(ctx, "Scan %s -> %v", kv.Key, value)
+			}
+			return prettyKey, prettyValue, nil
+		}
+	}
+
+	// No need to unmarshal the column value. Either the column was part of
+	// the index key or it isn't needed.
+	if debugRowFetch {
+		log.Infof(ctx, "Scan %s -> [%d] (skipped)", kv.Key, colID)
+	}
+	return prettyKey, prettyValue, nil
+}
+
+func (rf *RowFetcher) processValueBytes(
+	ctx context.Context,
+	kv client.KeyValue,
+	valueBytes []byte,
+	debugStrings bool,
+	prettyKeyPrefix string,
+) (prettyKey string, prettyValue string, err error) {
+	prettyKey = prettyKeyPrefix
+	if debugStrings {
+		if rf.prettyValueBuf == nil {
+			rf.prettyValueBuf = &bytes.Buffer{}
+		}
+		rf.prettyValueBuf.Reset()
+	}
+
+	var colIDDiff uint32
+	var lastColID ColumnID
+	for len(valueBytes) > 0 {
+		_, _, colIDDiff, _, err = encoding.DecodeValueTag(valueBytes)
+		if err != nil {
+			return "", "", err
+		}
+		colID := lastColID + ColumnID(colIDDiff)
+		lastColID = colID
+		if !rf.neededCols.Contains(uint32(colID)) {
+			// This column wasn't requested, so read its length and skip it.
+			_, len, err := encoding.PeekValueLength(valueBytes)
+			if err != nil {
+				return "", "", err
+			}
+			valueBytes = valueBytes[len:]
+			if debugRowFetch {
+				log.Infof(ctx, "Scan %s -> [%d] (skipped)", kv.Key, colID)
+			}
+			continue
+		}
+		idx := rf.colIdxMap[colID]
+
 		if debugStrings {
 			prettyKey = fmt.Sprintf("%s/%s", prettyKey, rf.desc.Columns[idx].Name)
 		}
-		kind := rf.cols[idx].Type.Kind
-		// TODO(arjun): The value is a directly marshaled single value, so we
-		// unmarshal it eagerly here. This can potentially be optimized out,
-		// although that would require changing UnmarshalColumnValue to operate
-		// on bytes, and for Encode/DecodeTableValue to operate on marshaled
-		// single values.
-		value, err := UnmarshalColumnValue(&rf.alloc, kind, kv.Value)
+
+		var encValue EncDatum
+		encValue, valueBytes, err =
+			EncDatumFromBuffer(rf.cols[idx].Type, DatumEncoding_VALUE, valueBytes)
 		if err != nil {
 			return "", "", err
 		}
 		if debugStrings {
-			prettyValue = value.String()
+			err := encValue.EnsureDecoded(rf.alloc)
+			if err != nil {
+				return "", "", err
+			}
+			fmt.Fprintf(rf.prettyValueBuf, "/%v", encValue.Datum)
 		}
-		if !rf.row[idx].IsUnset() {
-			panic(fmt.Sprintf("duplicate value for column %d", idx))
-		}
-		rf.row[idx] = DatumToEncDatum(rf.cols[idx].Type.Kind, value)
-		if log.V(3) {
-			log.Infof(context.TODO(), "Scan %s -> %v", kv.Key, value)
-		}
-	} else {
-		// No need to unmarshal the column value. Either the column was part of
-		// the index key or it isn't needed.
-		if log.V(3) {
-			log.Infof(context.TODO(), "Scan %s -> [%d] (skipped)", kv.Key, colID)
+		rf.row[idx] = encValue
+		if debugRowFetch {
+			log.Infof(ctx, "Scan %d -> %v", idx, encValue)
 		}
 	}
-
+	if debugStrings {
+		prettyValue = rf.prettyValueBuf.String()
+	}
 	return prettyKey, prettyValue, nil
 }
 
 // processValueTuple processes the given values (of columns family.ColumnIDs),
 // setting values in the rf.row accordingly. The key is only used for logging.
 func (rf *RowFetcher) processValueTuple(
-	family *ColumnFamilyDescriptor, kv client.KeyValue, debugStrings bool, prettyKeyPrefix string,
+	ctx context.Context, kv client.KeyValue, debugStrings bool, prettyKeyPrefix string,
 ) (prettyKey string, prettyValue string, err error) {
-	prettyKey = prettyKeyPrefix
-	if debugStrings {
-		rf.prettyValueBuf.Reset()
-	}
-
 	tupleBytes, err := kv.Value.GetTuple()
 	if err != nil {
 		return "", "", err
 	}
-
-	var colIDDiff uint32
-	var value parser.Datum
-	var lastColID ColumnID
-	for len(tupleBytes) > 0 {
-		_, _, colIDDiff, _, err = encoding.DecodeValueTag(tupleBytes)
-		if err != nil {
-			return "", "", err
-		}
-		colID := lastColID + ColumnID(colIDDiff)
-		lastColID = colID
-		idx, ok := rf.colIdxMap[colID]
-		if !ok || !rf.valNeededForCol[idx] {
-			// This column wasn't requested, so read its length and skip it.
-			_, len, err := encoding.PeekValueLength(tupleBytes)
-			if err != nil {
-				return "", "", err
-			}
-			tupleBytes = tupleBytes[len:]
-			if log.V(3) {
-				log.Infof(context.TODO(), "Scan %s -> [%d] (skipped)", kv.Key, colID)
-			}
-			continue
-		}
-
-		if debugStrings {
-			prettyKey = fmt.Sprintf("%s/%s", prettyKey, rf.desc.Columns[idx].Name)
-		}
-
-		kind := rf.cols[idx].Type.Kind
-		if err != nil {
-			return "", "", err
-		}
-		var encValue EncDatum
-		encValue, tupleBytes, err = EncDatumFromBuffer(kind, DatumEncoding_VALUE, tupleBytes)
-		if err != nil {
-			return "", "", err
-		}
-		if debugStrings {
-			err := encValue.EnsureDecoded(&rf.alloc)
-			if err != nil {
-				return "", "", err
-			}
-			value = encValue.Datum
-			fmt.Fprintf(&rf.prettyValueBuf, "/%v", value)
-		}
-		if !rf.row[idx].IsUnset() {
-			panic(fmt.Sprintf("duplicate value for column %d", idx))
-		}
-		rf.row[idx] = encValue
-		if log.V(3) {
-			log.Infof(context.TODO(), "Scan %d -> %v", idx, value)
-		}
-	}
-
-	if debugStrings {
-		prettyValue = rf.prettyValueBuf.String()
-	}
-	return prettyKey, prettyValue, nil
+	return rf.processValueBytes(ctx, kv, tupleBytes, debugStrings, prettyKeyPrefix)
 }
 
 // NextRow processes keys until we complete one row, which is returned as an
@@ -468,7 +532,7 @@ func (rf *RowFetcher) processValueTuple(
 // index used; values that are not needed (as per valNeededForCol) are nil. The
 // EncDatumRow should not be modified and is only valid until the next call.
 // When there are no more rows, the EncDatumRow is nil.
-func (rf *RowFetcher) NextRow() (EncDatumRow, error) {
+func (rf *RowFetcher) NextRow(ctx context.Context, traceKV bool) (EncDatumRow, error) {
 	if rf.kvEnd {
 		return nil, nil
 	}
@@ -480,11 +544,14 @@ func (rf *RowFetcher) NextRow() (EncDatumRow, error) {
 	// column name. When the index key changes we output a row containing the
 	// current values.
 	for {
-		_, _, err := rf.ProcessKV(rf.kv, false)
+		prettyKey, prettyVal, err := rf.processKV(ctx, rf.kv, traceKV)
 		if err != nil {
 			return nil, err
 		}
-		rowDone, err := rf.NextKey()
+		if traceKV {
+			log.VEventf(ctx, 2, "fetched: %s -> %s", prettyKey, prettyVal)
+		}
+		rowDone, err := rf.NextKey(ctx)
 		if err != nil {
 			return nil, err
 		}
@@ -495,55 +562,33 @@ func (rf *RowFetcher) NextRow() (EncDatumRow, error) {
 	}
 }
 
-// NextRowDecoded calls NextRow and decodes the EncDatumRow into a DTuple.
-// The DTuple should not be modified and is only valid until the next call.
-// When there are no more rows, the DTuple is nil.
-func (rf *RowFetcher) NextRowDecoded() (parser.DTuple, error) {
-	encRow, err := rf.NextRow()
+// NextRowDecoded calls NextRow and decodes the EncDatumRow into a Datums.
+// The Datums should not be modified and is only valid until the next call.
+// When there are no more rows, the Datums is nil.
+func (rf *RowFetcher) NextRowDecoded(ctx context.Context, traceKV bool) (parser.Datums, error) {
+	encRow, err := rf.NextRow(ctx, traceKV)
 	if err != nil {
 		return nil, err
 	}
 	if encRow == nil {
 		return nil, nil
 	}
-	err = EncDatumRowToDTuple(rf.decodedRow, encRow, &rf.alloc)
+	err = EncDatumRowToDatums(rf.decodedRow, encRow, rf.alloc)
 	if err != nil {
 		return nil, err
 	}
 	return rf.decodedRow, nil
 }
 
-// NextKeyDebug processes one key at a time and returns a pretty printed key and
-// value. If we completed a row, the row is returned as well (see nextRow). If
-// there are no more keys, prettyKey is "".
-func (rf *RowFetcher) NextKeyDebug() (prettyKey string, prettyValue string, row EncDatumRow, err error) {
-	if rf.kvEnd {
-		return "", "", nil, nil
-	}
-	prettyKey, prettyValue, err = rf.ProcessKV(rf.kv, true)
-	if err != nil {
-		return "", "", nil, err
-	}
-	rowDone, err := rf.NextKey()
-	if err != nil {
-		return "", "", nil, err
-	}
-	if rowDone {
-		rf.finalizeRow()
-		row = rf.row
-	}
-	return prettyKey, prettyValue, row, nil
-}
-
 func (rf *RowFetcher) finalizeRow() {
 	// Fill in any missing values with NULLs
-	for i, col := range rf.cols {
-		if rf.valNeededForCol[i] && rf.row[i].IsUnset() {
-			if !col.Nullable {
+	for i := range rf.cols {
+		if rf.neededCols.Contains(uint32(rf.cols[i].ID)) && rf.row[i].IsUnset() {
+			if !rf.cols[i].Nullable {
 				panic("Non-nullable column with no value!")
 			}
 			rf.row[i] = EncDatum{
-				Type:  col.Type.Kind,
+				Type:  rf.cols[i].Type,
 				Datum: parser.DNull,
 			}
 		}
@@ -551,6 +596,13 @@ func (rf *RowFetcher) finalizeRow() {
 }
 
 // Key returns the next key (the key that follows the last returned row).
+// Key returns nil when there are no more rows.
 func (rf *RowFetcher) Key() roachpb.Key {
 	return rf.kv.Key
+}
+
+// GetRangeInfo returns information about the ranges where the rows came from.
+// The RangeInfo's are deduped and not ordered.
+func (rf *RowFetcher) GetRangeInfo() []roachpb.RangeInfo {
+	return rf.kvFetcher.getRangesInfo()
 }

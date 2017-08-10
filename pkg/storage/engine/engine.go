@@ -11,50 +11,66 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Andrew Bonventre (andybons@gmail.com)
-// Author: Spencer Kimball (spencer.kimball@gmail.com)
-// Author: Jiang-Ming Yang (jiangming.yang@gmail.com)
 
 package engine
 
 import (
 	"github.com/gogo/protobuf/proto"
+	"golang.org/x/net/context"
 
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/storage/engine/enginepb"
+	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 )
 
-// Iterator is an interface for iterating over key/value pairs in an
-// engine. Iterator implementations are thread safe unless otherwise
-// noted.
-type Iterator interface {
+// SimpleIterator is an interface for iterating over key/value pairs in an
+// engine. SimpleIterator implementations are thread safe unless otherwise
+// noted. SimpleIterator is a subset of the functionality offered by Iterator.
+type SimpleIterator interface {
 	// Close frees up resources held by the iterator.
 	Close()
 	// Seek advances the iterator to the first key in the engine which
 	// is >= the provided key.
 	Seek(key MVCCKey)
-	// SeekReverse advances the iterator to the first key in the engine which
-	// is <= the provided key.
-	SeekReverse(key MVCCKey)
-	// Valid returns true if the iterator is currently valid. An iterator that
-	// hasn't had Seek called on it or has gone past the end of the key range
-	// is invalid.
-	Valid() bool
+	// Valid must be called after any call to Seek(), Next(), Prev(), or
+	// similar methods. It returns (true, nil) if the iterator points to
+	// a valid key (it is undefined to call Key(), Value(), or similar
+	// methods unless Valid() has returned (true, nil)). It returns
+	// (false, nil) if the iterator has moved past the end of the valid
+	// range, or (false, err) if an error has occurred. Valid() will
+	// never return true with a non-nil error.
+	Valid() (bool, error)
 	// Next advances the iterator to the next key/value in the
 	// iteration. After this call, Valid() will be true if the
 	// iterator was not positioned at the last key.
 	Next()
-	// Prev moves the iterator backward to the previous key/value
-	// in the iteration. After this call, Valid() will be true if the
-	// iterator was not positioned at the first key.
-	Prev()
 	// NextKey advances the iterator to the next MVCC key. This operation is
 	// distinct from Next which advances to the next version of the current key
 	// or the next key if the iterator is currently located at the last version
 	// for a key.
 	NextKey()
+	// UnsafeKey returns the same value as Key, but the memory is invalidated on
+	// the next call to {Next,Prev,Seek,SeekReverse,Close}.
+	UnsafeKey() MVCCKey
+	// UnsafeValue returns the same value as Value, but the memory is
+	// invalidated on the next call to {Next,Prev,Seek,SeekReverse,Close}.
+	UnsafeValue() []byte
+}
+
+// Iterator is an interface for iterating over key/value pairs in an
+// engine. Iterator implementations are thread safe unless otherwise
+// noted.
+type Iterator interface {
+	SimpleIterator
+
+	// SeekReverse advances the iterator to the first key in the engine which
+	// is <= the provided key.
+	SeekReverse(key MVCCKey)
+	// Prev moves the iterator backward to the previous key/value
+	// in the iteration. After this call, Valid() will be true if the
+	// iterator was not positioned at the first key.
+	Prev()
 	// PrevKey moves the iterator backward to the previous MVCC key. This
 	// operation is distinct from Prev which moves the iterator backward to the
 	// prev version of the current key or the prev key if the iterator is
@@ -67,17 +83,9 @@ type Iterator interface {
 	// ValueProto unmarshals the value the iterator is currently
 	// pointing to using a protobuf decoder.
 	ValueProto(msg proto.Message) error
-	// unsafeKey returns the same value as Key, but the memory is invalidated on
-	// the next call to {Next,Prev,Seek,SeekReverse,Close}.
-	unsafeKey() MVCCKey
-	// unsafeKey returns the same value as Value, but the memory is invalidated
-	// on the next call to {Next,Prev,Seek,SeekReverse,Close}.
-	unsafeValue() []byte
 	// Less returns true if the key the iterator is currently positioned at is
 	// less than the specified key.
 	Less(key MVCCKey) bool
-	// Error returns the error, if any, which the iterator encountered.
-	Error() error
 	// ComputeStats scans the underlying engine from start to end keys and
 	// computes stats counters based on the values. This method is used after a
 	// range is split to recompute stats for each subrange. The start key is
@@ -95,10 +103,11 @@ type Reader interface {
 	// Distinct() batches release their parent batch for future use while
 	// Engines, Snapshots and Batches free the associated C++ resources.
 	Close()
-	// closed returns true if the reader has been closed or is not usable.
+	// Closed returns true if the reader has been closed or is not usable.
 	// Objects backed by this reader (e.g. Iterators) can check this to ensure
-	// that they are not using a closed engine.
-	closed() bool
+	// that they are not using a closed engine. Intended for use within package
+	// engine; exported to enable wrappers to exist in other packages.
+	Closed() bool
 	// Get returns the value for the given key, nil otherwise.
 	Get(key MVCCKey) ([]byte, error)
 	// GetProto fetches the value at the specified key and unmarshals it
@@ -119,18 +128,34 @@ type Reader interface {
 	// skipped). The caller must invoke Iterator.Close() when finished with the
 	// iterator to free resources.
 	NewIterator(prefix bool) Iterator
+	// NewTimeBoundIterator is like NewIterator, but the underlying iterator will
+	// efficiently skip over SSTs that contain no MVCC keys in the time range
+	// (start, end].
+	NewTimeBoundIterator(start, end hlc.Timestamp) Iterator
 }
 
 // Writer is the write interface to an engine's data.
 type Writer interface {
 	// ApplyBatchRepr atomically applies a set of batched updates. Created by
 	// calling Repr() on a batch. Using this method is equivalent to constructing
-	// and committing a batch whose Repr() equals repr.
-	ApplyBatchRepr(repr []byte) error
+	// and committing a batch whose Repr() equals repr. If sync is true, the
+	// batch is synchronously written to disk. It is an error to specify
+	// sync=true if the Writer is a Batch.
+	ApplyBatchRepr(repr []byte, sync bool) error
 	// Clear removes the item from the db with the given key.
 	// Note that clear actually removes entries from the storage
 	// engine, rather than inserting tombstones.
 	Clear(key MVCCKey) error
+	// ClearRange removes a set of entries, from start (inclusive) to end
+	// (exclusive). Similar to Clear, this method actually removes entries from
+	// the storage engine.
+	ClearRange(start, end MVCCKey) error
+	// ClearIterRange removes a set of entries, from start (inclusive) to end
+	// (exclusive). Similar to Clear and ClearRange, this method actually removes
+	// entries from the storage engine. Unlike ClearRange, the entries to remove
+	// are determined by iterating over iter and per-key tombstones are
+	// generated.
+	ClearIterRange(iter Iterator, start, end MVCCKey) error
 	// Merge is a high-performance write operation used for values which are
 	// accumulated over several writes. Multiple values can be merged
 	// sequentially into a single key; a subsequent read will return a "merged"
@@ -167,10 +192,20 @@ type Engine interface {
 	Flush() error
 	// GetStats retrieves stats from the engine.
 	GetStats() (*Stats, error)
+	// GetAuxiliaryDir returns a path under which files can be stored
+	// persistently, and from which data can be ingested by the engine.
+	//
+	// Not thread safe.
+	GetAuxiliaryDir() string
 	// NewBatch returns a new instance of a batched engine which wraps
 	// this engine. Batched engines accumulate all mutations and apply
 	// them atomically on a call to Commit().
 	NewBatch() Batch
+	// NewReadOnly returns a new instance of a ReadWriter that wraps
+	// this engine. This wrapper panics when unexpected operations (e.g., write
+	// operations) are executed on it and caches iterators to avoid the overhead
+	// of creating multiple iterators for batched reads.
+	NewReadOnly() ReadWriter
 	// NewWriteOnlyBatch returns a new instance of a batched engine which wraps
 	// this engine. A write-only batch accumulates all mutations and applies them
 	// atomically on a call to Commit(). Read operations return an error.
@@ -186,14 +221,18 @@ type Engine interface {
 	// by invoking Close(). Note that snapshots must not be used after the
 	// original engine has been stopped.
 	NewSnapshot() Reader
+	// IngestExternalFile links a file into the RocksDB log-structured
+	// merge-tree.
+	IngestExternalFile(ctx context.Context, path string, move bool) error
 }
 
 // Batch is the interface for batch specific operations.
 type Batch interface {
 	ReadWriter
 	// Commit atomically applies any batched updates to the underlying
-	// engine. This is a noop unless the engine was created via NewBatch().
-	Commit() error
+	// engine. This is a noop unless the engine was created via NewBatch(). If
+	// sync is true, the batch is synchronously committed to disk.
+	Commit(sync bool) error
 	// Distinct returns a view of the existing batch which only sees writes that
 	// were performed before the Distinct batch was created. That is, the
 	// returned batch will not read its own writes, but it will read writes to
@@ -262,24 +301,4 @@ func Scan(engine Reader, start, end MVCCKey, max int64) ([]MVCCKeyValue, error) 
 		return false, nil
 	})
 	return kvs, err
-}
-
-// ClearRange removes a set of entries, from start (inclusive) to end
-// (exclusive). This function returns the number of entries
-// removed. Either all entries within the range will be deleted, or
-// none, and an error will be returned. Note that this function
-// actually removes entries from the storage engine, rather than
-// inserting tombstones, as with deletion through the MVCC.
-func ClearRange(engine ReadWriter, start, end MVCCKey) (int, error) {
-	count := 0
-	if err := engine.Iterate(start, end, func(kv MVCCKeyValue) (bool, error) {
-		if err := engine.Clear(kv.Key); err != nil {
-			return false, err
-		}
-		count++
-		return false, nil
-	}); err != nil {
-		return 0, err
-	}
-	return count, nil
 }

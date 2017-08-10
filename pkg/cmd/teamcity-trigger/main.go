@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Tamir Duberstein (tamird@gmail.com)
 
 package main
 
@@ -25,8 +23,6 @@ import (
 
 	"github.com/abourget/teamcity"
 	"github.com/kisielk/gotool"
-
-	"github.com/cockroachdb/cockroach/pkg/testutils"
 )
 
 var buildTypeID = flag.String("build", "Cockroach_Nightlies_Stress", "the TeamCity build ID to start")
@@ -74,15 +70,11 @@ func runTC(queueBuildFn func(map[string]string)) {
 		{"env.GOFLAGS": "-race"},
 		{"env.TAGS": "deadlock"},
 	} {
-		properties[testutils.StressEnv] = strconv.FormatBool(true)
-		for _, propEvalKV := range []bool{true, false} {
-			properties["env.COCKROACH_PROPOSER_EVALUATED_KV"] = strconv.FormatBool(propEvalKV)
+		properties["COCKROACH_NIGHTLY_STRESS"] = strconv.FormatBool(true)
+		for _, importPath := range importPaths {
+			properties["env.PKG"] = importPath
 
-			for _, importPath := range importPaths {
-				properties["env.PKG"] = importPath
-
-				queueBuildFn(properties)
-			}
+			queueBuildFn(properties)
 		}
 	}
 }

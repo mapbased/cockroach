@@ -11,9 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Spencer Kimball (spencer.kimball@gmail.com)
-// Author: Tobias Schottdorf (tobias.schottdorf@gmail.com)
 
 package engine
 
@@ -25,6 +22,8 @@ import (
 	"strconv"
 	"testing"
 
+	"github.com/gogo/protobuf/proto"
+	"github.com/pkg/errors"
 	"golang.org/x/net/context"
 
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
@@ -32,7 +31,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
-	"github.com/gogo/protobuf/proto"
 )
 
 func ensureRangeEqual(
@@ -59,7 +57,7 @@ var (
 // invokes the supplied test func with each instance.
 func runWithAllEngines(test func(e Engine, t *testing.T), t *testing.T) {
 	stopper := stop.NewStopper()
-	defer stopper.Stop()
+	defer stopper.Stop(context.TODO())
 	inMem := NewInMem(inMemAttrs, testCacheSize)
 	stopper.AddCloser(inMem)
 	test(inMem, t)
@@ -78,28 +76,30 @@ func TestEngineBatchCommit(t *testing.T) {
 	runWithAllEngines(func(e Engine, t *testing.T) {
 		// Start a concurrent read operation in a busy loop.
 		readsBegun := make(chan struct{})
-		readsDone := make(chan struct{})
+		readsDone := make(chan error)
 		writesDone := make(chan struct{})
 		go func() {
-			for i := 0; ; i++ {
-				select {
-				case <-writesDone:
-					close(readsDone)
-					return
-				default:
-					val, err := e.Get(key)
-					if err != nil {
-						t.Fatal(err)
-					}
-					if val != nil && !bytes.Equal(val, finalVal) {
-						close(readsDone)
-						t.Fatalf("key value should be empty or %q; got %q", string(finalVal), string(val))
-					}
-					if i == 0 {
-						close(readsBegun)
+			readsDone <- func() error {
+				readsBegunAlias := readsBegun
+				for {
+					select {
+					case <-writesDone:
+						return nil
+					default:
+						val, err := e.Get(key)
+						if err != nil {
+							return err
+						}
+						if val != nil && !bytes.Equal(val, finalVal) {
+							return errors.Errorf("key value should be empty or %q; got %q", string(finalVal), string(val))
+						}
+						if readsBegunAlias != nil {
+							close(readsBegunAlias)
+							readsBegunAlias = nil
+						}
 					}
 				}
-			}
+			}()
 		}()
 		// Wait until we've succeeded with first read.
 		<-readsBegun
@@ -112,11 +112,13 @@ func TestEngineBatchCommit(t *testing.T) {
 				t.Fatal(err)
 			}
 		}
-		if err := batch.Commit(); err != nil {
+		if err := batch.Commit(false /* !sync */); err != nil {
 			t.Fatal(err)
 		}
 		close(writesDone)
-		<-readsDone
+		if err := <-readsDone; err != nil {
+			t.Fatal(err)
+		}
 	}, t)
 }
 
@@ -147,9 +149,11 @@ func TestEngineBatchStaleCachedIterator(t *testing.T) {
 			// Iterator should not reuse its cached result.
 			iter.Seek(key)
 
-			if iter.Valid() {
+			if ok, err := iter.Valid(); err != nil {
+				t.Fatal(err)
+			} else if ok {
 				t.Fatalf("iterator unexpectedly valid: %v -> %v",
-					iter.unsafeKey(), iter.unsafeValue())
+					iter.UnsafeKey(), iter.UnsafeValue())
 			}
 		}
 
@@ -162,7 +166,7 @@ func TestEngineBatchStaleCachedIterator(t *testing.T) {
 
 			// Put a value so that the deletion below finds a value to seek
 			// to.
-			if err := MVCCPut(context.Background(), batch, nil, key, hlc.ZeroTimestamp,
+			if err := MVCCPut(context.Background(), batch, nil, key, hlc.Timestamp{},
 				roachpb.MakeValueFromString("x"), nil); err != nil {
 				t.Fatal(err)
 			}
@@ -170,7 +174,7 @@ func TestEngineBatchStaleCachedIterator(t *testing.T) {
 			// Seek the iterator to `key` and clear the value (but without
 			// telling the iterator about that).
 			if err := MVCCDelete(context.Background(), batch, nil, key,
-				hlc.ZeroTimestamp, nil); err != nil {
+				hlc.Timestamp{}, nil); err != nil {
 				t.Fatal(err)
 			}
 
@@ -182,7 +186,7 @@ func TestEngineBatchStaleCachedIterator(t *testing.T) {
 			// result back, we'll see the (newly deleted) value (due to the
 			// failure mode above).
 			if v, _, err := MVCCGet(context.Background(), batch, key,
-				hlc.ZeroTimestamp, true, nil); err != nil {
+				hlc.Timestamp{}, true, nil); err != nil {
 				t.Fatal(err)
 			} else if v != nil {
 				t.Fatalf("expected no value, got %+v", v)
@@ -294,9 +298,9 @@ func TestEngineBatch(t *testing.T) {
 			// Try using an iterator to get the value from the batch.
 			iter := b.NewIterator(false)
 			iter.Seek(key)
-			if !iter.Valid() {
+			if ok, err := iter.Valid(); !ok {
 				if currentBatch[len(currentBatch)-1].value != nil {
-					t.Errorf("%d: batch seek invalid", i)
+					t.Errorf("%d: batch seek invalid, err=%v", i, err)
 				}
 			} else if !iter.Key().Equal(key) {
 				t.Errorf("%d: batch seek expected key %s, but got %s", i, key, iter.Key())
@@ -315,7 +319,7 @@ func TestEngineBatch(t *testing.T) {
 			}
 			iter.Close()
 			// Commit the batch and try getting the value from the engine.
-			if err := b.Commit(); err != nil {
+			if err := b.Commit(false /* !sync */); err != nil {
 				t.Errorf("%d: %v", i, err)
 				continue
 			}
@@ -571,8 +575,7 @@ func TestEngineScan2(t *testing.T) {
 	}, t)
 }
 
-func TestEngineDeleteRange(t *testing.T) {
-	defer leaktest.AfterTest(t)()
+func testEngineDeleteRange(t *testing.T, clearRange func(engine Engine, start, end MVCCKey) error) {
 	runWithAllEngines(func(engine Engine, t *testing.T) {
 		keys := []MVCCKey{
 			mvccKey("a"),
@@ -589,18 +592,47 @@ func TestEngineDeleteRange(t *testing.T) {
 		verifyScan(mvccKey(roachpb.RKeyMin), mvccKey(roachpb.RKeyMax), 10, keys[:5], engine, t)
 
 		// Delete a range of keys
-		numDeleted, err := ClearRange(engine, mvccKey("aa"), mvccKey("abc"))
-		// Verify what was deleted
-		if err != nil {
-			t.Error("Not expecting an error")
-		}
-		if numDeleted != 3 {
-			t.Errorf("Expected to delete 3 entries; was %v", numDeleted)
+		if err := clearRange(engine, mvccKey("aa"), mvccKey("abc")); err != nil {
+			t.Fatal(err)
 		}
 		// Verify what's left
 		verifyScan(mvccKey(roachpb.RKeyMin), mvccKey(roachpb.RKeyMax), 10,
 			[]MVCCKey{mvccKey("a"), mvccKey("abc")}, engine, t)
 	}, t)
+
+}
+
+func TestEngineDeleteRange(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	testEngineDeleteRange(t, func(engine Engine, start, end MVCCKey) error {
+		return engine.ClearRange(start, end)
+	})
+}
+
+func TestEngineDeleteRangeBatch(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	testEngineDeleteRange(t, func(engine Engine, start, end MVCCKey) error {
+		batch := engine.NewWriteOnlyBatch()
+		defer batch.Close()
+		if err := batch.ClearRange(start, end); err != nil {
+			return err
+		}
+		batch2 := engine.NewWriteOnlyBatch()
+		defer batch2.Close()
+		if err := batch2.ApplyBatchRepr(batch.Repr(), false); err != nil {
+			return err
+		}
+		return batch2.Commit(false)
+	})
+}
+
+func TestEngineDeleteIterRange(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	testEngineDeleteRange(t, func(engine Engine, start, end MVCCKey) error {
+		iter := engine.NewIterator(false)
+		defer iter.Close()
+		return engine.ClearIterRange(iter, start, end)
+	})
 }
 
 func TestSnapshot(t *testing.T) {
@@ -730,7 +762,9 @@ func TestSnapshotMethods(t *testing.T) {
 		// Verify NewIterator still iterates over original snapshot.
 		iter := snap.NewIterator(false)
 		iter.Seek(newKey)
-		if iter.Valid() {
+		if ok, err := iter.Valid(); err != nil {
+			t.Fatal(err)
+		} else if ok {
 			t.Error("expected invalid iterator when seeking to element which shouldn't be visible to snapshot")
 		}
 		iter.Close()

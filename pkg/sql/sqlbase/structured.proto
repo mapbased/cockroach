@@ -11,23 +11,22 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Tamir Duberstein (tamird@gmail.com)
 
 // Cannot be proto3 because we use nullable primitives.
 syntax = "proto2";
 package cockroach.sql.sqlbase;
 option go_package = "sqlbase";
 
-import "cockroach/pkg/roachpb/data.proto";
 import "cockroach/pkg/util/hlc/timestamp.proto";
 import "cockroach/pkg/sql/sqlbase/privilege.proto";
 import "gogoproto/gogo.proto";
 
 message ColumnType {
+  option (gogoproto.equal) = true;
+
   // These mirror the types supported by the sql/parser. See
   // sql/parser/col_types.go.
-  enum Kind {
+  enum SemanticType {
     BOOL = 0;
     INT = 1;        // INT(width)
     FLOAT = 2;      // FLOAT(precision)
@@ -38,18 +37,37 @@ message ColumnType {
     STRING = 7;     // STRING(width)
     BYTES = 8;
     TIMESTAMPTZ = 9;
+    COLLATEDSTRING = 10;  // Collated STRING, CHAR, and VARCHAR
+    // Collated string key columns are encoded partly as a key and partly as a
+    // value. The key part is the collation key, so that different strings that
+    // collate equal cannot both be used as keys. The value part is the usual
+    // UTF-8 encoding of the string. This creates several special cases in the
+    // encode/decode logic.
 
-    // Array types.
-    //
-    // TODO(cuongdo): Fix this before allowing persistence of array types. 
-    // It would be cleaner if when array_dimensions are specified, Kind is
-    // simply the parameterized type of the array. However, because Kind is used
-    // to determine type information elsewhere, it isn't possible to take the
-    // cleaner approach without an extensive refactoring.
-    INT_ARRAY = 100;
+    NAME = 11;
+    OID = 12;
+
+    // NULL is not supported as a table column type, however it can be
+    // transferred through distsql streams.
+    NULL = 13;
+
+    UUID = 14;
+    ARRAY = 15;
+
+    INT2VECTOR = 200;
   }
 
-  optional Kind kind = 1 [(gogoproto.nullable) = false];
+  enum VisibleType {
+    NONE = 0;
+    INTEGER = 1;
+    SMALLINT = 2;
+    BIGINT = 3;
+    BIT = 4;
+    REAL = 5;
+    DOUBLE_PRECISON = 6;
+  }
+
+  optional SemanticType semantic_type = 1 [(gogoproto.nullable) = false];
   // BIT, INT, FLOAT, DECIMAL, CHAR and BINARY
   optional int32 width = 2 [(gogoproto.nullable) = false];
   // FLOAT and DECIMAL.
@@ -57,6 +75,14 @@ message ColumnType {
   // The length of each dimension in the array. A dimension of -1 means that
   // no bound was specified for that dimension.
   repeated int32 array_dimensions = 4;
+  // Collated STRING, CHAR, and VARCHAR
+  optional string locale = 5;
+  // Alias for any types where our internal representation is different than
+  // the user specification. Examples are INT4, FLOAT4, etc. Mostly for Postgres
+  // compatibility.
+  optional VisibleType visible_type = 6 [(gogoproto.nullable) = false];
+  // Only used if the kind is ARRAY.
+  optional SemanticType array_contents = 7;
 }
 
 enum ConstraintValidity {
@@ -69,6 +95,9 @@ message ForeignKeyReference {
   optional uint32 index = 2 [(gogoproto.nullable) = false, (gogoproto.casttype) = "IndexID"];
   optional string name = 3 [(gogoproto.nullable) = false];
   optional ConstraintValidity validity = 4 [(gogoproto.nullable) = false];
+  // If this FK only uses a prefix of the columns in its index, we record how
+  // many to avoid spuriously counting the additional cols as used by this FK.
+  optional int32 shared_prefix_len = 5 [(gogoproto.nullable) = false];
 }
 
 message ColumnDescriptor {
@@ -146,6 +175,49 @@ message InterleaveDescriptor {
   repeated Ancestor ancestors = 1 [(gogoproto.nullable) = false];
 }
 
+// IndexDescriptor describes an index (primary or secondary).
+//
+// Sample field values on the following table:
+//
+//   CREATE TABLE t (
+//     k1 INT NOT NULL,   // column ID: 1
+//     k2 INT NOT NULL,   // column ID: 2
+//     u INT NULL,        // column ID: 3
+//     v INT NULL,        // column ID: 4
+//     w INT NULL,        // column ID: 5
+//     CONSTRAINT "primary" PRIMARY KEY (k1, k2),
+//     INDEX k1v (k1, v) STORING (w),
+//     FAMILY "primary" (k1, k2, u, v, w)
+//   )
+//
+// Primary index:
+//   name:                primary
+//   id:                  1
+//   unique:              true
+//   column_names:        k1, k2
+//   column_directions:   ASC, ASC
+//   column_ids:          1, 2   // k1, k2
+//
+// [old STORING encoding] Index k1v (k1, v) STORING (w):
+//   name:                k1v
+//   id:                  2
+//   unique:              false
+//   column_names:        k1, v
+//   column_directions:   ASC, ASC
+//   store_column_names:  w
+//   column_ids:          1, 4   // k1, v
+//   extra_column_ids:    2, 5   // k2, w
+//
+// [new STORING encoding] Index k1v (k1, v) STORING (w):
+//   name:                k1v
+//   id:                  2
+//   unique:              false
+//   column_names:        k1, v
+//   column_directions:   ASC, ASC
+//   store_column_names:  w
+//   column_ids:          1, 4   // k1, v
+//   extra_column_ids:    2      // k2
+//   store_column_ids:    5      // w
 message IndexDescriptor {
   // The direction of a column in the index.
   enum Direction {
@@ -157,31 +229,56 @@ message IndexDescriptor {
   optional uint32 id = 2 [(gogoproto.nullable) = false,
       (gogoproto.customname) = "ID", (gogoproto.casttype) = "IndexID"];
   optional bool unique = 3 [(gogoproto.nullable) = false];
-  // An ordered list of column names of which the index is comprised. This list
-  // parallels the column_ids list. If duplicating the storage of the column
-  // names here proves to be prohibitive, we could clear this field before
-  // saving and reconstruct it after loading.
+
+  // An ordered list of column names of which the index is comprised; these
+  // columns do not include any additional stored columns (which are in
+  // stored_column_names). This list parallels the column_ids list.
+  //
+  // Note: if duplicating the storage of the column names here proves to be
+  // prohibitive, we could clear this field before saving and reconstruct it
+  // after loading.
   repeated string column_names = 4;
-  // Parallel with column_names - the sort direction of each column.
+
+  // The sort direction of each column in column_names.
   repeated Direction column_directions = 8;
 
-  // An ordered list of column names which the index stores in
-  // addition to the columns which are explicitly part of the index.
+  // An ordered list of column names which the index stores in addition to the
+  // columns which are explicitly part of the index (STORING clause). Only used
+  // for secondary indexes.
   repeated string store_column_names = 5;
-  // An ordered list of column ids of which the index is comprised. This list
-  // parallels the column_names list.
+
+  // An ordered list of column IDs of which the index is comprised. This list
+  // parallels the column_names list and does not include any additional stored
+  // columns.
   repeated uint32 column_ids = 6 [(gogoproto.customname) = "ColumnIDs",
       (gogoproto.casttype) = "ColumnID"];
-  // An ordered list of implicit column ids associated with the index. For
-  // non-unique indexes, these columns will be appended to the key. For unique
-  // indexes these columns will be stored in the value. The extra column IDs is
-  // computed as PrimaryIndex.column_ids - column_ids. For the primary index
-  // the list will be empty.
-  // The distinction about whether the columns are written in the key or the value
-  // comes because we want to always do writes using a single operation - this
-  // way for unique indexes we can do a conditional put on the key.
-  repeated uint32 implicit_column_ids = 7 [(gogoproto.customname) = "ImplicitColumnIDs",
+
+  // An ordered list of IDs for the additional columns associated with the
+  // index:
+  //  - implicit columns, which are all the primary key columns that are not
+  //    already part of the index (i.e. PrimaryIndex.column_ids - column_ids).
+  //  - stored columns (the columns in store_column_names) if this index uses the
+  //    old STORING encoding (key-encoded data).
+  //
+  // Only used for secondary indexes.
+  // For non-unique indexes, these columns are appended to the key.
+  // For unique indexes, these columns are stored in the value.
+  // This distinction exists because we want to be able to insert an entry using
+  // a single conditional put on the key.
+  repeated uint32 extra_column_ids = 7 [(gogoproto.customname) = "ExtraColumnIDs",
       (gogoproto.casttype) = "ColumnID"];
+
+  // An ordered list of column IDs that parallels store_column_names if this
+  // index uses the new STORING encoding (value-encoded data, always in the KV
+  // value).
+  repeated uint32 store_column_ids = 14
+      [(gogoproto.customname) = "StoreColumnIDs", (gogoproto.casttype) = "ColumnID"];
+
+  // CompositeColumnIDs contains an ordered list of IDs of columns that appear
+  // in the index and have a composite encoding. Includes IDs from both
+  // column_ids and extra_column_ids.
+  repeated uint32 composite_column_ids = 13
+      [(gogoproto.customname) = "CompositeColumnIDs", (gogoproto.casttype) = "ColumnID"];
 
   optional ForeignKeyReference foreign_key = 9 [(gogoproto.nullable) = false];
   repeated ForeignKeyReference referenced_by = 10 [(gogoproto.nullable) = false];
@@ -189,6 +286,7 @@ message IndexDescriptor {
   // Interleave, if it's not the zero value, describes how this index's data is
   // interleaved into another index's data.
   optional InterleaveDescriptor interleave = 11 [(gogoproto.nullable) = false];
+
   // InterleavedBy contains a reference to every table/index that is interleaved
   // into this one.
   repeated ForeignKeyReference interleaved_by = 12  [(gogoproto.nullable) = false];
@@ -233,8 +331,8 @@ message DescriptorMutation {
     //
     // When adding a descriptor, all descriptor related data
     // (column default or index data) can only be backfilled once
-    // all nodes have transitioned into the WRITE_ONLY state.
-    WRITE_ONLY = 2;
+    // all nodes have transitioned into the DELETE_AND_WRITE_ONLY state.
+    DELETE_AND_WRITE_ONLY = 2;
   }
   optional State state = 3 [(gogoproto.nullable) = false];
 
@@ -255,12 +353,7 @@ message DescriptorMutation {
   // unique constraint index.
   optional uint32 mutation_id = 5 [(gogoproto.nullable) = false,
       (gogoproto.customname) = "MutationID", (gogoproto.casttype) = "MutationID"];
-
-  // A schema change can involve backfilling or deleting data.
-  // It occasionally stores a checkpoint Span of where the backfill/delete
-  // is, so that in the event of a node failure, it can start close to
-  // where it left off.
-  optional roachpb.Span resume_span = 6 [(gogoproto.nullable) = false];
+  reserved 6;
 }
 
 // A TableDescriptor represents a table or view and is stored in a
@@ -441,6 +534,21 @@ message TableDescriptor {
   // they're still being referred to.
   repeated Reference dependedOnBy = 26 [(gogoproto.nullable) = false,
            (gogoproto.customname) = "DependedOnBy"];
+
+  message MutationJob {
+    // The mutation id of this mutation job.
+    optional uint32 mutation_id = 1 [(gogoproto.nullable) = false,
+             (gogoproto.customname) = "MutationID", (gogoproto.casttype) = "MutationID"];
+
+    // The job id for a mutation job is the id in the system.jobs table of the
+    // schema change job executing the mutation referenced by mutation_id.
+    optional int64 job_id = 2 [(gogoproto.nullable) = false,
+             (gogoproto.customname) = "JobID"];
+  }
+
+  // Mutation jobs queued for execution in a FIFO order. Remains synchronized
+  // with the mutations list.
+  repeated MutationJob mutationJobs = 27 [(gogoproto.nullable) = false];
 }
 
 // DatabaseDescriptor represents a namespace (aka database) and is stored

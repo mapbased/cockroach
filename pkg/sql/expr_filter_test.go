@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Radu Berinde (radu@cockroachlabs.com)
 
 package sql
 
@@ -20,6 +18,8 @@ import (
 	"fmt"
 	"strings"
 	"testing"
+
+	"golang.org/x/net/context"
 
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
@@ -119,9 +119,11 @@ func TestSplitFilter(t *testing.T) {
 
 	for _, d := range testData {
 		t.Run(fmt.Sprintf("%s~(%s, %s)", d.expr, d.expectedRes, d.expectedRem), func(t *testing.T) {
+			evalCtx := parser.NewTestingEvalContext()
+			defer evalCtx.Stop(context.Background())
 			sel := makeSelectNode(t)
 			// A function that "converts" only vars in the list.
-			conv := func(expr parser.VariableExpr) (bool, parser.VariableExpr) {
+			conv := func(expr parser.VariableExpr) (bool, parser.Expr) {
 				iv := expr.(*parser.IndexedVar)
 				colName := iv.String()
 				for _, col := range d.vars {
@@ -133,7 +135,7 @@ func TestSplitFilter(t *testing.T) {
 				}
 				return false, nil
 			}
-			expr := parseAndNormalizeExpr(t, d.expr, sel)
+			expr := parseAndNormalizeExpr(t, evalCtx, d.expr, sel)
 			exprStr := expr.String()
 			res, rem := splitFilter(expr, conv)
 			// We use Sprint to handle the 'nil' case correctly.

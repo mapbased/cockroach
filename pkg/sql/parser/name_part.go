@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Raphael 'kena' Poss (knz@cockroachlabs.com)
 
 package parser
 
@@ -65,7 +63,11 @@ type Name string
 
 // Format implements the NodeFormatter interface.
 func (n Name) Format(buf *bytes.Buffer, f FmtFlags) {
-	encodeSQLIdent(buf, string(n))
+	if f.anonymize {
+		buf.WriteByte('_')
+	} else {
+		encodeSQLIdent(buf, string(n), f)
+	}
 }
 
 // Normalize normalizes to lowercase and Unicode Normalization Form C
@@ -76,18 +78,6 @@ func (n Name) Normalize() string {
 		return lower
 	}
 	return norm.NFC.String(lower)
-}
-
-// Equal returns true iff the normalizations of a and b are equal.
-func (n Name) Equal(b Name) bool {
-	return n.Normalize() == b.Normalize()
-}
-
-// ReNormalizeName performs the same work as NormalizeName but when
-// the string originates from the database. We define a different
-// function so as to be able to track usage of this function (cf. #8200).
-func ReNormalizeName(name string) string {
-	return Name(name).Normalize()
 }
 
 // ToStrings converts the name list to an array of regular strings.
@@ -180,7 +170,7 @@ func (l NameParts) Format(buf *bytes.Buffer, f FmtFlags) {
 type UnresolvedName NameParts
 
 // Format implements the NodeFormatter interface.
-func (u UnresolvedName) Format(buf *bytes.Buffer, f FmtFlags) { NameParts(u).Format(buf, f) }
+func (u UnresolvedName) Format(buf *bytes.Buffer, f FmtFlags) { FormatNode(buf, f, NameParts(u)) }
 func (u UnresolvedName) String() string                       { return AsString(u) }
 
 // UnresolvedNames corresponds to a comma-separate list of unresolved

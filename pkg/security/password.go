@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Marc Berhault (marc@cockroachlabs.com)
 
 package security
 
@@ -20,7 +18,7 @@ import (
 	"bytes"
 	"crypto/sha256"
 	"fmt"
-	"syscall"
+	"os"
 
 	"github.com/pkg/errors"
 
@@ -36,7 +34,10 @@ const bcryptCost = bcrypt.DefaultCost
 // ErrEmptyPassword indicates that an empty password was attempted to be set.
 var ErrEmptyPassword = errors.New("empty passwords are not permitted")
 
-func compareHashAndPassword(hashedPassword []byte, password string) error {
+// CompareHashAndPassword tests that the provided bytes are equivalent to the
+// hash of the supplied password. If they are not equivalent, returns an
+// error.
+func CompareHashAndPassword(hashedPassword []byte, password string) error {
 	h := sha256.New()
 	return bcrypt.CompareHashAndPassword(hashedPassword, h.Sum([]byte(password)))
 }
@@ -47,11 +48,26 @@ func HashPassword(password string) ([]byte, error) {
 	return bcrypt.GenerateFromPassword(h.Sum([]byte(password)), bcryptCost)
 }
 
-// PromptForPassword prompts for a password twice, returning the read string if
-// they match, or an error.
+// PromptForPassword prompts for a password.
+// This is meant to be used when using a password.
 func PromptForPassword() (string, error) {
 	fmt.Print("Enter password: ")
-	one, err := terminal.ReadPassword(syscall.Stdin)
+	password, err := terminal.ReadPassword(int(os.Stdin.Fd()))
+	if err != nil {
+		return "", err
+	}
+	// Make sure stdout moves on to the next line.
+	fmt.Print("\n")
+
+	return string(password), nil
+}
+
+// PromptForPasswordTwice prompts for a password twice, returning the read string if
+// they match, or an error.
+// This is meant to be used when setting a password.
+func PromptForPasswordTwice() (string, error) {
+	fmt.Print("Enter password: ")
+	one, err := terminal.ReadPassword(int(os.Stdin.Fd()))
 	if err != nil {
 		return "", err
 	}
@@ -59,7 +75,7 @@ func PromptForPassword() (string, error) {
 		return "", ErrEmptyPassword
 	}
 	fmt.Print("\nConfirm password: ")
-	two, err := terminal.ReadPassword(syscall.Stdin)
+	two, err := terminal.ReadPassword(int(os.Stdin.Fd()))
 	if err != nil {
 		return "", err
 	}
@@ -75,7 +91,7 @@ func PromptForPassword() (string, error) {
 // PromptForPasswordAndHash prompts for a password twice and returns the bcrypt
 // hash.
 func PromptForPasswordAndHash() ([]byte, error) {
-	password, err := PromptForPassword()
+	password, err := PromptForPasswordTwice()
 	if err != nil {
 		return nil, err
 	}

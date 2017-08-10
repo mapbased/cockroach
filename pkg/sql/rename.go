@@ -11,23 +11,22 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: XisiHuang (cockhuangxh@163.com)
 
 package sql
 
 import (
 	"fmt"
 
+	"github.com/pkg/errors"
+	"golang.org/x/net/context"
+
 	"github.com/cockroachdb/cockroach/pkg/config"
 	"github.com/cockroachdb/cockroach/pkg/internal/client"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
-	"github.com/pkg/errors"
 )
 
 var (
@@ -39,21 +38,21 @@ var (
 // Privileges: security.RootUser user, DROP on source database.
 //   Notes: postgres requires superuser, db owner, or "CREATEDB".
 //          mysql >= 5.1.23 does not allow database renames.
-func (p *planner) RenameDatabase(n *parser.RenameDatabase) (planNode, error) {
+func (p *planner) RenameDatabase(ctx context.Context, n *parser.RenameDatabase) (planNode, error) {
 	if n.Name == "" || n.NewName == "" {
 		return nil, errEmptyDatabaseName
 	}
 
-	if p.session.User != security.RootUser {
-		return nil, fmt.Errorf("only %s is allowed to rename databases", security.RootUser)
+	if err := p.RequireSuperUser("ALTER DATABASE ... RENAME"); err != nil {
+		return nil, err
 	}
 
-	dbDesc, err := p.mustGetDatabaseDesc(string(n.Name))
+	dbDesc, err := MustGetDatabaseDesc(ctx, p.txn, p.getVirtualTabler(), string(n.Name))
 	if err != nil {
 		return nil, err
 	}
 
-	if err := p.checkPrivilege(dbDesc, privilege.DROP); err != nil {
+	if err := p.CheckPrivilege(dbDesc, privilege.DROP); err != nil {
 		return nil, err
 	}
 
@@ -66,12 +65,12 @@ func (p *planner) RenameDatabase(n *parser.RenameDatabase) (planNode, error) {
 	// are currently just stored as strings, they explicitly specify the database
 	// name. Rather than trying to rewrite them with the changed DB name, we
 	// simply disallow such renames for now.
-	tbNames, err := p.getTableNames(dbDesc)
+	tbNames, err := getTableNames(ctx, p.txn, p.getVirtualTabler(), dbDesc, false)
 	if err != nil {
 		return nil, err
 	}
 	for i := range tbNames {
-		tbDesc, err := p.getTableOrViewDesc(&tbNames[i])
+		tbDesc, err := getTableOrViewDesc(ctx, p.txn, p.getVirtualTabler(), &tbNames[i])
 		if err != nil {
 			return nil, err
 		}
@@ -79,27 +78,28 @@ func (p *planner) RenameDatabase(n *parser.RenameDatabase) (planNode, error) {
 			continue
 		}
 		if len(tbDesc.DependedOnBy) > 0 {
-			viewDesc, err := sqlbase.GetTableDescFromID(p.txn, tbDesc.DependedOnBy[0].ID)
+			viewDesc, err := sqlbase.GetTableDescFromID(ctx, p.txn, tbDesc.DependedOnBy[0].ID)
 			if err != nil {
 				return nil, err
 			}
 			viewName := viewDesc.Name
 			if dbDesc.ID != viewDesc.ParentID {
 				var err error
-				viewName, err = p.getQualifiedTableName(viewDesc)
+				viewName, err = p.getQualifiedTableName(ctx, viewDesc)
 				if err != nil {
-					log.Warningf(p.ctx(), "Unable to retrieve fully-qualified name of view %d: %v",
+					log.Warningf(ctx, "Unable to retrieve fully-qualified name of view %d: %v",
 						viewDesc.ID, err)
-					return nil, sqlbase.NewDependentObjectError(
-						"cannot rename database because a view depends on table %q", tbDesc.Name)
+					msg := fmt.Sprintf("cannot rename database because a view depends on table %q", tbDesc.Name)
+					return nil, sqlbase.NewDependentObjectError(msg)
 				}
 			}
-			return nil, sqlbase.NewDependentObjectError(
-				"cannot rename database because view %q depends on table %q", viewName, tbDesc.Name)
+			msg := fmt.Sprintf("cannot rename database because view %q depends on table %q", viewName, tbDesc.Name)
+			hint := fmt.Sprintf("you can drop %s instead.", viewName)
+			return nil, sqlbase.NewDependentObjectErrorWithHint(msg, hint)
 		}
 	}
 
-	if err := p.renameDatabase(dbDesc, string(n.NewName)); err != nil {
+	if err := p.renameDatabase(ctx, dbDesc, string(n.NewName)); err != nil {
 		return nil, err
 	}
 	return &emptyNode{}, nil
@@ -110,7 +110,7 @@ func (p *planner) RenameDatabase(n *parser.RenameDatabase) (planNode, error) {
 //   Notes: postgres requires the table owner.
 //          mysql requires ALTER, DROP on the original table, and CREATE, INSERT
 //          on the new table (and does not copy privileges over).
-func (p *planner) RenameTable(n *parser.RenameTable) (planNode, error) {
+func (p *planner) RenameTable(ctx context.Context, n *parser.RenameTable) (planNode, error) {
 	oldTn, err := n.Name.NormalizeWithDatabaseName(p.session.Database)
 	if err != nil {
 		return nil, err
@@ -120,7 +120,7 @@ func (p *planner) RenameTable(n *parser.RenameTable) (planNode, error) {
 		return nil, err
 	}
 
-	dbDesc, err := p.mustGetDatabaseDesc(oldTn.Database())
+	dbDesc, err := MustGetDatabaseDesc(ctx, p.txn, p.getVirtualTabler(), oldTn.Database())
 	if err != nil {
 		return nil, err
 	}
@@ -132,7 +132,7 @@ func (p *planner) RenameTable(n *parser.RenameTable) (planNode, error) {
 	// made more lenient down the road if needed.
 	var tableDesc *sqlbase.TableDescriptor
 	if n.IsView {
-		tableDesc, err = p.getViewDesc(oldTn)
+		tableDesc, err = getViewDesc(ctx, p.txn, p.getVirtualTabler(), oldTn)
 		if err != nil {
 			return nil, err
 		}
@@ -142,13 +142,13 @@ func (p *planner) RenameTable(n *parser.RenameTable) (planNode, error) {
 				return &emptyNode{}, nil
 			}
 			// Key does not exist, but we want it to: error out.
-			return nil, sqlbase.NewUndefinedViewError(oldTn.String())
+			return nil, sqlbase.NewUndefinedRelationError(oldTn)
 		}
 		if tableDesc.State != sqlbase.TableDescriptor_PUBLIC {
-			return nil, sqlbase.NewUndefinedViewError(oldTn.String())
+			return nil, sqlbase.NewUndefinedRelationError(oldTn)
 		}
 	} else {
-		tableDesc, err = p.getTableDesc(oldTn)
+		tableDesc, err = getTableDesc(ctx, p.txn, p.getVirtualTabler(), oldTn)
 		if err != nil {
 			return nil, err
 		}
@@ -158,14 +158,14 @@ func (p *planner) RenameTable(n *parser.RenameTable) (planNode, error) {
 				return &emptyNode{}, nil
 			}
 			// Key does not exist, but we want it to: error out.
-			return nil, sqlbase.NewUndefinedTableError(oldTn.String())
+			return nil, sqlbase.NewUndefinedRelationError(oldTn)
 		}
 		if tableDesc.State != sqlbase.TableDescriptor_PUBLIC {
-			return nil, sqlbase.NewUndefinedTableError(oldTn.String())
+			return nil, sqlbase.NewUndefinedRelationError(oldTn)
 		}
 	}
 
-	if err := p.checkPrivilege(tableDesc, privilege.DROP); err != nil {
+	if err := p.CheckPrivilege(tableDesc, privilege.DROP); err != nil {
 		return nil, err
 	}
 
@@ -175,16 +175,16 @@ func (p *planner) RenameTable(n *parser.RenameTable) (planNode, error) {
 	// query with the new name, we simply disallow such renames for now.
 	if len(tableDesc.DependedOnBy) > 0 {
 		return nil, p.dependentViewRenameError(
-			tableDesc.TypeName(), oldTn.String(), tableDesc.ParentID, tableDesc.DependedOnBy[0].ID)
+			ctx, tableDesc.TypeName(), oldTn.String(), tableDesc.ParentID, tableDesc.DependedOnBy[0].ID)
 	}
 
 	// Check if target database exists.
-	targetDbDesc, err := p.mustGetDatabaseDesc(newTn.Database())
+	targetDbDesc, err := MustGetDatabaseDesc(ctx, p.txn, p.getVirtualTabler(), newTn.Database())
 	if err != nil {
 		return nil, err
 	}
 
-	if err := p.checkPrivilege(targetDbDesc, privilege.CREATE); err != nil {
+	if err := p.CheckPrivilege(targetDbDesc, privilege.CREATE); err != nil {
 		return nil, err
 	}
 
@@ -200,7 +200,7 @@ func (p *planner) RenameTable(n *parser.RenameTable) (planNode, error) {
 	descKey := sqlbase.MakeDescMetadataKey(tableDesc.GetID())
 	newTbKey := tableKey{targetDbDesc.ID, newTn.Table()}.Key()
 
-	if err := tableDesc.Validate(p.txn); err != nil {
+	if err := tableDesc.Validate(ctx, p.txn); err != nil {
 		return nil, err
 	}
 
@@ -214,7 +214,7 @@ func (p *planner) RenameTable(n *parser.RenameTable) (planNode, error) {
 		OldParentID: dbDesc.ID,
 		OldName:     oldTn.Table()}
 	tableDesc.Renames = append(tableDesc.Renames, renameDetails)
-	if err := p.writeTableDesc(tableDesc); err != nil {
+	if err := p.writeTableDesc(ctx, tableDesc); err != nil {
 		return nil, err
 	}
 
@@ -222,18 +222,22 @@ func (p *planner) RenameTable(n *parser.RenameTable) (planNode, error) {
 	// old name to the id, so that the name is not reused until the schema changer
 	// has made sure it's not in use any more.
 	b := &client.Batch{}
+	if p.session.Tracing.KVTracingEnabled() {
+		log.VEventf(ctx, 2, "Put %s -> %s", descKey, descDesc)
+		log.VEventf(ctx, 2, "CPut %s -> %d", newTbKey, descID)
+	}
 	b.Put(descKey, descDesc)
 	b.CPut(newTbKey, descID, nil)
 
-	if err := p.txn.Run(b); err != nil {
+	if err := p.txn.Run(ctx, b); err != nil {
 		if _, ok := err.(*roachpb.ConditionFailedError); ok {
 			return nil, sqlbase.NewRelationAlreadyExistsError(newTn.Table())
 		}
 		return nil, err
 	}
-	p.notifySchemaChange(tableDesc.ID, sqlbase.InvalidMutationID)
+	p.notifySchemaChange(tableDesc, sqlbase.InvalidMutationID)
 
-	p.setTestingVerifyMetadata(func(systemConfig config.SystemConfig) error {
+	p.session.setTestingVerifyMetadata(func(systemConfig config.SystemConfig) error {
 		if err := expectDescriptorID(systemConfig, newTbKey, descID); err != nil {
 			return err
 		}
@@ -250,19 +254,18 @@ func (p *planner) RenameTable(n *parser.RenameTable) (planNode, error) {
 // Privileges: CREATE on table.
 //   notes: postgres requires CREATE on the table.
 //          mysql requires ALTER, CREATE, INSERT on the table.
-func (p *planner) RenameIndex(n *parser.RenameIndex) (planNode, error) {
-	tn, err := p.expandIndexName(n.Index)
+func (p *planner) RenameIndex(ctx context.Context, n *parser.RenameIndex) (planNode, error) {
+	tn, err := p.expandIndexName(ctx, n.Index)
 	if err != nil {
 		return nil, err
 	}
 
-	tableDesc, err := p.mustGetTableDesc(tn)
+	tableDesc, err := MustGetTableDesc(ctx, p.txn, p.getVirtualTabler(), tn, true /*allowAdding*/)
 	if err != nil {
 		return nil, err
 	}
 
-	normIdxName := n.Index.Index.Normalize()
-	status, i, err := tableDesc.FindIndexByNormalizedName(normIdxName)
+	idx, _, err := tableDesc.FindIndexByName(string(n.Index.Index))
 	if err != nil {
 		if n.IfExists {
 			// Noop.
@@ -272,49 +275,44 @@ func (p *planner) RenameIndex(n *parser.RenameIndex) (planNode, error) {
 		return nil, err
 	}
 
-	if err := p.checkPrivilege(tableDesc, privilege.CREATE); err != nil {
+	if err := p.CheckPrivilege(tableDesc, privilege.CREATE); err != nil {
 		return nil, err
 	}
 
 	for _, tableRef := range tableDesc.DependedOnBy {
-		if tableRef.IndexID != tableDesc.Indexes[i].ID {
+		if tableRef.IndexID != idx.ID {
 			continue
 		}
 		return nil, p.dependentViewRenameError(
-			"index", n.Index.Index.String(), tableDesc.ParentID, tableRef.ID)
+			ctx, "index", n.Index.Index.String(), tableDesc.ParentID, tableRef.ID)
 	}
 
 	if n.NewName == "" {
 		return nil, errEmptyIndexName
 	}
-	normNewIdxName := n.NewName.Normalize()
 
-	if normIdxName == normNewIdxName {
+	if n.Index.Index == n.NewName {
 		// Noop.
 		return &emptyNode{}, nil
 	}
 
-	if _, _, err := tableDesc.FindIndexByNormalizedName(normNewIdxName); err == nil {
-		return nil, fmt.Errorf("index name %q already exists", n.NewName)
+	if _, _, err := tableDesc.FindIndexByName(string(n.NewName)); err == nil {
+		return nil, fmt.Errorf("index name %q already exists", string(n.NewName))
 	}
 
-	if status == sqlbase.DescriptorActive {
-		tableDesc.Indexes[i].Name = normNewIdxName
-	} else {
-		tableDesc.Mutations[i].GetIndex().Name = normNewIdxName
-	}
+	tableDesc.RenameIndexDescriptor(idx, string(n.NewName))
 
 	if err := tableDesc.SetUpVersion(); err != nil {
 		return nil, err
 	}
 	descKey := sqlbase.MakeDescMetadataKey(tableDesc.GetID())
-	if err := tableDesc.Validate(p.txn); err != nil {
+	if err := tableDesc.Validate(ctx, p.txn); err != nil {
 		return nil, err
 	}
-	if err := p.txn.Put(descKey, sqlbase.WrapDescriptor(tableDesc)); err != nil {
+	if err := p.txn.Put(ctx, descKey, sqlbase.WrapDescriptor(tableDesc)); err != nil {
 		return nil, err
 	}
-	p.notifySchemaChange(tableDesc.ID, sqlbase.InvalidMutationID)
+	p.notifySchemaChange(tableDesc, sqlbase.InvalidMutationID)
 	return &emptyNode{}, nil
 }
 
@@ -322,13 +320,13 @@ func (p *planner) RenameIndex(n *parser.RenameIndex) (planNode, error) {
 // Privileges: CREATE on table.
 //   notes: postgres requires CREATE on the table.
 //          mysql requires ALTER, CREATE, INSERT on the table.
-func (p *planner) RenameColumn(n *parser.RenameColumn) (planNode, error) {
+func (p *planner) RenameColumn(ctx context.Context, n *parser.RenameColumn) (planNode, error) {
 	// Check if table exists.
 	tn, err := n.Table.NormalizeWithDatabaseName(p.session.Database)
 	if err != nil {
 		return nil, err
 	}
-	tableDesc, err := p.getTableDesc(tn)
+	tableDesc, err := getTableDesc(ctx, p.txn, p.getVirtualTabler(), tn)
 	if err != nil {
 		return nil, err
 	}
@@ -341,48 +339,40 @@ func (p *planner) RenameColumn(n *parser.RenameColumn) (planNode, error) {
 		return nil, fmt.Errorf("table %q does not exist", tn.Table())
 	}
 
-	if err := p.checkPrivilege(tableDesc, privilege.CREATE); err != nil {
+	if err := p.CheckPrivilege(tableDesc, privilege.CREATE); err != nil {
 		return nil, err
 	}
 
 	if n.NewName == "" {
 		return nil, errEmptyColumnName
 	}
-	normNewColName := n.NewName.Normalize()
-	normColName := n.Name.Normalize()
 
-	status, i, err := tableDesc.FindColumnByNormalizedName(normColName)
+	col, _, err := tableDesc.FindColumnByName(n.Name)
 	// n.IfExists only applies to table, no need to check here.
 	if err != nil {
 		return nil, err
-	}
-	var column *sqlbase.ColumnDescriptor
-	if status == sqlbase.DescriptorActive {
-		column = &tableDesc.Columns[i]
-	} else {
-		column = tableDesc.Mutations[i].GetColumn()
 	}
 
 	for _, tableRef := range tableDesc.DependedOnBy {
 		found := false
 		for _, colID := range tableRef.ColumnIDs {
-			if colID == column.ID {
+			if colID == col.ID {
 				found = true
 			}
 		}
 		if found {
 			return nil, p.dependentViewRenameError(
-				"column", n.Name.String(), tableDesc.ParentID, tableRef.ID)
+				ctx, "column", n.Name.String(), tableDesc.ParentID, tableRef.ID)
 		}
 	}
 
-	if normColName == normNewColName {
+	if n.Name == n.NewName {
 		// Noop.
 		return &emptyNode{}, nil
 	}
 
-	if _, _, err := tableDesc.FindColumnByNormalizedName(normNewColName); err == nil {
-		return nil, fmt.Errorf("column name %q already exists", n.NewName)
+	if _, _, err := tableDesc.FindColumnByName(n.NewName); err == nil {
+		return nil, fmt.Errorf("column name %q already exists", string(n.NewName))
 	}
 
 	preFn := func(expr parser.Expr) (err error, recurse bool, newExpr parser.Expr) {
@@ -392,7 +382,7 @@ func (p *planner) RenameColumn(n *parser.RenameColumn) (planNode, error) {
 				return err, false, nil
 			}
 			if c, ok := v.(*parser.ColumnItem); ok {
-				if c.ColumnName.Normalize() == normColName {
+				if string(c.ColumnName) == string(n.Name) {
 					c.ColumnName = n.NewName
 				}
 			}
@@ -405,7 +395,7 @@ func (p *planner) RenameColumn(n *parser.RenameColumn) (planNode, error) {
 	for i, check := range tableDesc.Checks {
 		exprStrings[i] = check.Expr
 	}
-	exprs, err := parser.ParseExprsTraditional(exprStrings)
+	exprs, err := parser.ParseExprs(exprStrings)
 	if err != nil {
 		return nil, err
 	}
@@ -420,42 +410,45 @@ func (p *planner) RenameColumn(n *parser.RenameColumn) (planNode, error) {
 		}
 	}
 	// Rename the column in the indexes.
-	tableDesc.RenameColumnNormalized(column.ID, normNewColName)
-	column.Name = normNewColName
+	tableDesc.RenameColumnDescriptor(col, string(n.NewName))
+
 	if err := tableDesc.SetUpVersion(); err != nil {
 		return nil, err
 	}
 
 	descKey := sqlbase.MakeDescMetadataKey(tableDesc.GetID())
-	if err := tableDesc.Validate(p.txn); err != nil {
+	if err := tableDesc.Validate(ctx, p.txn); err != nil {
 		return nil, err
 	}
-	if err := p.txn.Put(descKey, sqlbase.WrapDescriptor(tableDesc)); err != nil {
+	if err := p.txn.Put(ctx, descKey, sqlbase.WrapDescriptor(tableDesc)); err != nil {
 		return nil, err
 	}
-	p.notifySchemaChange(tableDesc.ID, sqlbase.InvalidMutationID)
+	p.notifySchemaChange(tableDesc, sqlbase.InvalidMutationID)
 	return &emptyNode{}, nil
 }
 
 // TODO(a-robinson): Support renaming objects depended on by views once we have
 // a better encoding for view queries (#10083).
 func (p *planner) dependentViewRenameError(
-	typeName, objName string, parentID, viewID sqlbase.ID,
+	ctx context.Context, typeName, objName string, parentID, viewID sqlbase.ID,
 ) error {
-	viewDesc, err := sqlbase.GetTableDescFromID(p.txn, viewID)
+	viewDesc, err := sqlbase.GetTableDescFromID(ctx, p.txn, viewID)
 	if err != nil {
 		return err
 	}
 	viewName := viewDesc.Name
 	if viewDesc.ParentID != parentID {
 		var err error
-		viewName, err = p.getQualifiedTableName(viewDesc)
+		viewName, err = p.getQualifiedTableName(ctx, viewDesc)
 		if err != nil {
-			log.Warningf(p.ctx(), "unable to retrieve name of view %d: %v", viewID, err)
-			return sqlbase.NewDependentObjectError("cannot rename %s %q because a view depends on it",
+			log.Warningf(ctx, "unable to retrieve name of view %d: %v", viewID, err)
+			msg := fmt.Sprintf("cannot rename %s %q because a view depends on it",
 				typeName, objName)
+			return sqlbase.NewDependentObjectError(msg)
 		}
 	}
-	return sqlbase.NewDependentObjectError("cannot rename %s %q because view %q depends on it",
+	msg := fmt.Sprintf("cannot rename %s %q because view %q depends on it",
 		typeName, objName, viewName)
+	hint := fmt.Sprintf("you can drop %s instead.", viewName)
+	return sqlbase.NewDependentObjectErrorWithHint(msg, hint)
 }

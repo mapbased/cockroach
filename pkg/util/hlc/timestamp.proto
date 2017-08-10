@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Tobias Schottdorf (tobias.schottdorf@gmail.com)
 
 syntax = "proto2";
 package cockroach.util.hlc;
@@ -22,6 +20,8 @@ import "gogoproto/gogo.proto";
 
 // Timestamp represents a state of the hybrid logical clock.
 message Timestamp {
+  option (gogoproto.equal) = true;
+
   option (gogoproto.goproto_stringer) = false;
   option (gogoproto.populate) = true;
 

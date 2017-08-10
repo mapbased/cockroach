@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Marc Berhault (marc@cockroachlabs.com)
 
 package sql_test
 
@@ -27,6 +25,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/internal/client"
 	"github.com/cockroachdb/cockroach/pkg/keys"
+	"github.com/cockroachdb/cockroach/pkg/migration/sqlmigrations"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/server"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
@@ -40,7 +39,7 @@ func TestDatabaseDescriptor(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	params, _ := createTestServerParams()
 	s, sqlDB, kvDB := serverutils.StartServer(t, params)
-	defer s.Stopper().Stop()
+	defer s.Stopper().Stop(context.TODO())
 	ctx := context.TODO()
 
 	expectedCounter := int64(keys.MaxReservedDescID + 1)
@@ -81,6 +80,10 @@ func TestDatabaseDescriptor(t *testing.T) {
 		t.Fatalf("unexpected error %v", err)
 	}
 
+	// Even though the CREATE above failed, the counter is still incremented
+	// (that's performed non-transactionally).
+	expectedCounter++
+
 	if ir, err := kvDB.Get(ctx, keys.DescIDGenerator); err != nil {
 		t.Fatal(err)
 	} else if actual := ir.ValueInt(); actual != expectedCounter {
@@ -91,7 +94,12 @@ func TestDatabaseDescriptor(t *testing.T) {
 	if kvs, err := kvDB.Scan(ctx, start, start.PrefixEnd(), 0); err != nil {
 		t.Fatal(err)
 	} else {
-		if a, e := len(kvs), server.GetBootstrapSchema().SystemDescriptorCount(); a != e {
+		migrationDescriptors, _, err := sqlmigrations.AdditionalInitialDescriptors(ctx, kvDB)
+		if err != nil {
+			t.Fatal(err)
+		}
+		e := server.GetBootstrapSchema().SystemDescriptorCount() + migrationDescriptors
+		if a := len(kvs); a != e {
 			t.Fatalf("expected %d keys to have been written, found %d keys", e, a)
 		}
 	}
@@ -101,6 +109,7 @@ func TestDatabaseDescriptor(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	dbDescKey = sqlbase.MakeDescMetadataKey(sqlbase.ID(expectedCounter))
 	if _, err := sqlDB.Exec(`CREATE DATABASE test`); err != nil {
 		t.Fatal(err)
 	}
@@ -188,7 +197,7 @@ func createTestTable(
 			if testutils.IsSQLRetryableError(err) {
 				continue
 			}
-			t.Errorf("table %d: could not be created: %v", id, err)
+			t.Errorf("table %d: could not be created: %s", id, err)
 			return
 		}
 		completed <- id
@@ -204,24 +213,33 @@ func verifyTables(
 	tc *testcluster.TestCluster,
 	completed chan int,
 	expectedNumOfTables int,
-	descIDStart int64,
+	descIDStart sqlbase.ID,
 ) {
-	descIDEnd := descIDStart + int64(expectedNumOfTables)
 	usedTableIDs := make(map[sqlbase.ID]string)
 	var count int
+	tableIDs := make(map[sqlbase.ID]struct{})
+	maxID := descIDStart
 	for id := range completed {
 		count++
 		tableName := fmt.Sprintf("table_%d", id)
 		kvDB := tc.Servers[count%tc.NumServers()].KVClient().(*client.DB)
 		tableDesc := sqlbase.GetTableDescriptor(kvDB, "test", tableName)
-		if int64(tableDesc.ID) < descIDStart || int64(tableDesc.ID) >= descIDEnd {
+		if tableDesc.ID < descIDStart {
 			t.Fatalf(
-				"table %s's ID %d is not within the expected range of %d to %d",
+				"table %s's ID %d is too small. Expected >= %d",
 				tableName,
 				tableDesc.ID,
 				descIDStart,
-				descIDEnd,
 			)
+
+			if _, ok := tableIDs[tableDesc.ID]; ok {
+				t.Fatalf("duplicate ID: %d", id)
+			}
+			tableIDs[tableDesc.ID] = struct{}{}
+			if tableDesc.ID > maxID {
+				maxID = tableDesc.ID
+			}
+
 		}
 		usedTableIDs[tableDesc.ID] = tableName
 	}
@@ -230,12 +248,20 @@ func verifyTables(
 		t.Fatalf("expected %d tables created, only got %d", e, a)
 	}
 
-	kvDB := tc.Servers[count%tc.NumServers()].KVClient().(*client.DB)
-	if descID, err := kvDB.Get(context.Background(), keys.DescIDGenerator); err != nil {
-		t.Fatal(err)
-	} else {
-		if e, a := descIDEnd, descID.ValueInt(); e != a {
-			t.Fatalf("expected next descriptor ID to be %d, got %d", e, a)
+	// Check that no extra descriptors have been written in the range
+	// descIDStart..maxID.
+	kvDB := tc.Servers[0].KVClient().(*client.DB)
+	for id := descIDStart; id < maxID; id++ {
+		if _, ok := tableIDs[id]; ok {
+			continue
+		}
+		descKey := sqlbase.MakeDescMetadataKey(id)
+		desc := &sqlbase.Descriptor{}
+		if err := kvDB.GetProto(context.TODO(), descKey, desc); err != nil {
+			t.Fatal(err)
+		}
+		if (*desc != sqlbase.Descriptor{}) {
+			t.Fatalf("extra descriptor with id %d", id)
 		}
 	}
 }
@@ -251,18 +277,18 @@ func TestParallelCreateTables(t *testing.T) {
 	const numberOfNodes = 3
 
 	tc := testcluster.StartTestCluster(t, numberOfNodes, base.TestClusterArgs{})
-	defer tc.Stopper().Stop()
+	defer tc.Stopper().Stop(context.TODO())
 
 	if _, err := tc.ServerConn(0).Exec(`CREATE DATABASE "test"`); err != nil {
 		t.Fatal(err)
 	}
 	// Get the id descriptor generator count.
 	kvDB := tc.Servers[0].KVClient().(*client.DB)
-	var descIDStart int64
+	var descIDStart sqlbase.ID
 	if descID, err := kvDB.Get(context.Background(), keys.DescIDGenerator); err != nil {
 		t.Fatal(err)
 	} else {
-		descIDStart = descID.ValueInt()
+		descIDStart = sqlbase.ID(descID.ValueInt())
 	}
 
 	var wgStart sync.WaitGroup
@@ -304,7 +330,7 @@ func TestParallelCreateConflictingTables(t *testing.T) {
 	const numberOfNodes = 3
 
 	tc := testcluster.StartTestCluster(t, numberOfNodes, base.TestClusterArgs{})
-	defer tc.Stopper().Stop()
+	defer tc.Stopper().Stop(context.TODO())
 
 	if _, err := tc.ServerConn(0).Exec(`CREATE DATABASE "test"`); err != nil {
 		t.Fatal(err)
@@ -312,11 +338,11 @@ func TestParallelCreateConflictingTables(t *testing.T) {
 
 	// Get the id descriptor generator count.
 	kvDB := tc.Servers[0].KVClient().(*client.DB)
-	var descIDStart int64
+	var descIDStart sqlbase.ID
 	if descID, err := kvDB.Get(context.Background(), keys.DescIDGenerator); err != nil {
 		t.Fatal(err)
 	} else {
-		descIDStart = descID.ValueInt()
+		descIDStart = sqlbase.ID(descID.ValueInt())
 	}
 
 	var wgStart sync.WaitGroup
@@ -342,7 +368,67 @@ func TestParallelCreateConflictingTables(t *testing.T) {
 		t,
 		tc,
 		completed,
-		1,
+		1, /* expectedNumOfTables */
 		descIDStart,
 	)
+}
+
+// Test that the modification time on a table descriptor is initialized.
+func TestTableReadErrorsBeforeTableCreation(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	params, _ := createTestServerParams()
+	s, sqlDB, _ := serverutils.StartServer(t, params)
+	defer s.Stopper().Stop(context.TODO())
+
+	if _, err := sqlDB.Exec(`
+CREATE DATABASE t;
+CREATE TABLE t.timestamp (k CHAR PRIMARY KEY, v CHAR);
+`); err != nil {
+		t.Fatal(err)
+	}
+
+	testCases := []struct {
+		schema string
+	}{
+		{"CREATE TABLE t.kv0 (k CHAR PRIMARY KEY, v CHAR)"},
+		{"CREATE TABLE t.kv1 AS SELECT * FROM t.kv0"},
+		{"CREATE VIEW t.kv2 AS SELECT k, v FROM t.kv0"},
+	}
+
+	for i, testCase := range testCases {
+		tx, err := sqlDB.Begin()
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		// Insert an entry so that the transaction is guaranteed to be
+		// assigned a timestamp.
+		if _, err := tx.Exec(fmt.Sprintf(`
+INSERT INTO t.timestamp VALUES ('%d', 'b');
+`, i)); err != nil {
+			t.Fatal(err)
+		}
+
+		// Create schema and read data so that a table lease is acquired.
+		if _, err := sqlDB.Exec(testCase.schema); err != nil {
+			t.Fatal(err)
+		}
+
+		if _, err := sqlDB.Exec(fmt.Sprintf(`
+SELECT * FROM t.kv%d
+`, i)); err != nil {
+			t.Fatal(err)
+		}
+
+		// This select should not see any data.
+		if _, err := tx.Query(fmt.Sprintf(
+			`SELECT * FROM t.kv%d`, i,
+		)); !testutils.IsError(err, fmt.Sprintf("id %d is not a table", 52+i)) {
+			t.Fatalf("err = %v", err)
+		}
+
+		if err := tx.Rollback(); err != nil {
+			t.Fatal(err)
+		}
+	}
 }

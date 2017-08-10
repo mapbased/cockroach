@@ -18,41 +18,30 @@ package acceptance
 // and run tests against dedicated test clusters.
 //
 // Required setup:
-// 1. Have a GCE account.
-// 2. Have someone grant permissions (for new *and* existing objects) for the
-//    GCS bucket referenced in `archivedStoreURL`. You'll want permissions
-//    granted to the following email addresses:
-//      a. The email address you use to log into Google Cloud Console.
-//      b. Your default Google Compute Engine service account (it'll look like
-//         111111111111-compute@developer.gserviceaccount.com)
-// 3. Set the environment variable GOOGLE_PROJECT to the name of the Google
-//    Project you want Terraform to use.
+// 1. Have an Azure account.
+// 2. Passphrase-less SSH key in ~/.ssh/{azure,azure.pub}.
+// 3. Set the ARM_SUBSCRIPTION_ID, ARM_CLIENT_ID, ARM_CLIENT_SECRET, and
+//    ARM_TENANT_ID variables as documented here:
+//    https://www.terraform.io/docs/providers/azurerm/#argument-reference
 //
 // Example use:
 //
-// build/builder.sh make build && make test \
+// make test \
 //	 TESTTIMEOUT=48h \
 //	 PKG=./pkg/acceptance \
-//	 TESTS=Rebalance_3To5Small \
-//	 TESTFLAGS='-v -remote -key-name google_compute_engine -cwd terraform -tf.keep-cluster=failed -tf.cockroach-binary=../../cockroach'
+//	 TESTS='^TestRebalance_3To5Small$$' \
+//	 TESTFLAGS='-v -remote -key-name azure -cwd terraform/azure -tf.keep-cluster=failed'
 //
 // Things to note:
-// - You must use an SSH key without a passphrase. It is recommended that you
-//   create a new key for this purpose named google_compute_engine so that
-//   gcloud and related tools can use it too. Create the key with:
-//     ssh-keygen -f ~/.ssh/google_compute_engine
-// - Your SSH key (-key-name) for Google Cloud Platform must be in
-//   ~/.ssh/google_compute_engine
+// - You must use an SSH key without a passphrase. This is a Terraform
+//   requirement.
 // - If you want to manually fiddle with a test cluster, start the test with
 //   `-tf.keep-cluster=failed". After the cluster has been created, press
 //   Control-C and the cluster will remain up.
 // - These tests rely on a specific Terraform config that's specified using the
 //   -cwd test flag.
 // - You *must* set the TESTTIMEOUT high enough for any of these tests to
-//   finish. To be safe, specify a timeout of at least 24 hours.
-// - Your Google Cloud credentials must be accessible by Terraform, as described
-//   here:
-//   https://www.terraform.io/docs/providers/google/
+//   finish. To be really safe, specify a timeout of at least 24 hours.
 // - There are various flags that start with `tf.` that control the
 //   of Terrafarm and allocator tests, respectively. For example, you can add
 //   "-tf.cockroach-binary" to TESTFLAGS to specify a custom Linux CockroachDB
@@ -64,7 +53,8 @@ package acceptance
 //
 // Troubleshooting:
 // - The minimum recommended version of Terraform is 0.7.2. If you see strange
-//   Terraform errors, upgrade your install of Terraform.
+//   Terraform errors, upgrade your install of Terraform. Terraform 0.8.x or
+//   later might not work because of breaking changes to Terraform.
 // - Adding `-tf.keep-cluster=always` to your TESTFLAGS allows the cluster to
 //   stay around after the test completes.
 
@@ -73,7 +63,6 @@ import (
 	"fmt"
 	"math"
 	"net/http"
-	"strconv"
 	"testing"
 	"time"
 
@@ -86,7 +75,9 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
 	"github.com/cockroachdb/cockroach/pkg/sql"
+	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/storage"
+	"github.com/cockroachdb/cockroach/pkg/util/duration"
 	"github.com/cockroachdb/cockroach/pkg/util/httputil"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
@@ -116,11 +107,8 @@ type allocatorTest struct {
 	// Prefix is the prefix that will be prepended to all resources created by
 	// Terraform.
 	Prefix string
-	// CockroachDiskSizeGB is the size, in gigabytes, of the disks allocated
-	// for CockroachDB nodes. Leaving this as 0 accepts the default in the
-	// Terraform configs. This must be in GB, because Terraform only accepts
-	// disk size for GCE in GB.
-	CockroachDiskSizeGB int
+	// Run some schema changes during the rebalancing.
+	RunSchemaChanges bool
 
 	f *terrafarm.Farmer
 }
@@ -137,15 +125,13 @@ func (at *allocatorTest) Cleanup(t *testing.T) {
 func (at *allocatorTest) Run(ctx context.Context, t *testing.T) {
 	at.f = MakeFarmer(t, at.Prefix, stopper)
 
-	if at.CockroachDiskSizeGB != 0 {
-		at.f.AddVars["cockroach_disk_size"] = strconv.Itoa(at.CockroachDiskSizeGB)
-	}
-
 	log.Infof(ctx, "creating cluster with %d node(s)", at.StartNodes)
 	if err := at.f.Resize(at.StartNodes); err != nil {
 		t.Fatal(err)
 	}
-	CheckGossip(ctx, t, at.f, longWaitTime, HasPeers(at.StartNodes))
+	if err := CheckGossip(ctx, at.f, longWaitTime, HasPeers(at.StartNodes)); err != nil {
+		t.Fatal(err)
+	}
 	at.f.Assert(ctx, t)
 	log.Info(ctx, "initial cluster is up")
 
@@ -173,10 +159,17 @@ func (at *allocatorTest) Run(ctx context.Context, t *testing.T) {
 	}
 
 	log.Info(ctx, "restarting cluster with archived store(s)")
+	ch := make(chan error)
 	for i := 0; i < at.f.NumNodes(); i++ {
-		if err := at.f.Restart(ctx, i); err != nil {
-			t.Fatalf("error restarting node %d: %s", i, err)
+		go func(i int) { ch <- at.f.Restart(ctx, i) }(i)
+	}
+	for i := 0; i < at.f.NumNodes(); i++ {
+		if err := <-ch; err != nil {
+			t.Errorf("error restarting node %d: %s", i, err)
 		}
+	}
+	if t.Failed() {
+		t.FailNow()
 	}
 	at.f.Assert(ctx, t)
 
@@ -184,7 +177,10 @@ func (at *allocatorTest) Run(ctx context.Context, t *testing.T) {
 	if err := at.f.Resize(at.EndNodes); err != nil {
 		t.Fatal(err)
 	}
-	CheckGossip(ctx, t, at.f, longWaitTime, HasPeers(at.EndNodes))
+
+	if err := CheckGossip(ctx, at.f, longWaitTime, HasPeers(at.EndNodes)); err != nil {
+		t.Fatal(err)
+	}
 	at.f.Assert(ctx, t)
 
 	log.Infof(ctx, "starting load on cluster")
@@ -195,20 +191,115 @@ func (at *allocatorTest) Run(ctx context.Context, t *testing.T) {
 		t.Fatal(err)
 	}
 
+	if at.RunSchemaChanges {
+		log.Info(ctx, "running schema changes while cluster is rebalancing")
+		if err := at.runSchemaChanges(ctx, t); err != nil {
+			t.Fatal(err)
+		}
+	}
+
 	log.Info(ctx, "waiting for rebalance to finish")
 	if err := at.WaitForRebalance(ctx, t); err != nil {
 		t.Fatal(err)
 	}
+
 	at.f.Assert(ctx, t)
 }
 
 func (at *allocatorTest) RunAndCleanup(ctx context.Context, t *testing.T) {
+	s := log.Scope(t)
+	defer s.Close(t)
+
 	defer at.Cleanup(t)
 	at.Run(ctx, t)
 }
 
+func (at *allocatorTest) runSchemaChanges(ctx context.Context, t *testing.T) error {
+	db, err := gosql.Open("postgres", at.f.PGUrl(ctx, 0))
+	if err != nil {
+		return err
+	}
+	defer func() {
+		_ = db.Close()
+	}()
+
+	const tableName = "datablocks.blocks"
+	schemaChanges := []string{
+		"ALTER TABLE %s ADD COLUMN newcol DECIMAL DEFAULT (DECIMAL '1.4')",
+		"CREATE INDEX foo ON %s (block_id)",
+	}
+
+	errChan := make(chan error)
+	for i := range schemaChanges {
+		go func(i int) {
+			start := timeutil.Now()
+			cmd := fmt.Sprintf(schemaChanges[i], tableName)
+			log.Infof(ctx, "starting schema change: %s", cmd)
+			if _, err := db.Exec(cmd); err != nil {
+				errChan <- errors.Errorf("hit schema change error: %s, for %s, in %s", err, cmd, timeutil.Since(start))
+				return
+			}
+			log.Infof(ctx, "completed schema change: %s, in %s", cmd, timeutil.Since(start))
+			errChan <- nil
+			// TODO(vivek): Monitor progress of schema changes and log progress.
+		}(i)
+	}
+
+	for range schemaChanges {
+		if err := <-errChan; err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	log.Info(ctx, "validate applied schema changes")
+	if err := at.ValidateSchemaChanges(ctx, t); err != nil {
+		t.Fatal(err)
+	}
+	return nil
+}
+
+func (at *allocatorTest) ValidateSchemaChanges(ctx context.Context, t *testing.T) error {
+	db, err := gosql.Open("postgres", at.f.PGUrl(ctx, 0))
+	if err != nil {
+		return err
+	}
+	defer func() {
+		_ = db.Close()
+	}()
+
+	const tableName = "datablocks.blocks"
+	var now string
+	if err := db.QueryRow("SELECT cluster_logical_timestamp()").Scan(&now); err != nil {
+		t.Fatal(err)
+	}
+	var eCount int64
+	q := fmt.Sprintf(`SELECT COUNT(*) FROM %s AS OF SYSTEM TIME %s`, tableName, now)
+	if err := db.QueryRow(q).Scan(&eCount); err != nil {
+		return err
+	}
+	log.Infof(ctx, "%s: %d rows", q, eCount)
+
+	// Validate the different schema changes
+	validationQueries := []string{
+		"SELECT COUNT(newcol) FROM %s AS OF SYSTEM TIME %s",
+		"SELECT COUNT(block_id) FROM %s@foo AS OF SYSTEM TIME %s",
+	}
+	for i := range validationQueries {
+		var count int64
+		q := fmt.Sprintf(validationQueries[i], tableName, now)
+		if err := db.QueryRow(q).Scan(&count); err != nil {
+			return err
+		}
+		log.Infof(ctx, "query: %s, found %d rows", q, count)
+		if count != eCount {
+			t.Fatalf("%s: %d rows found, expected %d rows", q, count, eCount)
+		}
+	}
+	return nil
+}
+
 func (at *allocatorTest) stdDev() (float64, error) {
-	host := at.f.Nodes()[0]
+	host := at.f.Hostname(0)
 	var client http.Client
 	var nodesResp serverpb.NodesResponse
 	url := fmt.Sprintf("http://%s:%s/_status/nodes", host, adminPort)
@@ -236,21 +327,21 @@ func (at *allocatorTest) printRebalanceStats(db *gosql.DB, host string) error {
 	// Output time it took to rebalance.
 	{
 		var rebalanceIntervalStr string
-		var rebalanceInterval time.Duration
-		q := `SELECT (SELECT MAX(timestamp) FROM rangelog) - ` +
-			`(select MAX(timestamp) FROM eventlog WHERE eventType='` + string(sql.EventLogNodeJoin) + `')`
-		if err := db.QueryRow(q).Scan(&rebalanceIntervalStr); err != nil {
+		if err := db.QueryRow(
+			`SELECT (SELECT MAX(timestamp) FROM rangelog) - (SELECT MAX(timestamp) FROM eventlog WHERE "eventType"=$1)`,
+			sql.EventLogNodeJoin,
+		).Scan(&rebalanceIntervalStr); err != nil {
 			return err
 		}
-		rebalanceInterval, err := time.ParseDuration(rebalanceIntervalStr)
+		rebalanceInterval, err := parser.ParseDInterval(rebalanceIntervalStr)
 		if err != nil {
 			return err
 		}
-		if rebalanceInterval < 0 {
-			// This can happen with single-node clusters.
-			rebalanceInterval = time.Duration(0)
+		if rebalanceInterval.Duration.Compare(duration.Duration{}) < 0 {
+			log.Warningf(context.Background(), "test finished, but clock moved backward")
+		} else {
+			log.Infof(context.Background(), "cluster took %s to rebalance", rebalanceInterval)
 		}
-		log.Infof(context.Background(), "cluster took %s to rebalance", rebalanceInterval)
 	}
 
 	// Output # of range events that occurred. All other things being equal,
@@ -275,7 +366,7 @@ func (at *allocatorTest) printRebalanceStats(db *gosql.DB, host string) error {
 }
 
 type replicationStats struct {
-	ElapsedSinceLastEvent time.Duration
+	ElapsedSinceLastEvent duration.Duration
 	EventType             string
 	RangeID               int64
 	StoreID               int64
@@ -297,13 +388,14 @@ func (at *allocatorTest) allocatorStats(db *gosql.DB) (s replicationStats, err e
 		}
 	}()
 
-	q := `SELECT NOW()-timestamp, rangeID, storeID, eventType FROM rangelog WHERE ` +
-		`timestamp=(SELECT MAX(timestamp) FROM rangelog WHERE eventType IN ($1, $2, $3))`
 	eventTypes := []interface{}{
-		string(storage.RangeEventLogSplit),
-		string(storage.RangeEventLogAdd),
-		string(storage.RangeEventLogRemove),
+		storage.RangeLogEventType_split.String(),
+		storage.RangeLogEventType_add.String(),
+		storage.RangeLogEventType_remove.String(),
 	}
+
+	q := `SELECT NOW()-timestamp, "rangeID", "storeID", "eventType" FROM rangelog WHERE ` +
+		`timestamp=(SELECT MAX(timestamp) FROM rangelog WHERE "eventType" IN ($1, $2, $3))`
 
 	var elapsedStr string
 
@@ -316,11 +408,11 @@ func (at *allocatorTest) allocatorStats(db *gosql.DB) (s replicationStats, err e
 	if err := row.Scan(&elapsedStr, &s.RangeID, &s.StoreID, &s.EventType); err != nil {
 		return replicationStats{}, err
 	}
-
-	s.ElapsedSinceLastEvent, err = time.ParseDuration(elapsedStr)
+	elapsedSinceLastEvent, err := parser.ParseDInterval(elapsedStr)
 	if err != nil {
 		return replicationStats{}, err
 	}
+	s.ElapsedSinceLastEvent = elapsedSinceLastEvent.Duration
 
 	s.ReplicaCountStdDev, err = at.stdDev()
 	if err != nil {
@@ -364,8 +456,9 @@ func (at *allocatorTest) WaitForRebalance(ctx context.Context, t *testing.T) err
 			}
 
 			log.Info(ctx, stats)
-			if StableInterval <= stats.ElapsedSinceLastEvent {
-				host := at.f.Nodes()[0]
+			stableDuration := duration.Duration{Nanos: StableInterval.Nanoseconds()}
+			if stableDuration.Compare(stats.ElapsedSinceLastEvent) <= 0 {
+				host := at.f.Hostname(0)
 				log.Infof(context.Background(), "replica count = %f, max = %f", stats.ReplicaCountStdDev, *flagATMaxStdDev)
 				if stats.ReplicaCountStdDev > *flagATMaxStdDev {
 					_ = at.printRebalanceStats(db, host)
@@ -400,6 +493,21 @@ func TestUpreplicate_1To3Small(t *testing.T) {
 	at.RunAndCleanup(ctx, t)
 }
 
+// TestRebalance3to5Small_WithSchemaChanges tests rebalancing in
+// the midst of schema changes, starting with 3 nodes (each
+// containing 10 GiB of data) and growing to 5 nodes.
+func TestRebalance_3To5Small_WithSchemaChanges(t *testing.T) {
+	ctx := context.Background()
+	at := allocatorTest{
+		StartNodes:       3,
+		EndNodes:         5,
+		StoreURL:         urlStore3s,
+		Prefix:           "rebal-3to5s",
+		RunSchemaChanges: true,
+	}
+	at.RunAndCleanup(ctx, t)
+}
+
 // TestRebalance3to5Small tests rebalancing, starting with 3 nodes (each
 // containing 10 GiB of data) and growing to 5 nodes.
 func TestRebalance_3To5Small(t *testing.T) {
@@ -418,11 +526,10 @@ func TestRebalance_3To5Small(t *testing.T) {
 func TestUpreplicate_1To3Medium(t *testing.T) {
 	ctx := context.Background()
 	at := allocatorTest{
-		StartNodes:          1,
-		EndNodes:            3,
-		StoreURL:            urlStore1m,
-		Prefix:              "uprep-1to3m",
-		CockroachDiskSizeGB: 250, // GB
+		StartNodes: 1,
+		EndNodes:   3,
+		StoreURL:   urlStore1m,
+		Prefix:     "uprep-1to3m",
 	}
 	at.RunAndCleanup(ctx, t)
 }
@@ -433,27 +540,38 @@ func TestUpreplicate_1To3Medium(t *testing.T) {
 func TestUpreplicate_1To6Medium(t *testing.T) {
 	ctx := context.Background()
 	at := allocatorTest{
-		StartNodes:          1,
-		EndNodes:            6,
-		StoreURL:            urlStore1m,
-		Prefix:              "uprep-1to6m",
-		CockroachDiskSizeGB: 250, // GB
+		StartNodes: 1,
+		EndNodes:   6,
+		StoreURL:   urlStore1m,
+		Prefix:     "uprep-1to6m",
 	}
 	at.RunAndCleanup(ctx, t)
 }
 
 // TestSteady_6Medium is useful for creating a medium-size balanced cluster
 // (when used with the -tf.keep-cluster flag).
-// TODO(tschottdorf): use for tests which run schema changes or drop large
-// amounts of data.
+// TODO(vivek): use for tests which drop large amounts of data.
 func TestSteady_6Medium(t *testing.T) {
 	ctx := context.Background()
 	at := allocatorTest{
-		StartNodes:          6,
-		EndNodes:            6,
-		StoreURL:            urlStore6m,
-		Prefix:              "steady-6m",
-		CockroachDiskSizeGB: 250, // GB
+		StartNodes:       6,
+		EndNodes:         6,
+		StoreURL:         urlStore6m,
+		Prefix:           "steady-6m",
+		RunSchemaChanges: true,
+	}
+	at.RunAndCleanup(ctx, t)
+}
+
+// TestSteady_3Small tests schema changes against a 3-node cluster.
+func TestSteady_3Small(t *testing.T) {
+	ctx := context.Background()
+	at := allocatorTest{
+		StartNodes:       3,
+		EndNodes:         3,
+		StoreURL:         urlStore3s,
+		Prefix:           "steady-3s",
+		RunSchemaChanges: true,
 	}
 	at.RunAndCleanup(ctx, t)
 }

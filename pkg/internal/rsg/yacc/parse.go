@@ -87,8 +87,7 @@ func (t *Tree) unexpected(token item, context string) {
 
 // recover is the handler that turns panics into returns from the top level of Parse.
 func (t *Tree) recover(errp *error) {
-	e := recover()
-	if e != nil {
+	if e := recover(); e != nil {
 		if _, ok := e.(runtime.Error); ok {
 			panic(e)
 		}
@@ -97,7 +96,6 @@ func (t *Tree) recover(errp *error) {
 		}
 		*errp = e.(error)
 	}
-	return
 }
 
 // startParse initializes the parser, using the lexer.
@@ -139,28 +137,25 @@ func (t *Tree) parse() {
 func (t *Tree) parseProduction(p *ProductionNode) {
 	const context = "production"
 	t.expect(itemColon, context)
-	t.expect(itemNL, context)
+	if t.peek().typ == itemNL {
+		t.next()
+	}
 	expectExpr := true
 	for {
-		switch token := t.next(); token.typ {
-		case itemComment:
-			if t.peek().typ == itemNL {
-				t.next()
-			}
-		case itemNL:
-			if !expectExpr {
-				return
-			}
+		token := t.next()
+		switch token.typ {
+		case itemComment, itemNL:
+			// ignore
 		case itemPipe:
 			if expectExpr {
 				t.unexpected(token, context)
 			}
 			expectExpr = true
 		default:
-			if !expectExpr {
-				t.unexpected(token, context)
-			}
 			t.backup()
+			if !expectExpr {
+				return
+			}
 			e := newExpression(token.pos)
 			t.parseExpression(e)
 			p.Expressions = append(p.Expressions, e)
@@ -184,7 +179,9 @@ func (t *Tree) parseExpression(e *ExpressionNode) {
 			e.Items = append(e.Items, Item{token.val, TypLiteral})
 		case itemExpr:
 			e.Command = token.val
-			t.expect(itemNL, context)
+			if t.peek().typ == itemNL {
+				t.next()
+			}
 			return
 		case itemPct, itemComment:
 			// ignore

@@ -11,9 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Kathy Spradlin (kathyspradlin@gmail.com)
-// Author: Spencer Kimball (spencer.kimball@gmail.com)
 
 package rpc
 
@@ -25,7 +22,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
-	"github.com/cockroachdb/cockroach/pkg/util/stop"
+	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 )
 
 var _ security.RequestWithUser = &PingRequest{}
@@ -66,41 +63,19 @@ func (hs *HeartbeatService) Ping(ctx context.Context, args *PingRequest) (*PingR
 	// Commit suicide in the event that this is ever untrue.
 	// This check is ignored if either offset is set to 0 (for unittests).
 	mo, amo := hs.clock.MaxOffset(), time.Duration(args.MaxOffsetNanos)
-	if mo != 0 && amo != 0 && mo != amo {
+	if mo != 0 && amo != 0 &&
+		mo != timeutil.ClocklessMaxOffset && amo != timeutil.ClocklessMaxOffset &&
+		mo != amo {
+
 		panic(fmt.Sprintf("locally configured maximum clock offset (%s) "+
 			"does not match that of node %s (%s)", mo, args.Addr, amo))
 	}
 	serverOffset := args.Offset
 	// The server offset should be the opposite of the client offset.
 	serverOffset.Offset = -serverOffset.Offset
-	hs.remoteClockMonitor.UpdateOffset(args.Addr, serverOffset)
+	hs.remoteClockMonitor.UpdateOffset(ctx, args.Addr, serverOffset, 0 /* roundTripLatency */)
 	return &PingResponse{
 		Pong:       args.Ping,
 		ServerTime: hs.clock.PhysicalNow(),
 	}, nil
-}
-
-// A ManualHeartbeatService allows manual control of when heartbeats occur, to
-// facilitate testing.
-type ManualHeartbeatService struct {
-	clock              *hlc.Clock
-	remoteClockMonitor *RemoteClockMonitor
-	// Heartbeats are processed when a value is sent here.
-	ready   chan struct{}
-	stopper *stop.Stopper
-}
-
-// Ping waits until the heartbeat service is ready to respond to a Heartbeat.
-func (mhs *ManualHeartbeatService) Ping(
-	ctx context.Context, args *PingRequest,
-) (*PingResponse, error) {
-	select {
-	case <-mhs.ready:
-	case <-mhs.stopper.ShouldStop():
-	}
-	hs := HeartbeatService{
-		clock:              mhs.clock,
-		remoteClockMonitor: mhs.remoteClockMonitor,
-	}
-	return hs.Ping(ctx, args)
 }

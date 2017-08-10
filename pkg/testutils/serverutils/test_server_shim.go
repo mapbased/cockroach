@@ -12,9 +12,6 @@
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
 //
-// Author: Radu Berinde (radu@cockroachlabs.com)
-// Author: Andrei Matei (andreimatei1@gmail.com)
-//
 // This file provides generic interfaces that allow tests to set up test servers
 // without importing the server package (avoiding circular dependencies).
 // To be used, the binary needs to call
@@ -39,6 +36,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/rpc"
 	"github.com/cockroachdb/cockroach/pkg/security"
+	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/httputil"
@@ -51,6 +49,9 @@ type TestServerInterface interface {
 	Stopper() *stop.Stopper
 
 	Start(params base.TestServerArgs) error
+
+	// NodeID returns the ID of this node within its cluster.
+	NodeID() roachpb.NodeID
 
 	// ServingAddr returns the server's address.
 	ServingAddr() string
@@ -68,6 +69,9 @@ type TestServerInterface interface {
 	// LeaseManager() returns the *sql.LeaseManager as an interface{}.
 	LeaseManager() interface{}
 
+	// Executor() returns the *sql.Executor as an interface{}.
+	Executor() interface{}
+
 	// Gossip returns the gossip used by the TestServer.
 	Gossip() *gossip.Gossip
 
@@ -76,6 +80,25 @@ type TestServerInterface interface {
 
 	// DistSender returns the DistSender used by the TestServer.
 	DistSender() *kv.DistSender
+
+	// DistSQLServer returns the *distsqlrun.ServerImpl as an interface{}.
+	DistSQLServer() interface{}
+
+	// JobRegistry returns the *jobs.Registry as an interface{}.
+	JobRegistry() interface{}
+
+	// SetDistSQLSpanResolver changes the SpanResolver used for DistSQL inside the
+	// server's executor. The argument must be a distsqlplan.SpanResolver
+	// instance.
+	//
+	// This method exists because we cannot pass the fake span resolver with the
+	// server or cluster params: the fake span resolver needs the node IDs and
+	// addresses of the servers in a cluster, which are not available before we
+	// start the servers.
+	//
+	// It is the caller's responsibility to make sure no queries are being run
+	// with DistSQL at the same time.
+	SetDistSQLSpanResolver(spanResolver interface{})
 
 	// AdminURL returns the URL for the admin UI.
 	AdminURL() string
@@ -97,6 +120,19 @@ type TestServerInterface interface {
 	// GetFirstStoreID is a utility function returning the StoreID of the first
 	// store on this node.
 	GetFirstStoreID() roachpb.StoreID
+
+	// GetStores returns the collection of stores from this TestServer's node.
+	// The return value is of type *storage.Stores.
+	GetStores() interface{}
+
+	// ClusterSettings returns the ClusterSettings shared by all components of
+	// this server.
+	ClusterSettings() *cluster.Settings
+
+	// SplitRange splits the range containing splitKey.
+	SplitRange(
+		splitKey roachpb.Key,
+	) (left roachpb.RangeDescriptor, right roachpb.RangeDescriptor, err error)
 }
 
 // TestServerFactory encompasses the actual implementation of the shim

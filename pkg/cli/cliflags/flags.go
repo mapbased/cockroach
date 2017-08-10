@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Nathan VanBenschoten (nvanbenschoten@gmail.com)
 
 package cliflags
 
@@ -53,12 +51,13 @@ specialized hardware or number of cores (e.g. "gpu", "x16c"). For example:
 	Locality = FlagInfo{
 		Name: "locality",
 		Description: `
-Not fully implemented. https://github.com/cockroachdb/cockroach/issues/4868
 An ordered, comma-separated list of key-value pairs that describe the topography
 of the machine. Topography might include country, datacenter or rack
 designations. Data is automatically replicated to maximize diversities of each
-tier. The order of tiers is used to determine the priority of the diversity. The
-tiers and order must be the same on all nodes.  For example:
+tier. The order of tiers is used to determine the priority of the diversity, so
+the more inclusive localities like country should come before less inclusive
+localities like datacenter. The tiers and order must be the same on all nodes.
+Including more tiers is better than including fewer. For example:
 <PRE>
 
   --locality=country=us,region=us-west,datacenter=us-west-1b,rack=12
@@ -129,9 +128,18 @@ If left unspecified, defaults to 25% of the physical memory, or
 		Description: `The name of the database to connect to.`,
 	}
 
-	Deps = FlagInfo{
-		Name:        "deps",
-		Description: `Include dependency versions`,
+	DumpMode = FlagInfo{
+		Name: "dump-mode",
+		Description: `
+What to dump. "schema" dumps the schema only. "data" dumps the data only.
+"both" (default) dumps the schema then the data.`,
+	}
+
+	DumpTime = FlagInfo{
+		Name: "as-of",
+		Description: `
+Dumps the data as of the specified timestamp. Formats supported are the same
+as the timestamp type.`,
 	}
 
 	Execute = FlagInfo{
@@ -145,11 +153,12 @@ with a non-zero status code and further statements are not executed. The
 results of each SQL statement are printed on the standard output.`,
 	}
 
-	Pretty = FlagInfo{
-		Name: "pretty",
+	TableDisplayFormat = FlagInfo{
+		Name: "format",
 		Description: `
-Causes table rows to be formatted as tables using ASCII art.
-When not specified, table rows are printed as tab-separated values (TSV).`,
+Selects how to display table rows in results. Possible values: tsv,
+csv, pretty, records, sql, html. If left unspecified, defaults to tsv
+for non-interactive sessions and pretty for interactive sessions.`,
 	}
 
 	Join = FlagInfo{
@@ -188,9 +197,10 @@ hostname if advertise-host is not specified.`,
 	}
 
 	ServerPort = FlagInfo{
-		Name:        "port",
-		Shorthand:   "p",
-		Description: `The port to bind to.`,
+		Name:      "port",
+		Shorthand: "p",
+		Description: `
+The port to bind to.`,
 	}
 
 	AdvertiseHost = FlagInfo{
@@ -198,6 +208,13 @@ hostname if advertise-host is not specified.`,
 		Description: `
 The hostname to advertise to other CockroachDB nodes for intra-cluster
 communication; it must resolve from other nodes in the cluster.`,
+	}
+
+	AdvertisePort = FlagInfo{
+		Name: "advertise-port",
+		Description: `
+The port to advertise to other CockroachDB nodes for intra-cluster
+communication.`,
 	}
 
 	ServerHTTPHost = FlagInfo{
@@ -210,6 +227,20 @@ communication; it must resolve from other nodes in the cluster.`,
 		Description: `The port to bind to for HTTP requests.`,
 	}
 
+	ListeningURLFile = FlagInfo{
+		Name: "listening-url-file",
+		Description: `
+After the CockroachDB node has started up successfully, it will
+write its connection URL to the specified file.`,
+	}
+
+	PIDFile = FlagInfo{
+		Name: "pid-file",
+		Description: `
+After the CockroachDB node has started up successfully, it will
+write its process ID to the specified file.`,
+	}
+
 	Socket = FlagInfo{
 		Name:   "socket",
 		EnvVar: "COCKROACH_SOCKET",
@@ -219,18 +250,44 @@ Note: when given a path to a unix socket, most postgres clients will
 open "<given path>/.s.PGSQL.<server port>"`,
 	}
 
-	Insecure = FlagInfo{
+	ClientInsecure = FlagInfo{
 		Name:   "insecure",
 		EnvVar: "COCKROACH_INSECURE",
 		Description: `
-Run over non-encrypted (non-TLS) connections. This is strongly discouraged for
-production usage and this flag must be explicitly specified in order for the
-server to listen on an external address in insecure mode.`,
+Connect to an insecure cluster. This is strongly discouraged for
+production usage.`,
 	}
 
+	ServerInsecure = FlagInfo{
+		Name: "insecure",
+		Description: `
+Start an insecure node, using unencrypted (non-TLS) connections,
+listening on all IP addresses (unless --host is provided) and
+disabling password authentication for all database users. This is
+strongly discouraged for production usage and should never be used on
+a public network without combining it with --host.`,
+	}
+
+	// KeySize, CertificateLifetime, AllowKeyReuse, and OverwriteFiles are used for
+	// certificate generation functions.
 	KeySize = FlagInfo{
 		Name:        "key-size",
 		Description: `Key size in bits for CA/Node/Client certificates.`,
+	}
+
+	CertificateLifetime = FlagInfo{
+		Name:        "lifetime",
+		Description: `Certificate lifetime.`,
+	}
+
+	AllowCAKeyReuse = FlagInfo{
+		Name:        "allow-ca-key-reuse",
+		Description: `Use the CA key if it exists.`,
+	}
+
+	OverwriteFiles = FlagInfo{
+		Name:        "overwrite",
+		Description: `Certificate and key files are overwritten if they exist.`,
 	}
 
 	MaxResults = FlagInfo{
@@ -243,28 +300,59 @@ server to listen on an external address in insecure mode.`,
 		Description: `Prompt for the new user's password.`,
 	}
 
-	CACert = FlagInfo{
-		Name:        "ca-cert",
-		EnvVar:      "COCKROACH_CA_CERT",
-		Description: `Path to the CA certificate. Needed by clients and servers in secure mode.`,
+	CertsDir = FlagInfo{
+		Name:   "certs-dir",
+		EnvVar: "COCKROACH_CERTS_DIR",
+		Description: `
+The path to the directory containing SSL certificates and keys.
+<PRE>
+
+Cockroach looks for certificates and keys inside the directory using the
+following naming scheme:
+
+  - CA certificate and key: ca.crt, ca.key
+  - Server certificate and key: node.crt, node.key
+  - Client certificate and key: client.<user>.crt, client.<user>.key
+
+When running client commands, the user can be specified with the --user flag.
+</PRE>
+
+Keys have a minimum permission requirement of 0700 (rwx------). This restriction can be
+disabled by setting the environment variable COCKROACH_SKIP_KEY_PERMISSION_CHECK to true.`,
+	}
+
+	// Server version of the certs directory flag, cannot be set through environment.
+	ServerCertsDir = FlagInfo{
+		Name:        "certs-dir",
+		Description: CertsDir.Description,
 	}
 
 	CAKey = FlagInfo{
 		Name:        "ca-key",
 		EnvVar:      "COCKROACH_CA_KEY",
-		Description: `Path to the key protecting --ca-cert. Only needed when signing new certificates.`,
+		Description: `Path to the CA key.`,
 	}
 
-	Cert = FlagInfo{
-		Name:        "cert",
-		EnvVar:      "COCKROACH_CERT",
-		Description: `Path to the client or server certificate. Needed in secure mode.`,
-	}
+	// TODO(tschottdorf): once clockless mode becomes non-experimental, explain it here:
+	// <PRE>
+	//
+	// </PRE>
+	// Specifying the string value 'experimental-clockless' instead of a duration runs the cluster
+	// in clockless reads mode. In that mode, reads are routed through Raft and subsequently
+	// performance is reduced, but clock synchronization is not relied upon for correctness.
+	MaxOffset = FlagInfo{
+		Name: "max-offset",
+		Description: `
+Maximum allowed clock offset for the cluster. If observed clock offsets exceed
+this limit, servers will crash to minimize the likelihood of reading
+inconsistent data. Increasing this value will increase the time to recovery of
+failures as well as the frequency of uncertainty-based read restarts.
+<PRE>
 
-	Key = FlagInfo{
-		Name:        "key",
-		EnvVar:      "COCKROACH_KEY",
-		Description: `Path to the key protecting --cert. Needed in secure mode.`,
+</PRE>
+Note that this value must be the same on all nodes in the cluster. In order to
+change it, all nodes in the cluster must be stopped simultaneously and restarted
+with the new value.`,
 	}
 
 	Store = FlagInfo{
@@ -371,20 +459,49 @@ is the prefix for range local keys.`}
 		Description: `Print key and value sizes along with their associated key.`,
 	}
 
-	RaftTickInterval = FlagInfo{
-		Name: "raft-tick-interval",
-		Description: `
-The resolution of the Raft timer; other raft timeouts are
-defined in terms of multiples of this value.`,
-	}
-
-	UndoFreezeCluster = FlagInfo{
-		Name:        "undo",
-		Description: `Attempt to undo an earlier attempt to freeze the cluster.`,
-	}
-
 	Replicated = FlagInfo{
 		Name:        "replicated",
 		Description: "Restrict scan to replicated data.",
+	}
+
+	GossipInputFile = FlagInfo{
+		Name:      "file",
+		Shorthand: "f",
+		Description: `
+File containing the JSON output from a node's /_status/gossip/ endpoint.
+If specified, takes priority over host/port flags.`,
+	}
+
+	PrintSystemConfig = FlagInfo{
+		Name: "print-system-config",
+		Description: `
+If specified, print the system config contents. Beware that the output will be
+long and not particularly human-readable.`,
+	}
+
+	Decommission = FlagInfo{
+		Name: "decommission",
+		Description: `
+If specified, decommissions the node and waits for it to rebalance before
+shutting down the node.`,
+	}
+
+	Wait = FlagInfo{
+		Name: "wait",
+		Description: `
+Specifies when to return after having marked the targets as decommissioning.
+Takes any of the following values:
+<PRE>
+
+  - all:  waits until all target nodes' replica counts have dropped to zero.
+    This is the default. Use this unless you are targeting down nodes. In the presence
+    of down nodes, this will likely wait forever.
+  - live: waits until all live target nodes' replica counts have dropped to zero.
+    Use this when targeting down nodes only. When the process returns, manually verify
+    that the cluster is fully replicated before proceeding with node removal.
+  - none: marks the targets as decommissioning, but does not wait for the process to complete.
+    Use when polling manually from an external system.
+
+</PRE>`,
 	}
 )

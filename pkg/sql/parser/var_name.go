@@ -11,14 +11,14 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Raphael 'kena' Poss (knz@cockroachlabs.com)
 
 package parser
 
 import (
 	"bytes"
 	"fmt"
+
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 )
 
 // Variable names are used in multiples places in SQL:
@@ -59,7 +59,7 @@ import (
 // TypedExpr and VariableExpr so it can be used in expression trees
 // directly.  During parsing a name in expressions always begins as an
 // UnresolvedName instance.  During either IndexedVar substitution, type
-// checking or render target expansion (select node) this is
+// checking or render target expansion (render node) this is
 // normalized and replaced by either *ColumnItem, UnqualifiedStar or
 // AllColumnsSelector using the NormalizeVarName() method.
 //
@@ -115,7 +115,7 @@ type AllColumnsSelector struct {
 
 // Format implements the NodeFormatter interface.
 func (a *AllColumnsSelector) Format(buf *bytes.Buffer, f FmtFlags) {
-	if a.TableName.DatabaseName != "" {
+	if !a.TableName.DBNameOriginallyOmitted {
 		FormatNode(buf, f, a.TableName.DatabaseName)
 		buf.WriteByte('.')
 	}
@@ -152,7 +152,7 @@ type ColumnItem struct {
 // Format implements the NodeFormatter interface.
 func (c *ColumnItem) Format(buf *bytes.Buffer, f FmtFlags) {
 	if c.TableName.TableName != "" {
-		if c.TableName.DatabaseName != "" {
+		if !c.TableName.DBNameOriginallyOmitted {
 			FormatNode(buf, f, c.TableName.DatabaseName)
 			buf.WriteByte('.')
 		}
@@ -188,6 +188,10 @@ func (c *ColumnItem) ResolvedType() Type {
 		return nil
 	}
 	return presetTypesForTesting[c.String()]
+}
+
+func newInvColRef(fmt string, args ...interface{}) error {
+	return pgerror.NewErrorf(pgerror.CodeInvalidColumnReferenceError, fmt, args...)
 }
 
 // NormalizeVarName normalizes a UnresolvedName for all the forms it can have
@@ -229,14 +233,14 @@ func (n UnresolvedName) NormalizeVarName() (VarName, error) {
 	// The element at position i - 1 must be the column name.
 	// (We don't support record types yet.)
 	if i == 0 {
-		return nil, fmt.Errorf("invalid column name: %q", n)
+		return nil, newInvColRef("invalid column name: %q", n)
 	}
 	colName, ok := n[i-1].(Name)
 	if !ok {
-		return nil, fmt.Errorf("invalid column name: %q", n[:i])
+		return nil, newInvColRef("invalid column name: %q", n[:i])
 	}
 	if len(colName) == 0 {
-		return nil, fmt.Errorf("empty column name: %q", n)
+		return nil, newInvColRef("empty column name: %q", n)
 	}
 
 	// Everything afterwards is the selector.
@@ -261,16 +265,16 @@ func (n UnresolvedName) NormalizeVarName() (VarName, error) {
 // column item (e.g. UPDATE LHS, INSERT, etc.).
 func (n UnresolvedName) NormalizeUnqualifiedColumnItem() (*ColumnItem, error) {
 	if len(n) == 0 {
-		return nil, fmt.Errorf("invalid column name: %q", n)
+		return nil, newInvColRef("invalid column name: %q", n)
 	}
 
 	colName, ok := n[0].(Name)
 	if !ok {
-		return nil, fmt.Errorf("invalid column name: %q", n)
+		return nil, newInvColRef("invalid column name: %q", n)
 	}
 
 	if colName == "" {
-		return nil, fmt.Errorf("empty column name: %q", n)
+		return nil, newInvColRef("empty column name: %q", n)
 	}
 
 	// Remainder is a selector.

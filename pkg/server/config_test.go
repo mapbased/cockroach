@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Kenji Kaneda (kenji.kaneda@gmail.com)
 
 package server
 
@@ -22,18 +20,24 @@ import (
 	"testing"
 	"time"
 
+	"golang.org/x/net/context"
+
+	"github.com/kr/pretty"
+
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/gossip/resolver"
+	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
+	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/envutil"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 )
 
 func TestParseInitNodeAttributes(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	cfg := MakeConfig()
+	cfg := MakeConfig(cluster.MakeClusterSettings())
 	cfg.Attrs = "attr1=val1::attr2=val2"
 	cfg.Stores = base.StoreSpecList{Specs: []base.StoreSpec{{InMemory: true, SizeInBytes: base.MinimumStoreSize * 100}}}
-	engines, err := cfg.CreateEngines()
+	engines, err := cfg.CreateEngines(context.TODO())
 	if err != nil {
 		t.Fatalf("Failed to initialize stores: %s", err)
 	}
@@ -51,10 +55,10 @@ func TestParseInitNodeAttributes(t *testing.T) {
 // correctly.
 func TestParseJoinUsingAddrs(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	cfg := MakeConfig()
+	cfg := MakeConfig(cluster.MakeClusterSettings())
 	cfg.JoinList = []string{"localhost:12345,,localhost:23456", "localhost:34567"}
 	cfg.Stores = base.StoreSpecList{Specs: []base.StoreSpec{{InMemory: true, SizeInBytes: base.MinimumStoreSize * 100}}}
-	engines, err := cfg.CreateEngines()
+	engines, err := cfg.CreateEngines(context.TODO())
 	if err != nil {
 		t.Fatalf("Failed to initialize stores: %s", err)
 	}
@@ -90,9 +94,6 @@ func TestReadEnvironmentVariables(t *testing.T) {
 		if err := os.Unsetenv("COCKROACH_LINEARIZABLE"); err != nil {
 			t.Fatal(err)
 		}
-		if err := os.Unsetenv("COCKROACH_MAX_OFFSET"); err != nil {
-			t.Fatal(err)
-		}
 		if err := os.Unsetenv("COCKROACH_METRICS_SAMPLE_INTERVAL"); err != nil {
 			t.Fatal(err)
 		}
@@ -111,24 +112,19 @@ func TestReadEnvironmentVariables(t *testing.T) {
 		if err := os.Unsetenv("COCKROACH_TIME_UNTIL_STORE_DEAD"); err != nil {
 			t.Fatal(err)
 		}
-		if err := os.Unsetenv("COCKROACH_CONSISTENCY_CHECK_INTERVAL"); err != nil {
-			t.Fatal(err)
-		}
-		if err := os.Unsetenv("COCKROACH_RESERVATIONS_ENABLED"); err != nil {
-			t.Fatal(err)
-		}
 		envutil.ClearEnvCache()
 	}
 	defer resetEnvVar()
 
+	st := cluster.MakeClusterSettings()
 	// Makes sure no values are set when no environment variables are set.
-	cfg := MakeConfig()
-	cfgExpected := MakeConfig()
+	cfg := MakeConfig(st)
+	cfgExpected := MakeConfig(st)
 
 	resetEnvVar()
 	cfg.readEnvironmentVariables()
 	if !reflect.DeepEqual(cfg, cfgExpected) {
-		t.Fatalf("actual context does not match expected:\nactual:%+v\nexpected:%+v", cfg, cfgExpected)
+		t.Fatalf("actual context does not match expected: diff(actual, expected) = %s\nactual:\n%+v\nexpected:\n%+v", pretty.Diff(cfg, cfgExpected), cfg, cfgExpected)
 	}
 
 	// Set all the environment variables to valid values and ensure they are set
@@ -137,10 +133,6 @@ func TestReadEnvironmentVariables(t *testing.T) {
 		t.Fatal(err)
 	}
 	cfgExpected.Linearizable = true
-	if err := os.Setenv("COCKROACH_MAX_OFFSET", "1s"); err != nil {
-		t.Fatal(err)
-	}
-	cfgExpected.MaxOffset = time.Second
 	if err := os.Setenv("COCKROACH_METRICS_SAMPLE_INTERVAL", "1h10m"); err != nil {
 		t.Fatal(err)
 	}
@@ -161,63 +153,64 @@ func TestReadEnvironmentVariables(t *testing.T) {
 		t.Fatal(err)
 	}
 	cfgExpected.ConsistencyCheckPanicOnFailure = true
-	if err := os.Setenv("COCKROACH_TIME_UNTIL_STORE_DEAD", "10ms"); err != nil {
-		t.Fatal(err)
-	}
-	cfgExpected.TimeUntilStoreDead = time.Millisecond * 10
-	if err := os.Setenv("COCKROACH_CONSISTENCY_CHECK_INTERVAL", "10ms"); err != nil {
-		t.Fatal(err)
-	}
-	cfgExpected.ConsistencyCheckInterval = time.Millisecond * 10
-	if err := os.Setenv("COCKROACH_RESERVATIONS_ENABLED", "false"); err != nil {
-		t.Fatal(err)
-	}
 
 	envutil.ClearEnvCache()
 	cfg.readEnvironmentVariables()
 	if !reflect.DeepEqual(cfg, cfgExpected) {
-		t.Fatalf("actual context does not match expected:\nactual:%+v\nexpected:%+v", cfg, cfgExpected)
+		t.Fatalf("actual context does not match expected: diff(actual,expected) = %s", pretty.Diff(cfgExpected, cfg))
 	}
 
-	// Set all the environment variables to invalid values and test that the
-	// defaults are still set.
-	cfg = MakeConfig()
-	cfgExpected = MakeConfig()
+	for _, envVar := range []string{
+		"COCKROACH_LINEARIZABLE",
+		"COCKROACH_METRICS_SAMPLE_INTERVAL",
+		"COCKROACH_SCAN_INTERVAL",
+		"COCKROACH_SCAN_MAX_IDLE_TIME",
+		"COCKROACH_CONSISTENCY_CHECK_INTERVAL",
+		"COCKROACH_CONSISTENCY_CHECK_PANIC_ON_FAILURE",
+		"COCKROACH_TIME_UNTIL_STORE_DEAD",
+	} {
+		t.Run("invalid", func(t *testing.T) {
+			if err := os.Setenv(envVar, "abcd"); err != nil {
+				t.Fatal(err)
+			}
+			envutil.ClearEnvCache()
 
-	if err := os.Setenv("COCKROACH_LINEARIZABLE", "abcd"); err != nil {
-		t.Fatal(err)
+			defer func() {
+				if recover() == nil {
+					t.Fatal("expected panic")
+				}
+			}()
+
+			cfg.readEnvironmentVariables()
+		})
 	}
-	if err := os.Setenv("COCKROACH_MAX_OFFSET", "abcd"); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Setenv("COCKROACH_METRICS_SAMPLE_INTERVAL", "abcd"); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Setenv("COCKROACH_SCAN_INTERVAL", "abcd"); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Setenv("COCKROACH_SCAN_MAX_IDLE_TIME", "abcd"); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Setenv("COCKROACH_CONSISTENCY_CHECK_INTERVAL", "abcd"); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Setenv("COCKROACH_CONSISTENCY_CHECK_PANIC_ON_FAILURE", "abcd"); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Setenv("COCKROACH_TIME_UNTIL_STORE_DEAD", "abcd"); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Setenv("COCKROACH_CONSISTENCY_CHECK_INTERVAL", "abcd"); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Setenv("COCKROACH_RESERVATIONS_ENABLED", "abcd"); err != nil {
-		t.Fatal(err)
+}
+
+func TestFilterGossipBootstrapResolvers(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	resolverSpecs := []string{
+		"127.0.0.1:9000",
+		"127.0.0.1:9001",
+		"localhost:9004",
 	}
 
-	envutil.ClearEnvCache()
-	cfg.readEnvironmentVariables()
-	if !reflect.DeepEqual(cfg, cfgExpected) {
-		t.Fatalf("actual context does not match expected:\nactual:%+v\nexpected:%+v", cfg, cfgExpected)
+	resolvers := []resolver.Resolver{}
+	for _, rs := range resolverSpecs {
+		resolver, err := resolver.NewResolver(rs)
+		if err == nil {
+			resolvers = append(resolvers, resolver)
+		}
+	}
+	cfg := MakeConfig(cluster.MakeClusterSettings())
+	cfg.GossipBootstrapResolvers = resolvers
+
+	listenAddr := util.MakeUnresolvedAddr("tcp", resolverSpecs[0])
+	advertAddr := util.MakeUnresolvedAddr("tcp", resolverSpecs[2])
+	filtered := cfg.FilterGossipBootstrapResolvers(context.Background(), &listenAddr, &advertAddr)
+	if len(filtered) != 1 {
+		t.Fatalf("expected one resolver; got %+v", filtered)
+	} else if filtered[0].Addr() != resolverSpecs[1] {
+		t.Fatalf("expected resolver to be %q; got %q", resolverSpecs[1], filtered[0].Addr())
 	}
 }

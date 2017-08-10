@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Matt Jibson (mjibson@cockroachlabs.com)
 
 package acceptance
 
@@ -20,10 +18,15 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/cockroachdb/cockroach/pkg/util/log"
+
 	"golang.org/x/net/context"
 )
 
 func TestDockerPHP(t *testing.T) {
+	s := log.Scope(t)
+	defer s.Close(t)
+
 	ctx := context.Background()
 	testDockerSuccess(ctx, t, "php", []string{"php", "-r", strings.Replace(php, "%v", "3", 1)})
 	testDockerFail(ctx, t, "php", []string{"php", "-r", strings.Replace(php, "%v", `"a"`, 1)})

@@ -11,14 +11,14 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Dan Harrison (daniel.harrison@gmail.com)
 
 package pgwire
 
 import (
 	"testing"
 	"time"
+
+	"golang.org/x/net/context"
 
 	"github.com/lib/pq/oid"
 
@@ -44,12 +44,12 @@ func TestParseTs(t *testing.T) {
 	}
 
 	for i, test := range parseTsTests {
-		parsed, err := parseTs(test.strTimestamp)
+		parsed, err := parser.ParseDTimestamp(test.strTimestamp, time.Nanosecond)
 		if err != nil {
 			t.Errorf("%d could not parse [%s]: %v", i, test.strTimestamp, err)
 			continue
 		}
-		if !parsed.Equal(test.expected) {
+		if !parsed.Time.Equal(test.expected) {
 			t.Errorf("%d parsing [%s] got [%s] expected [%s]", i, test.strTimestamp, parsed, test.expected)
 		}
 	}
@@ -60,7 +60,7 @@ func TestTimestampRoundtrip(t *testing.T) {
 	ts := time.Date(2006, 7, 8, 0, 0, 0, 123000, time.FixedZone("UTC", 0))
 
 	parse := func(encoded []byte) time.Time {
-		decoded, err := parseTs(string(encoded))
+		decoded, err := parser.ParseDTimestamp(string(encoded), time.Nanosecond)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -82,7 +82,35 @@ func TestTimestampRoundtrip(t *testing.T) {
 	}
 }
 
+func TestIntArrayRoundTrip(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	buf := writeBuffer{bytecount: metric.NewCounter(metric.Metadata{})}
+	d := parser.NewDArray(parser.TypeInt)
+	for i := 0; i < 10; i++ {
+		if err := d.Append(parser.NewDInt(parser.DInt(i))); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	buf.writeTextDatum(context.Background(), d, time.UTC)
+
+	b := buf.wrapped.Bytes()
+
+	got, err := decodeOidDatum(oid.T__int8, formatText, b[4:])
+	if err != nil {
+		t.Fatal(err)
+	}
+	evalCtx := parser.NewTestingEvalContext()
+	defer evalCtx.Stop(context.Background())
+	if got.Compare(evalCtx, d) != 0 {
+		t.Fatalf("expected %s, got %s", d, got)
+	}
+}
+
 func benchmarkWriteType(b *testing.B, d parser.Datum, format formatCode) {
+	ctx := context.Background()
+
 	buf := writeBuffer{bytecount: metric.NewCounter(metric.Metadata{Name: ""})}
 
 	writeMethod := buf.writeTextDatum
@@ -91,7 +119,7 @@ func benchmarkWriteType(b *testing.B, d parser.Datum, format formatCode) {
 	}
 
 	// Warm up the buffer.
-	writeMethod(d, nil)
+	writeMethod(ctx, d, nil)
 	buf.wrapped.Reset()
 
 	b.ResetTimer()
@@ -99,7 +127,7 @@ func benchmarkWriteType(b *testing.B, d parser.Datum, format formatCode) {
 		// Starting and stopping the timer in each loop iteration causes this
 		// to take much longer. See http://stackoverflow.com/a/37624250/3435257.
 		// buf.wrapped.Reset() should be fast enough to be negligible.
-		writeMethod(d, nil)
+		writeMethod(ctx, d, nil)
 		buf.wrapped.Reset()
 	}
 }
@@ -119,7 +147,7 @@ func benchmarkWriteFloat(b *testing.B, format formatCode) {
 func benchmarkWriteDecimal(b *testing.B, format formatCode) {
 	dec := new(parser.DDecimal)
 	s := "-1728718718271827121233.1212121212"
-	if _, ok := dec.SetString(s); !ok {
+	if err := dec.SetString(s); err != nil {
 		b.Fatalf("could not set %q on decimal", format)
 	}
 	benchmarkWriteType(b, dec, formatText)
@@ -169,7 +197,7 @@ func benchmarkWriteTuple(b *testing.B, format formatCode) {
 	i := parser.NewDInt(1234)
 	f := parser.NewDFloat(12.34)
 	s := parser.NewDString("testing")
-	t := &parser.DTuple{i, f, s}
+	t := parser.NewDTuple(i, f, s)
 	benchmarkWriteType(b, t, format)
 }
 
@@ -263,10 +291,10 @@ func BenchmarkDecodeBinaryDecimal(b *testing.B) {
 
 	expected := new(parser.DDecimal)
 	s := "-1728718718271827121233.1212121212"
-	if _, ok := expected.SetString(s); !ok {
+	if err := expected.SetString(s); err != nil {
 		b.Fatalf("could not set %q on decimal", s)
 	}
-	wbuf.writeBinaryDatum(expected, nil)
+	wbuf.writeBinaryDatum(context.Background(), expected, nil)
 
 	rbuf := readBuffer{msg: wbuf.wrapped.Bytes()}
 
@@ -284,9 +312,11 @@ func BenchmarkDecodeBinaryDecimal(b *testing.B) {
 		b.StartTimer()
 		got, err := decodeOidDatum(oid.T_numeric, formatBinary, bytes)
 		b.StopTimer()
+		evalCtx := parser.NewTestingEvalContext()
+		defer evalCtx.Stop(context.Background())
 		if err != nil {
 			b.Fatal(err)
-		} else if got.Compare(expected) != 0 {
+		} else if got.Compare(evalCtx, expected) != 0 {
 			b.Fatalf("expected %s, got %s", expected, got)
 		}
 	}

@@ -11,13 +11,12 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Peter Mattis (peter@cockroachlabs.com)
 
 package sqlbase
 
 import (
 	"encoding/json"
+	"fmt"
 	"reflect"
 	"testing"
 
@@ -28,6 +27,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
+	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 )
 
@@ -98,8 +98,8 @@ func TestAllocateIDs(t *testing.T) {
 				ColumnDirections: []IndexDescriptor_Direction{IndexDescriptor_ASC,
 					IndexDescriptor_ASC}},
 			{ID: 3, Name: "e", ColumnIDs: []ColumnID{2}, ColumnNames: []string{"b"},
-				ColumnDirections:  []IndexDescriptor_Direction{IndexDescriptor_ASC},
-				ImplicitColumnIDs: []ColumnID{1}},
+				ColumnDirections: []IndexDescriptor_Direction{IndexDescriptor_ASC},
+				ExtraColumnIDs:   []ColumnID{1}},
 		},
 		Privileges:     NewDefaultPrivilegeDescriptor(),
 		NextColumnID:   4,
@@ -599,7 +599,7 @@ func TestValidateTableDesc(t *testing.T) {
 func TestValidateCrossTableReferences(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	s, _, kvDB := serverutils.StartServer(t, base.TestServerArgs{})
-	defer s.Stopper().Stop()
+	defer s.Stopper().Stop(context.TODO())
 
 	tests := []struct {
 		err        string
@@ -633,7 +633,7 @@ func TestValidateCrossTableReferences(t *testing.T) {
 			}},
 		},
 		{
-			err: `missing fk back reference to foo.bar from baz.qux`,
+			err: `missing fk back reference to "foo"@"bar" from "baz"@"qux"`,
 			desc: TableDescriptor{
 				ID:   51,
 				Name: "foo",
@@ -677,7 +677,7 @@ func TestValidateCrossTableReferences(t *testing.T) {
 			}},
 		},
 		{
-			err: `broken fk backward reference from foo.bar to baz.qux`,
+			err: `broken fk backward reference from "foo"@"bar" to "baz"@"qux"`,
 			desc: TableDescriptor{
 				ID:   51,
 				Name: "foo",
@@ -728,7 +728,7 @@ func TestValidateCrossTableReferences(t *testing.T) {
 			}},
 		},
 		{
-			err: `missing interleave back reference to foo.bar from baz.qux`,
+			err: `missing interleave back reference to "foo"@"bar" from "baz"@"qux"`,
 			desc: TableDescriptor{
 				ID:   51,
 				Name: "foo",
@@ -774,7 +774,7 @@ func TestValidateCrossTableReferences(t *testing.T) {
 			}},
 		},
 		{
-			err: `broken interleave backward reference from foo.bar to baz.qux`,
+			err: `broken interleave backward reference from "foo"@"bar" to "baz"@"qux"`,
 			desc: TableDescriptor{
 				ID:   51,
 				Name: "foo",
@@ -795,6 +795,17 @@ func TestValidateCrossTableReferences(t *testing.T) {
 		},
 	}
 
+	{
+		var v roachpb.Value
+		desc := &Descriptor{Union: &Descriptor_Database{}}
+		if err := v.SetProto(desc); err != nil {
+			t.Fatal(err)
+		}
+		if err := kvDB.Put(context.TODO(), MakeDescMetadataKey(0), &v); err != nil {
+			t.Fatal(err)
+		}
+	}
+
 	for i, test := range tests {
 		for _, referencedDesc := range test.referenced {
 			var v roachpb.Value
@@ -806,8 +817,8 @@ func TestValidateCrossTableReferences(t *testing.T) {
 				t.Fatal(err)
 			}
 		}
-		txn := client.NewTxn(context.Background(), *kvDB)
-		if err := test.desc.validateCrossReferences(txn); err == nil {
+		txn := client.NewTxn(kvDB)
+		if err := test.desc.validateCrossReferences(context.TODO(), txn); err == nil {
 			t.Errorf("%d: expected \"%s\", but found success: %+v", i, test.err, test.desc)
 		} else if test.err != err.Error() {
 			t.Errorf("%d: expected \"%s\", but found \"%s\"", i, test.err, err.Error())
@@ -827,19 +838,19 @@ func TestColumnTypeSQLString(t *testing.T) {
 		colType     ColumnType
 		expectedSQL string
 	}{
-		{ColumnType{Kind: ColumnType_INT}, "INT"},
-		{ColumnType{Kind: ColumnType_INT, Width: 2}, "BIT(2)"},
-		{ColumnType{Kind: ColumnType_FLOAT}, "FLOAT"},
-		{ColumnType{Kind: ColumnType_FLOAT, Precision: 3}, "FLOAT(3)"},
-		{ColumnType{Kind: ColumnType_DECIMAL}, "DECIMAL"},
-		{ColumnType{Kind: ColumnType_DECIMAL, Precision: 6}, "DECIMAL(6)"},
-		{ColumnType{Kind: ColumnType_DECIMAL, Precision: 7, Width: 8}, "DECIMAL(7,8)"},
-		{ColumnType{Kind: ColumnType_DATE}, "DATE"},
-		{ColumnType{Kind: ColumnType_TIMESTAMP}, "TIMESTAMP"},
-		{ColumnType{Kind: ColumnType_INTERVAL}, "INTERVAL"},
-		{ColumnType{Kind: ColumnType_STRING}, "STRING"},
-		{ColumnType{Kind: ColumnType_STRING, Width: 10}, "STRING(10)"},
-		{ColumnType{Kind: ColumnType_BYTES}, "BYTES"},
+		{ColumnType{SemanticType: ColumnType_INT}, "INT"},
+		{ColumnType{SemanticType: ColumnType_INT, VisibleType: ColumnType_BIT, Width: 2}, "BIT(2)"},
+		{ColumnType{SemanticType: ColumnType_FLOAT}, "FLOAT"},
+		{ColumnType{SemanticType: ColumnType_FLOAT, Precision: 3}, "FLOAT(3)"},
+		{ColumnType{SemanticType: ColumnType_DECIMAL}, "DECIMAL"},
+		{ColumnType{SemanticType: ColumnType_DECIMAL, Precision: 6}, "DECIMAL(6)"},
+		{ColumnType{SemanticType: ColumnType_DECIMAL, Precision: 7, Width: 8}, "DECIMAL(7,8)"},
+		{ColumnType{SemanticType: ColumnType_DATE}, "DATE"},
+		{ColumnType{SemanticType: ColumnType_TIMESTAMP}, "TIMESTAMP"},
+		{ColumnType{SemanticType: ColumnType_INTERVAL}, "INTERVAL"},
+		{ColumnType{SemanticType: ColumnType_STRING}, "STRING"},
+		{ColumnType{SemanticType: ColumnType_STRING, Width: 10}, "STRING(10)"},
+		{ColumnType{SemanticType: ColumnType_BYTES}, "BYTES"},
 	}
 	for i, d := range testData {
 		sql := d.colType.SQLString()
@@ -854,20 +865,20 @@ func TestColumnValueEncodedSize(t *testing.T) {
 		colType ColumnType
 		size    int // -1 means unbounded
 	}{
-		{ColumnType{Kind: ColumnType_BOOL}, 1},
-		{ColumnType{Kind: ColumnType_INT}, 10},
-		{ColumnType{Kind: ColumnType_INT, Width: 2}, 10},
-		{ColumnType{Kind: ColumnType_FLOAT}, 9},
-		{ColumnType{Kind: ColumnType_FLOAT, Precision: 100}, 9},
-		{ColumnType{Kind: ColumnType_DECIMAL}, -1},
-		{ColumnType{Kind: ColumnType_DECIMAL, Precision: 100}, 68},
-		{ColumnType{Kind: ColumnType_DECIMAL, Precision: 100, Width: 100}, 68},
-		{ColumnType{Kind: ColumnType_DATE}, 10},
-		{ColumnType{Kind: ColumnType_TIMESTAMP}, 10},
-		{ColumnType{Kind: ColumnType_INTERVAL}, 28},
-		{ColumnType{Kind: ColumnType_STRING}, -1},
-		{ColumnType{Kind: ColumnType_STRING, Width: 100}, 110},
-		{ColumnType{Kind: ColumnType_BYTES}, -1},
+		{ColumnType{SemanticType: ColumnType_BOOL}, 1},
+		{ColumnType{SemanticType: ColumnType_INT}, 10},
+		{ColumnType{SemanticType: ColumnType_INT, Width: 2}, 10},
+		{ColumnType{SemanticType: ColumnType_FLOAT}, 9},
+		{ColumnType{SemanticType: ColumnType_FLOAT, Precision: 100}, 9},
+		{ColumnType{SemanticType: ColumnType_DECIMAL}, -1},
+		{ColumnType{SemanticType: ColumnType_DECIMAL, Precision: 100}, 69},
+		{ColumnType{SemanticType: ColumnType_DECIMAL, Precision: 100, Width: 100}, 69},
+		{ColumnType{SemanticType: ColumnType_DATE}, 10},
+		{ColumnType{SemanticType: ColumnType_TIMESTAMP}, 10},
+		{ColumnType{SemanticType: ColumnType_INTERVAL}, 28},
+		{ColumnType{SemanticType: ColumnType_STRING}, -1},
+		{ColumnType{SemanticType: ColumnType_STRING, Width: 100}, 110},
+		{ColumnType{SemanticType: ColumnType_BYTES}, -1},
 	}
 	for i, test := range tests {
 		testIsBounded := test.size != -1
@@ -891,7 +902,7 @@ func TestColumnValueEncodedSize(t *testing.T) {
 func TestFitColumnToFamily(t *testing.T) {
 	intEncodedSize, _ := upperBoundColumnValueEncodedSize(ColumnDescriptor{
 		ID:   8,
-		Type: ColumnType{Kind: ColumnType_INT},
+		Type: ColumnType{SemanticType: ColumnType_INT},
 	})
 
 	makeTestTableDescriptor := func(familyTypes [][]ColumnType) TableDescriptor {
@@ -914,15 +925,15 @@ func TestFitColumnToFamily(t *testing.T) {
 
 	emptyFamily := []ColumnType{}
 	partiallyFullFamily := []ColumnType{
-		{Kind: ColumnType_INT},
-		{Kind: ColumnType_BYTES, Width: 10},
+		{SemanticType: ColumnType_INT},
+		{SemanticType: ColumnType_BYTES, Width: 10},
 	}
 	fullFamily := []ColumnType{
-		{Kind: ColumnType_BYTES, Width: FamilyHeuristicTargetBytes + 1},
+		{SemanticType: ColumnType_BYTES, Width: FamilyHeuristicTargetBytes + 1},
 	}
 	maxIntsInOneFamily := make([]ColumnType, FamilyHeuristicTargetBytes/intEncodedSize)
 	for i := range maxIntsInOneFamily {
-		maxIntsInOneFamily[i] = ColumnType{Kind: ColumnType_INT}
+		maxIntsInOneFamily[i] = ColumnType{SemanticType: ColumnType_INT}
 	}
 
 	tests := []struct {
@@ -932,36 +943,28 @@ func TestFitColumnToFamily(t *testing.T) {
 		idx              int // not applicable if colFits is false
 	}{
 		// Bounded size column.
-		{colFits: false, idx: -1, newCol: ColumnType{Kind: ColumnType_BOOL},
+		{colFits: true, idx: 0, newCol: ColumnType{SemanticType: ColumnType_BOOL},
 			existingFamilies: nil,
 		},
-		{colFits: true, idx: 0, newCol: ColumnType{Kind: ColumnType_BOOL},
+		{colFits: true, idx: 0, newCol: ColumnType{SemanticType: ColumnType_BOOL},
 			existingFamilies: [][]ColumnType{emptyFamily},
 		},
-		{colFits: true, idx: 0, newCol: ColumnType{Kind: ColumnType_BOOL},
+		{colFits: true, idx: 0, newCol: ColumnType{SemanticType: ColumnType_BOOL},
 			existingFamilies: [][]ColumnType{partiallyFullFamily},
 		},
-		{colFits: false, idx: -1, newCol: ColumnType{Kind: ColumnType_BOOL},
+		{colFits: true, idx: 0, newCol: ColumnType{SemanticType: ColumnType_BOOL},
 			existingFamilies: [][]ColumnType{fullFamily},
 		},
-		{colFits: true, idx: 1, newCol: ColumnType{Kind: ColumnType_BOOL},
+		{colFits: true, idx: 0, newCol: ColumnType{SemanticType: ColumnType_BOOL},
 			existingFamilies: [][]ColumnType{fullFamily, emptyFamily},
 		},
 
 		// Unbounded size column.
-		{colFits: true, idx: 0, newCol: ColumnType{Kind: ColumnType_DECIMAL},
+		{colFits: true, idx: 0, newCol: ColumnType{SemanticType: ColumnType_DECIMAL},
 			existingFamilies: [][]ColumnType{emptyFamily},
 		},
-		{colFits: false, idx: -1, newCol: ColumnType{Kind: ColumnType_DECIMAL},
+		{colFits: true, idx: 0, newCol: ColumnType{SemanticType: ColumnType_DECIMAL},
 			existingFamilies: [][]ColumnType{partiallyFullFamily},
-		},
-
-		// Check FamilyHeuristicMaxBytes boundary.
-		{colFits: true, idx: 0, newCol: ColumnType{Kind: ColumnType_INT},
-			existingFamilies: [][]ColumnType{maxIntsInOneFamily[1:]},
-		},
-		{colFits: false, idx: -1, newCol: ColumnType{Kind: ColumnType_INT},
-			existingFamilies: [][]ColumnType{maxIntsInOneFamily},
 		},
 	}
 	for i, test := range tests {
@@ -1062,5 +1065,52 @@ func TestUnvalidateConstraints(t *testing.T) {
 	}
 	if c, ok := after["fk"]; !ok || !c.Unvalidated {
 		t.Fatalf("expected to find a unvalididated constraint fk before, found %v", c)
+	}
+}
+
+func TestKeysPerRow(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	// TODO(dan): This server is only used to turn a CREATE TABLE statement into
+	// a TableDescriptor. It should be possible to move MakeTableDesc into
+	// sqlbase. If/when that happens, use it here instead of this server.
+	s, conn, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	defer s.Stopper().Stop(context.TODO())
+	if _, err := conn.Exec(`CREATE DATABASE d`); err != nil {
+		t.Fatalf("%+v", err)
+	}
+
+	tests := []struct {
+		createTable string
+		indexID     IndexID
+		expected    int
+	}{
+		{"(a SERIAL PRIMARY KEY, b INT, INDEX (b))", 1, 1},                         // Primary index
+		{"(a SERIAL PRIMARY KEY, b INT, INDEX (b))", 2, 1},                         // 'b' index
+		{"(a SERIAL PRIMARY KEY, b INT, FAMILY (a), FAMILY (b), INDEX (b))", 1, 2}, // Primary index
+		{"(a SERIAL PRIMARY KEY, b INT, FAMILY (a), FAMILY (b), INDEX (b))", 2, 1}, // 'b' index
+	}
+
+	for i, test := range tests {
+		t.Run(fmt.Sprintf("%s - %d", test.createTable, test.indexID), func(t *testing.T) {
+			sqlDB := sqlutils.MakeSQLRunner(t, conn)
+			tableName := fmt.Sprintf("t%d", i)
+			sqlDB.Exec(fmt.Sprintf(`CREATE TABLE d.%s %s`, tableName, test.createTable))
+
+			var descBytes []byte
+			// Grab the most recently created descriptor.
+			row := sqlDB.QueryRow(
+				`SELECT descriptor FROM system.descriptor ORDER BY id DESC LIMIT 1`)
+			row.Scan(&descBytes)
+			var desc Descriptor
+			if err := desc.Unmarshal(descBytes); err != nil {
+				t.Fatalf("%+v", err)
+			}
+
+			keys := desc.GetTable().KeysPerRow(test.indexID)
+			if test.expected != keys {
+				t.Errorf("expected %d keys got %d", test.expected, keys)
+			}
+		})
 	}
 }

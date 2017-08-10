@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Ben Darnell
 
 package storage
 
@@ -34,9 +32,6 @@ import (
 )
 
 const (
-	// replicaGCQueueMaxSize is the max size of the gc queue.
-	replicaGCQueueMaxSize = 100
-
 	// replicaGCQueueTimerDuration is the duration between GCs of queued replicas.
 	replicaGCQueueTimerDuration = 50 * time.Millisecond
 
@@ -63,7 +58,8 @@ const (
 )
 
 var (
-	metaReplicaGCQueueRemoveReplicaCount = metric.Metadata{Name: "queue.replicagc.removereplica",
+	metaReplicaGCQueueRemoveReplicaCount = metric.Metadata{
+		Name: "queue.replicagc.removereplica",
 		Help: "Number of replica removals attempted by the replica gc queue"}
 )
 
@@ -97,8 +93,9 @@ func newReplicaGCQueue(store *Store, db *client.DB, gossip *gossip.Gossip) *repl
 	rgcq.baseQueue = newBaseQueue(
 		"replicaGC", rgcq, store, gossip,
 		queueConfig{
-			maxSize:              replicaGCQueueMaxSize,
+			maxSize:              defaultQueueMaxSize,
 			needsLease:           false,
+			needsSystemConfig:    false,
 			acceptsUnsplitRanges: true,
 			successes:            store.metrics.ReplicaGCQueueSuccesses,
 			failures:             store.metrics.ReplicaGCQueueFailures,
@@ -124,15 +121,32 @@ func (rgcq *replicaGCQueue) shouldQueue(
 		return false, 0
 	}
 
-	lastActivity := hlc.ZeroTimestamp.Add(repl.store.startedAt, 0)
+	if _, currentMember := repl.Desc().GetReplicaDescriptor(repl.store.StoreID()); !currentMember {
+		return true, replicaGCPriorityRemoved
+	}
 
-	if lease, _ := repl.getLease(); lease != nil && lease.ProposedTS != nil {
+	lastActivity := hlc.Timestamp{
+		WallTime: repl.store.startedAt,
+	}
+
+	if lease, _ := repl.getLease(); lease.ProposedTS != nil {
 		lastActivity.Forward(*lease.ProposedTS)
 	}
 
 	var isCandidate bool
 	if raftStatus := repl.RaftStatus(); raftStatus != nil {
 		isCandidate = (raftStatus.SoftState.RaftState == raft.StateCandidate)
+	} else {
+		// If a replica doesn't have an active raft group, we should check whether
+		// we're decommissioning. If so, we should process the replica because it
+		// has probably already been removed from its raft group but doesn't know it.
+		// Without this, node decommissioning can stall on such dormant ranges.
+		// Make sure NodeLiveness isn't nil because it can be in tests/benchmarks.
+		if repl.store.cfg.NodeLiveness != nil {
+			if liveness, _ := repl.store.cfg.NodeLiveness.Self(); liveness != nil && liveness.Decommissioning {
+				return true, replicaGCPriorityDefault
+			}
+		}
 	}
 	return replicaGCShouldQueueImpl(now, lastCheck, lastActivity, isCandidate)
 }
@@ -199,10 +213,12 @@ func (rgcq *replicaGCQueue) process(
 	}
 
 	replyDesc := reply.Ranges[0]
-	if _, currentMember := replyDesc.GetReplicaDescriptor(repl.store.StoreID()); !currentMember {
+	if currentDesc, currentMember := replyDesc.GetReplicaDescriptor(repl.store.StoreID()); !currentMember {
 		// We are no longer a member of this range; clean up our local data.
 		rgcq.metrics.RemoveReplicaCount.Inc(1)
-		log.VEventf(ctx, 1, "destroying local data")
+		if log.V(1) {
+			log.Infof(ctx, "destroying local data")
+		}
 		if err := repl.store.RemoveReplica(ctx, repl, replyDesc, true); err != nil {
 			return err
 		}
@@ -212,7 +228,9 @@ func (rgcq *replicaGCQueue) process(
 		// subsuming range. Shut down raft processing for the former range
 		// and delete any remaining metadata, but do not delete the data.
 		rgcq.metrics.RemoveReplicaCount.Inc(1)
-		log.VEventf(ctx, 1, "removing merged range")
+		if log.V(1) {
+			log.Infof(ctx, "removing merged range")
+		}
 		if err := repl.store.RemoveReplica(ctx, repl, replyDesc, false); err != nil {
 			return err
 		}
@@ -227,7 +245,9 @@ func (rgcq *replicaGCQueue) process(
 		// but also on how good a job the queue does at inspecting every
 		// Replica (see #8111) when inactive ones can be starved by
 		// event-driven additions.
-		log.Event(ctx, "not gc'able")
+		if log.V(1) {
+			log.Infof(ctx, "not gc'able, replica is still in range descriptor: %v", currentDesc)
+		}
 		if err := repl.setLastReplicaGCTimestamp(ctx, repl.store.Clock().Now()); err != nil {
 			return err
 		}

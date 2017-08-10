@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Spencer Kimball (spencer.kimball@gmail.com)
 
 /*
 Package simulation provides tools meant to visualize or test aspects
@@ -273,8 +271,8 @@ func main() {
 	// multiple runs.
 	randutil.SeedForTests()
 
-	if f := flag.Lookup("alsologtostderr"); f != nil {
-		fmt.Println("Starting simulation. Add -alsologtostderr to see progress.")
+	if f := flag.Lookup("logtostderr"); f != nil {
+		fmt.Println("Starting simulation. Add -logtostderr to see progress.")
 	}
 	flag.Parse()
 
@@ -307,7 +305,7 @@ func main() {
 	edgeSet := make(map[string]edge)
 
 	stopper := stop.NewStopper()
-	defer stopper.Stop()
+	defer stopper.Stop(context.TODO())
 
 	n := simulation.NewNetwork(stopper, nodeCount, true)
 	n.SimulateNetwork(

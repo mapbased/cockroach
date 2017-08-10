@@ -11,23 +11,17 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Spencer Kimball (spencer.kimball@gmail.com)
 
 package httputil
 
 import (
 	"bytes"
-	"io"
 	"io/ioutil"
 	"net/http"
-	"reflect"
 	"strconv"
-	"strings"
 
 	"github.com/gogo/protobuf/jsonpb"
 	"github.com/gogo/protobuf/proto"
-	"github.com/grpc-ecosystem/grpc-gateway/runtime"
 	"github.com/pkg/errors"
 )
 
@@ -54,6 +48,8 @@ const (
 	GzipEncoding = "gzip"
 )
 
+type httpHeaderFn func(header http.Header)
+
 // GetJSON uses the supplied client to GET the URL specified by the parameters
 // and unmarshals the result into response.
 func GetJSON(httpClient http.Client, path string, response proto.Message) error {
@@ -61,7 +57,8 @@ func GetJSON(httpClient http.Client, path string, response proto.Message) error 
 	if err != nil {
 		return err
 	}
-	return doJSONRequest(httpClient, req, response)
+	_, err = doJSONRequest(httpClient, nil, req, response)
+	return err
 }
 
 // PostJSON uses the supplied client to POST request to the URL specified by
@@ -78,77 +75,54 @@ func PostJSON(httpClient http.Client, path string, request, response proto.Messa
 	if err != nil {
 		return err
 	}
-	return doJSONRequest(httpClient, req, response)
+	_, err = doJSONRequest(httpClient, nil, req, response)
+	return err
 }
 
-func doJSONRequest(httpClient http.Client, req *http.Request, response proto.Message) error {
+// PostJSONWithHeaders uses the supplied client to POST request to the URL
+// specified by the parameters and unmarshals the result into response.
+//
+// The caller can provide an optional callback function that can modify outgoing
+// HTTP headers before the request is sent. Headers returned with the response
+// are returned to the caller.
+func PostJSONWithHeaders(
+	httpClient http.Client, path string, headerFn httpHeaderFn, request, response proto.Message,
+) (http.Header, error) {
+	// Hack to avoid upsetting TestProtoMarshal().
+	marshalFn := (&jsonpb.Marshaler{}).Marshal
+
+	var buf bytes.Buffer
+	if err := marshalFn(&buf, request); err != nil {
+		return nil, err
+	}
+	req, err := http.NewRequest("POST", path, &buf)
+	if err != nil {
+		return nil, err
+	}
+
+	return doJSONRequest(httpClient, headerFn, req, response)
+}
+
+func doJSONRequest(
+	httpClient http.Client, headerFn httpHeaderFn, req *http.Request, response proto.Message,
+) (http.Header, error) {
 	if timeout := httpClient.Timeout; timeout > 0 {
 		req.Header.Set("Grpc-Timeout", strconv.FormatInt(timeout.Nanoseconds(), 10)+"n")
 	}
 	req.Header.Set(AcceptHeader, JSONContentType)
+	if headerFn != nil {
+		headerFn(req.Header)
+	}
 	resp, err := httpClient.Do(req)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	defer resp.Body.Close()
 	if contentType := resp.Header.Get(ContentTypeHeader); !(resp.StatusCode == http.StatusOK && contentType == JSONContentType) {
 		b, err := ioutil.ReadAll(resp.Body)
-		return errors.Errorf("status: %s, content-type: %s, body: %s, error: %v", resp.Status, contentType, b, err)
+		return resp.Header, errors.Errorf(
+			"status: %s, content-type: %s, body: %s, error: %v", resp.Status, contentType, b, err,
+		)
 	}
-	return jsonpb.Unmarshal(resp.Body, response)
-}
-
-// StreamJSON uses the supplied client to POST the given proto request as JSON
-// to the supplied streaming grpc-gw endpoint; the response type serves only to
-// create the values passed to the callback (which is invoked for every message
-// in the stream with a value of the supplied response type masqueraded as an
-// interface).
-func StreamJSON(
-	httpClient http.Client,
-	path string,
-	request proto.Message,
-	dest proto.Message,
-	callback func(proto.Message),
-) error {
-	str, err := (&jsonpb.Marshaler{}).MarshalToString(request)
-	if err != nil {
-		return err
-	}
-
-	resp, err := httpClient.Post(path, JSONContentType, strings.NewReader(str))
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		b, err := ioutil.ReadAll(resp.Body)
-		return errors.Errorf("status: %s, body: %s, error: %v", resp.Status, b, err)
-	}
-
-	// grpc-gw/runtime's JSONpb {en,de}coder is pretty half-baked. Essentially
-	// we must pass a *map[string]*concreteType or it won't work (in
-	// particular, using a struct or replacing `*concreteType` with either
-	// `concreteType` or `proto.Message` leads to errors). This method should do
-	// a decent enough job at encapsulating this away; should this change, we
-	// should consider cribbing and fixing up the marshaling code.
-	m := reflect.New(reflect.MapOf(reflect.TypeOf(""), reflect.TypeOf(dest)))
-	// TODO(tschottdorf,tamird): We have cribbed parts of this object to deal
-	// with varying proto imports, and should technically use them here. We can
-	// get away with not cribbing more here for now though.
-	marshaler := runtime.JSONPb{}
-	decoder := marshaler.NewDecoder(resp.Body)
-	for {
-		if err := decoder.Decode(m.Interface()); err == io.EOF {
-			break
-		} else if err != nil {
-			return err
-		}
-		v := m.Elem().MapIndex(reflect.ValueOf("result"))
-		if !v.IsValid() {
-			// TODO(tschottdorf): recover actual JSON.
-			return errors.Errorf("unexpected JSON response: %+v", m)
-		}
-		callback(v.Interface().(proto.Message))
-	}
-	return nil
+	return resp.Header, jsonpb.Unmarshal(resp.Body, response)
 }

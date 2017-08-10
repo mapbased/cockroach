@@ -11,8 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Bram Gruneir (bram+code@cockroachlabs.com)
 
 package base
 
@@ -113,7 +111,7 @@ func TestNewStoreSpec(t *testing.T) {
 	}
 
 	for i, testCase := range testCases {
-		storeSpec, err := newStoreSpec(testCase.value)
+		storeSpec, err := NewStoreSpec(testCase.value)
 		if err != nil {
 			if len(testCase.expectedErr) == 0 {
 				t.Errorf("%d(%s): no expected error, got %s", i, testCase.value, err)
@@ -135,7 +133,7 @@ func TestNewStoreSpec(t *testing.T) {
 
 		// Now test String() to make sure the result can be parsed.
 		storeSpecString := storeSpec.String()
-		storeSpec2, err := newStoreSpec(storeSpecString)
+		storeSpec2, err := NewStoreSpec(storeSpecString)
 		if err != nil {
 			t.Errorf("%d(%s): error parsing String() result: %s", i, testCase.value, err)
 			continue

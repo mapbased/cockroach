@@ -11,30 +11,14 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Peter Mattis (peter@cockroachlabs.com)
 
 package parser
 
-import "testing"
-import "github.com/cockroachdb/cockroach/pkg/util/leaktest"
+import (
+	"testing"
 
-func TestReNormalizeName(t *testing.T) {
-	defer leaktest.AfterTest(t)()
-	testCases := []struct {
-		in, expected string
-	}{
-		{"HELLO", "hello"},                            // Lowercase is the norm
-		{"ıİ", "ii"},                                  // Turkish/Azeri special cases
-		{"no\u0308rmalization", "n\u00f6rmalization"}, // NFD -> NFC.
-	}
-	for _, test := range testCases {
-		s := ReNormalizeName(test.in)
-		if test.expected != s {
-			t.Errorf("%s: expected %s, but found %s", test.in, test.expected, s)
-		}
-	}
-}
+	"golang.org/x/net/context"
+)
 
 func TestNormalizeExpr(t *testing.T) {
 	defer mockNameTypes(map[string]Type{
@@ -73,7 +57,9 @@ func TestNormalizeExpr(t *testing.T) {
 		{`10 BETWEEN a AND 20`, `a <= 10`},
 		{`a BETWEEN b AND c`, `(a >= b) AND (a <= c)`},
 		{`a NOT BETWEEN b AND c`, `(a < b) OR (a > c)`},
-		{`a BETWEEN NULL AND c`, `NULL`},
+		{`a BETWEEN NULL AND c`, `NULL AND (a <= c)`},
+		{`a BETWEEN b AND NULL`, `(a >= b) AND NULL`},
+		{`a BETWEEN NULL AND NULL`, `NULL`},
 		{`NULL BETWEEN 1 AND 2`, `NULL`},
 		{`1+1`, `2`},
 		{`(1+1,2+2,3+3)`, `(2, 4, 6)`},
@@ -100,6 +86,10 @@ func TestNormalizeExpr(t *testing.T) {
 		{`a IN (3, 2, 1)`, `a IN (1, 2, 3)`},
 		{`1 IN (1, 2, a)`, `1 IN (1, 2, a)`},
 		{`NULL IN (1, 2, 3)`, `NULL`},
+		{`a IN (NULL)`, `NULL`},
+		{`a IN (NULL, NULL)`, `NULL`},
+		{`1 IN (1, NULL)`, `true`},
+		{`1 IN (2, NULL)`, `NULL`},
 		{`1 = ANY ARRAY[3, 2, 1]`, `true`},
 		{`1 < SOME ARRAY[3, 2, 1]`, `true`},
 		{`1 > SOME (ARRAY[3, 2, 1])`, `false`},
@@ -108,7 +98,7 @@ func TestNormalizeExpr(t *testing.T) {
 		{`NULL > SOME ARRAY[3, 2, 1]`, `NULL`},
 		{`NULL > ALL ARRAY[3, 2, 1]`, `NULL`},
 		{`4 > ALL ARRAY[3, 2, 1]`, `true`},
-		{`a > ALL ARRAY[3, 2, 1]`, `a > ALL {3,2,1}`},
+		{`a > ALL ARRAY[3, 2, 1]`, `a > ALL ARRAY[3,2,1]`},
 		{`3 > ALL ARRAY[3, 2, a]`, `3 > ALL ARRAY[3, 2, a]`},
 		{`3 > ANY (ARRAY[3, 2, a])`, `3 > ANY ARRAY[3, 2, a]`},
 		{`3 > SOME (((ARRAY[3, 2, a])))`, `3 > SOME ARRAY[3, 2, a]`},
@@ -150,15 +140,33 @@ func TestNormalizeExpr(t *testing.T) {
 		{`(1, 2, 3) IN ((1, 2, 3), (4, 5, 6))`, `true`},
 		{`(1, 'one')`, `(1, 'one')`},
 		{`ANNOTATE_TYPE(1, float)`, `1.0`},
-		// TODO(nvanbenschoten) introduce a shorthand type annotation notation.
-		// {`1!float`, `1.0`},
+		{`1:::float`, `1.0`},
 		{`IF((true AND a < 0), (0 + a)::decimal, 2 / (1 - 1))`, `IF(a < 0, a::DECIMAL, 2 / 0)`},
 		{`IF((true OR a < 0), (0 + a)::decimal, 2 / (1 - 1))`, `a::DECIMAL`},
 		{`COALESCE(NULL, (NULL < 3), a = 2 - 1, d)`, `COALESCE(a = 1, d)`},
 		{`COALESCE(NULL, a)`, `a`},
+		// #15454: ensure that operators are pretty-printed correctly after normalization.
+		{`(random() + 1.0)::INT`, `(random() + 1.0)::INT`},
+		{`('a' || left('b', random()::INT)) COLLATE en`, `('a' || left('b', random()::INT)) COLLATE en`},
+		{`(1.0 + random()) IS OF (INT)`, `(1.0 + random()) IS OF (INT)`},
+		// #14687: ensure that negative divisors flip the inequality when rotating.
+		{`1 < a / -2`, `a < -2`},
+		{`1 <= a / -2`, `a <= -2`},
+		{`1 > a / -2`, `a > -2`},
+		{`1 >= a / -2`, `a >= -2`},
+		{`1 = a / -2`, `a = -2`},
+		{`1 < a / 2`, `a > 2`},
+		{`1 <= a / 2`, `a >= 2`},
+		{`1 > a / 2`, `a < 2`},
+		{`1 >= a / 2`, `a <= 2`},
+		{`1 = a / 2`, `a = 2`},
+		{`a - 1 < 9223372036854775807`, `(a - 1) < 9223372036854775807`},
+		{`a - 1 < 9223372036854775806`, `a < 9223372036854775807`},
+		{`-1 + a < 9223372036854775807`, `(-1 + a) < 9223372036854775807`},
+		{`-1 + a < 9223372036854775806`, `a < 9223372036854775807`},
 	}
 	for _, d := range testData {
-		expr, err := ParseExprTraditional(d.expr)
+		expr, err := ParseExpr(d.expr)
 		if err != nil {
 			t.Fatalf("%s: %v", d.expr, err)
 		}
@@ -167,7 +175,9 @@ func TestNormalizeExpr(t *testing.T) {
 			t.Fatalf("%s: %v", d.expr, err)
 		}
 		rOrig := typedExpr.String()
-		ctx := &EvalContext{}
+		ctx := NewTestingEvalContext()
+		defer ctx.Mon.Stop(context.Background())
+		defer ctx.ActiveMemAcc.Close(context.Background())
 		r, err := ctx.NormalizeExpr(typedExpr)
 		if err != nil {
 			t.Fatalf("%s: %v", d.expr, err)

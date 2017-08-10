@@ -11,15 +11,18 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
-//
-// Author: Peter Mattis (peter@cockroachlabs.com)
 
 package sql
 
 import (
-	"github.com/cockroachdb/cockroach/pkg/sql/parser"
-	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/pkg/errors"
+	"golang.org/x/net/context"
+
+	"github.com/cockroachdb/cockroach/pkg/sql/parser"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 )
 
 type planMaker interface {
@@ -29,15 +32,17 @@ type planMaker interface {
 	// It performs as many early checks as possible on the structure of
 	// the SQL statement, including verifying permissions and type
 	// checking.  The returned plan object is not ready to execute; the
-	// planNode.expandPlan() method must be called first. See makePlan()
+	// optimizePlan() method must be called first. See makePlan()
 	// below.
 	//
 	// This method should not be used directly; instead prefer makePlan()
 	// or prepare() below.
-	newPlan(stmt parser.Statement, desiredTypes []parser.Type, autoCommit bool) (planNode, error)
+	newPlan(
+		ctx context.Context, stmt parser.Statement, desiredTypes []parser.Type,
+	) (planNode, error)
 
 	// makePlan prepares the query plan for a single SQL statement.  it
-	// calls newPlan() then expandPlan() on the result.  Execution must
+	// calls newPlan() then optimizePlan() on the result.  Execution must
 	// start by calling Start() first and then iterating using Next()
 	// and Values() in order to retrieve matching rows.
 	//
@@ -49,107 +54,56 @@ type planMaker interface {
 	// must start by calling Start() first and then iterating using
 	// Next() and Values() in order to retrieve matching
 	// rows.
-	// If autoCommit is true, the plan is allowed (but not required) to
-	// commit the transaction along with other KV operations.
-	// Note: The autoCommit parameter enables operations to enable the
-	// 1PC optimization. This is a bit hackish/preliminary at present.
-	makePlan(stmt parser.Statement, autoCommit bool) (planNode, error)
+	makePlan(ctx context.Context, stmt Statement) (planNode, error)
 
 	// prepare does the same checks as makePlan but skips building some
 	// data structures necessary for execution, based on the assumption
 	// that the plan will never be run. A planNode built with prepare()
 	// will do just enough work to check the structural validity of the
 	// SQL statement and determine types for placeholders. However it is
-	// not appropriate to call expandPlan(), Next() or Values() on a plan
+	// not appropriate to call optimizePlan(), Next() or Values() on a plan
 	// object created with prepare().
-	prepare(stmt parser.Statement) (planNode, error)
+	prepare(ctx context.Context, stmt parser.Statement) (planNode, error)
 }
 
 var _ planMaker = &planner{}
 
+// runParams is a struct containing all parameters passed to planNode.Next() and
+// planNode.Start().
+type runParams struct {
+	// context.Context for this method call.
+	ctx context.Context
+
+	// planner associated with this planNode.
+	p *planner
+}
+
 // planNode defines the interface for executing a query or portion of a query.
+//
+// The following methods apply to planNodes and contain special cases
+// for each type; they thus need to be extended when adding/removing
+// planNode instances:
+// - planMaker.newPlan()
+// - planMaker.prepare()
+// - planMaker.setNeededColumns()  (needed_columns.go)
+// - planMaker.expandPlan()        (expand_plan.go)
+// - planVisitor.visit()           (walk.go)
+// - planNodeNames                 (walk.go)
+// - planMaker.optimizeFilters()   (filter_opt.go)
+// - setLimitHint()                (limit_hint.go)
+// - collectSpans()                (plan_spans.go)
+// - planOrdering()                (plan_ordering.go)
+// - planColumns()                 (plan_columns.go)
+//
 type planNode interface {
-	// ExplainTypes reports the data types involved in the node, excluding
-	// the result column types.
-	//
-	// Available after newPlan().
-	ExplainTypes(explainFn func(elem string, desc string))
-
-	// SetLimitHint tells this node to optimize things under the assumption that
-	// we will only need the first `numRows` rows.
-	//
-	// The special value math.MaxInt64 indicates "no limit".
-	//
-	// If soft is true, this is a "soft" limit and is only a hint; the node must
-	// still be able to produce all results if requested.
-	//
-	// If soft is false, this is a "hard" limit and is a promise that Next will
-	// never be called more than numRows times.
-	//
-	// The action of calling this method triggers limit-based query plan
-	// optimizations, e.g. in selectNode.expandPlan(). The primary user
-	// is limitNode.Start() after it has fully evaluated the limit and
-	// offset expressions. EXPLAIN also does this, see
-	// explainTypesNode.expandPlan() and explainPlanNode.expandPlan().
-	//
-	// TODO(radu) Arguably, this interface has room for improvement.  A
-	// limitNode may have a hard limit locally which is larger than the
-	// soft limit propagated up by nodes downstream. We may want to
-	// improve this API to pass both the soft and hard limit.
-	//
-	// Available during/after newPlan().
-	SetLimitHint(numRows int64, soft bool)
-
-	// setNeededColumns is optionally called when the values for some of the
-	// Columns() are not required for this node. There must be one value per
-	// column. It must be called before expandPlan.
-	setNeededColumns(needed []bool)
-
-	// expandPlan finalizes type checking of placeholders and expands
-	// the query plan to its final form, including index selection and
-	// expansion of sub-queries. Returns an error if the initialization
-	// fails.  The SQL "prepare" phase, as well as the EXPLAIN
-	// statement, should merely build the plan node(s) and call
-	// expandPlan(). This is called automatically by makePlan().
-	//
-	// Available after newPlan().
-	expandPlan() error
-
-	// ExplainPlan returns a name and description and a list of child nodes.
-	//
-	// Available after expandPlan() (or makePlan).
-	ExplainPlan(verbose bool) (name, description string, children []planNode)
-
-	// Columns returns the column names and types. The length of the
-	// returned slice is guaranteed to be equal to the length of the
-	// tuple returned by Values().
-	//
-	// Stable after expandPlan() (or makePlan).
-	// Available after newPlan(), but may change on intermediate plan
-	// nodes during expandPlan() due to index selection.
-	Columns() ResultColumns
-
-	// The indexes of the columns the output is ordered by.
-	//
-	// Stable after expandPlan() (or makePlan).
-	// Available after newPlan(), but may change on intermediate plan
-	// nodes during expandPlan() due to index selection.
-	Ordering() orderingInfo
-
-	// MarkDebug puts the node in a special debugging mode, which allows
-	// DebugValues to be used. This should be called after Start() and
-	// before the first call to Next() since it may need to recurse into
-	// sub-nodes created by Start().
-	//
-	// Available after expandPlan().
-	MarkDebug(mode explainMode)
-
 	// Start begins the processing of the query/statement and starts
 	// performing side effects for data-modifying statements. Returns an
 	// error if initial processing fails.
 	//
-	// Available after expandPlan() (or makePlan).
-	Start() error
+	// Note: Don't use directly. Use startPlan() instead.
+	//
+	// Available after optimizePlan() (or makePlan).
+	Start(params runParams) error
 
 	// Next performs one unit of work, returning false if an error is
 	// encountered or if there is no more work to do. For statements
@@ -159,26 +113,19 @@ type planNode interface {
 	//
 	// Available after Start(). It is illegal to call Next() after it returns
 	// false.
-	Next() (bool, error)
+	Next(params runParams) (bool, error)
 
 	// Values returns the values at the current row. The result is only valid
 	// until the next call to Next().
 	//
 	// Available after Next().
-	Values() parser.DTuple
-
-	// DebugValues returns a set of debug values, valid until the next call to
-	// Next(). This is only available for nodes that have been put in a special
-	// "explainDebug" mode (using MarkDebug). When the output field in the
-	// result is debugValueRow, a set of values is also available through
-	// Values().
-	//
-	// Available after Next() and MarkDebug(explainDebug), see
-	// explain.go.
-	DebugValues() debugValues
+	Values() parser.Datums
 
 	// Close terminates the planNode execution and releases its resources.
-	Close()
+	// This method should be called if the node has been used in any way (any
+	// methods on it have been called) after it was constructed. Note that this
+	// doesn't imply that Start() has been necessarily called.
+	Close(ctx context.Context)
 }
 
 // planNodeFastPath is implemented by nodes that can perform all their
@@ -191,6 +138,7 @@ type planNodeFastPath interface {
 }
 
 var _ planNode = &alterTableNode{}
+var _ planNode = &copyNode{}
 var _ planNode = &createDatabaseNode{}
 var _ planNode = &createIndexNode{}
 var _ planNode = &createTableNode{}
@@ -203,42 +151,158 @@ var _ planNode = &dropIndexNode{}
 var _ planNode = &dropTableNode{}
 var _ planNode = &dropViewNode{}
 var _ planNode = &emptyNode{}
-var _ planNode = &explainDebugNode{}
-var _ planNode = &explainTraceNode{}
+var _ planNode = &explainDistSQLNode{}
+var _ planNode = &explainPlanNode{}
+var _ planNode = &traceNode{}
+var _ planNode = &filterNode{}
 var _ planNode = &groupNode{}
+var _ planNode = &hookFnNode{}
 var _ planNode = &indexJoinNode{}
 var _ planNode = &insertNode{}
 var _ planNode = &joinNode{}
 var _ planNode = &limitNode{}
+var _ planNode = &ordinalityNode{}
+var _ planNode = &testingRelocateNode{}
+var _ planNode = &renderNode{}
 var _ planNode = &scanNode{}
-var _ planNode = &selectNode{}
-var _ planNode = &selectTopNode{}
+var _ planNode = &scatterNode{}
+var _ planNode = &showRangesNode{}
+var _ planNode = &showFingerprintsNode{}
 var _ planNode = &sortNode{}
+var _ planNode = &splitNode{}
 var _ planNode = &unionNode{}
 var _ planNode = &updateNode{}
-var _ planNode = &valuesNode{}
-var _ planNode = &ordinalityNode{}
 var _ planNode = &valueGenerator{}
+var _ planNode = &valuesNode{}
+var _ planNode = &windowNode{}
+var _ planNode = &createUserNode{}
+var _ planNode = &dropUserNode{}
+
+var _ planNodeFastPath = &deleteNode{}
+var _ planNodeFastPath = &dropUserNode{}
 
 // makePlan implements the Planner interface.
-func (p *planner) makePlan(stmt parser.Statement, autoCommit bool) (planNode, error) {
-	plan, err := p.newPlan(stmt, nil, autoCommit)
+func (p *planner) makePlan(ctx context.Context, stmt Statement) (planNode, error) {
+	plan, err := p.newPlan(ctx, stmt.AST, nil)
 	if err != nil {
 		return nil, err
+	}
+	if stmt.ExpectedTypes != nil {
+		if !stmt.ExpectedTypes.TypesEqual(planColumns(plan)) {
+			return nil, pgerror.NewError(pgerror.CodeFeatureNotSupportedError,
+				"cached plan must not change result type")
+		}
 	}
 	if err := p.semaCtx.Placeholders.AssertAllAssigned(); err != nil {
 		return nil, err
 	}
-	if err := plan.expandPlan(); err != nil {
+
+	needed := allColumns(plan)
+	plan, err = p.optimizePlan(ctx, plan, needed)
+	if err != nil {
+		// Once the plan has undergone optimization, it may contain
+		// monitor-registered memory, even in case of error.
+		plan.Close(ctx)
 		return nil, err
 	}
+
+	if log.V(3) {
+		log.Infof(ctx, "statement %s compiled to:\n%s", stmt, planToString(ctx, plan))
+	}
 	return plan, nil
+}
+
+// startPlan starts the plan and all its sub-query nodes.
+func (p *planner) startPlan(ctx context.Context, plan planNode) error {
+	if err := p.startSubqueryPlans(ctx, plan); err != nil {
+		return err
+	}
+	params := runParams{
+		ctx: ctx,
+		p:   p,
+	}
+	if err := plan.Start(params); err != nil {
+		return err
+	}
+	// Trigger limit propagation through the plan and sub-queries.
+	setUnlimited(plan)
+	return nil
+}
+
+func (p *planner) maybePlanHook(ctx context.Context, stmt parser.Statement) (planNode, error) {
+	// TODO(dan): This iteration makes the plan dispatch no longer constant
+	// time. We could fix that with a map of `reflect.Type` but including
+	// reflection in such a primary codepath is unfortunate. Instead, the
+	// upcoming IR work will provide unique numeric type tags, which will
+	// elegantly solve this.
+	for _, planHook := range planHooks {
+		if fn, header, err := planHook(stmt, p); err != nil {
+			return nil, err
+		} else if fn != nil {
+			return &hookFnNode{f: fn, header: header}, nil
+		}
+	}
+	return nil, nil
+}
+
+// delegateQuery creates a plan for a given SQL query.
+// In addition, the caller can specify an additional validation
+// function (initialCheck) that will be ran and checked for errors
+// during plan optimization. This is meant for checks that cannot be
+// run during a SQL prepare operation.
+func (p *planner) delegateQuery(
+	ctx context.Context,
+	name string,
+	sql string,
+	initialCheck func(ctx context.Context) error,
+	desiredTypes []parser.Type,
+) (planNode, error) {
+	// Prepare the sub-plan.
+	stmt, err := parser.ParseOne(sql)
+	if err != nil {
+		return nil, err
+	}
+	plan, err := p.newPlan(ctx, stmt, desiredTypes)
+	if err != nil {
+		return nil, err
+	}
+
+	if initialCheck == nil {
+		return plan, nil
+	}
+
+	// To enable late calling into initialCheck, we use a delayedNode.
+	return &delayedNode{
+		name: name,
+
+		// The columns attribute cannot be a straight-up reference to the sub-plan's
+		// own columns, because they can be modified in-place by setNeededColumns().
+		columns: append(sqlbase.ResultColumns(nil), planColumns(plan)...),
+
+		// The delayed constructor's only responsibility is to call
+		// initialCheck() - the plan is already constructed.
+		constructor: func(ctx context.Context, _ *planner) (planNode, error) {
+			if err := initialCheck(ctx); err != nil {
+				return nil, err
+			}
+			return plan, nil
+		},
+
+		// Breaking with the common usage pattern of delayedNode, where
+		// the plan attribute is initially nil (the constructor creates
+		// it), here we prepopulate the field with the sub-plan created
+		// above. We do this instead of simply returning the newly created
+		// sub-plan in a constructor closure, to ensure the sub-plan is
+		// properly Close()d if the delayedNode is discarded before its
+		// constructor is called.
+		plan: plan,
+	}, nil
 }
 
 // newPlan constructs a planNode from a statement. This is used
 // recursively by the various node constructors.
 func (p *planner) newPlan(
-	stmt parser.Statement, desiredTypes []parser.Type, autoCommit bool,
+	ctx context.Context, stmt parser.Statement, desiredTypes []parser.Type,
 ) (planNode, error) {
 	tracing.AnnotateTrace()
 
@@ -248,157 +312,213 @@ func (p *planner) newPlan(
 	// where the table already exists. This will generate some false
 	// refreshes, but that's expected to be quite rare in practice.
 	if stmt.StatementType() == parser.DDL {
-		p.txn.SetSystemConfigTrigger()
+		if err := p.txn.SetSystemConfigTrigger(); err != nil {
+			return nil, errors.Wrap(err,
+				"schema change statement cannot follow a statement that has written in the same transaction")
+		}
 	}
 
-	// TODO(dan): This iteration makes the plan dispatch no longer constant
-	// time. We could fix that with a map of `reflect.Type` but including
-	// reflection in such a primary codepath is unfortunate. Instead, the
-	// upcoming IR work will provide unique numeric type tags, which will
-	// elegantly solve this.
-	for _, planHook := range planHooks {
-		if fn, header, err := planHook(p.ctx(), stmt, p.execCfg); err != nil {
-			return nil, err
-		} else if fn != nil {
-			return &hookFnNode{f: fn, header: header}, nil
-		}
+	if plan, err := p.maybePlanHook(ctx, stmt); plan != nil || err != nil {
+		return plan, err
 	}
 
 	switch n := stmt.(type) {
 	case *parser.AlterTable:
-		return p.AlterTable(n)
+		return p.AlterTable(ctx, n)
 	case *parser.BeginTransaction:
 		return p.BeginTransaction(n)
+	case *parser.CancelQuery:
+		return p.CancelQuery(ctx, n)
+	case *parser.CancelJob:
+		return p.CancelJob(ctx, n)
 	case CopyDataBlock:
-		return p.CopyData(n, autoCommit)
+		return p.CopyData(ctx, n)
 	case *parser.CopyFrom:
-		return p.CopyFrom(n, autoCommit)
+		return p.CopyFrom(ctx, n)
 	case *parser.CreateDatabase:
 		return p.CreateDatabase(n)
 	case *parser.CreateIndex:
-		return p.CreateIndex(n)
+		return p.CreateIndex(ctx, n)
 	case *parser.CreateTable:
-		return p.CreateTable(n)
+		return p.CreateTable(ctx, n)
 	case *parser.CreateUser:
-		return p.CreateUser(n)
+		return p.CreateUser(ctx, n)
 	case *parser.CreateView:
-		return p.CreateView(n)
+		return p.CreateView(ctx, n)
+	case *parser.Deallocate:
+		return p.Deallocate(ctx, n)
 	case *parser.Delete:
-		return p.Delete(n, desiredTypes, autoCommit)
+		return p.Delete(ctx, n, desiredTypes)
+	case *parser.Discard:
+		return p.Discard(ctx, n)
 	case *parser.DropDatabase:
-		return p.DropDatabase(n)
+		return p.DropDatabase(ctx, n)
 	case *parser.DropIndex:
-		return p.DropIndex(n)
+		return p.DropIndex(ctx, n)
 	case *parser.DropTable:
-		return p.DropTable(n)
+		return p.DropTable(ctx, n)
 	case *parser.DropView:
-		return p.DropView(n)
+		return p.DropView(ctx, n)
+	case *parser.DropUser:
+		return p.DropUser(ctx, n)
+	case *parser.Execute:
+		return p.Execute(ctx, n)
 	case *parser.Explain:
-		return p.Explain(n, autoCommit)
+		return p.Explain(ctx, n)
 	case *parser.Grant:
-		return p.Grant(n)
+		return p.Grant(ctx, n)
 	case *parser.Help:
-		return p.Help(n)
+		return p.Help(ctx, n)
 	case *parser.Insert:
-		return p.Insert(n, desiredTypes, autoCommit)
+		return p.Insert(ctx, n, desiredTypes)
 	case *parser.ParenSelect:
-		return p.newPlan(n.Select, desiredTypes, autoCommit)
+		return p.newPlan(ctx, n.Select, desiredTypes)
+	case *parser.PauseJob:
+		return p.PauseJob(ctx, n)
+	case *parser.TestingRelocate:
+		return p.TestingRelocate(ctx, n)
 	case *parser.RenameColumn:
-		return p.RenameColumn(n)
+		return p.RenameColumn(ctx, n)
 	case *parser.RenameDatabase:
-		return p.RenameDatabase(n)
+		return p.RenameDatabase(ctx, n)
 	case *parser.RenameIndex:
-		return p.RenameIndex(n)
+		return p.RenameIndex(ctx, n)
 	case *parser.RenameTable:
-		return p.RenameTable(n)
+		return p.RenameTable(ctx, n)
+	case *parser.ResumeJob:
+		return p.ResumeJob(ctx, n)
 	case *parser.Revoke:
-		return p.Revoke(n)
+		return p.Revoke(ctx, n)
+	case *parser.Scatter:
+		return p.Scatter(ctx, n)
 	case *parser.Select:
-		return p.Select(n, desiredTypes, autoCommit)
+		return p.Select(ctx, n, desiredTypes)
 	case *parser.SelectClause:
-		return p.SelectClause(n, nil, nil, desiredTypes, publicColumns)
+		return p.SelectClause(ctx, n, nil, nil, desiredTypes, publicColumns)
 	case *parser.Set:
-		return p.Set(n)
-	case *parser.SetTimeZone:
-		return p.SetTimeZone(n)
+		return p.Set(ctx, n)
 	case *parser.SetTransaction:
 		return p.SetTransaction(n)
 	case *parser.SetDefaultIsolation:
 		return p.SetDefaultIsolation(n)
 	case *parser.Show:
-		return p.Show(n)
+		return p.Show(ctx, n)
 	case *parser.ShowColumns:
-		return p.ShowColumns(n)
+		return p.ShowColumns(ctx, n)
 	case *parser.ShowConstraints:
-		return p.ShowConstraints(n)
+		return p.ShowConstraints(ctx, n)
 	case *parser.ShowCreateTable:
-		return p.ShowCreateTable(n)
+		return p.ShowCreateTable(ctx, n)
 	case *parser.ShowCreateView:
-		return p.ShowCreateView(n)
+		return p.ShowCreateView(ctx, n)
 	case *parser.ShowDatabases:
-		return p.ShowDatabases(n)
+		return p.ShowDatabases(ctx, n)
 	case *parser.ShowGrants:
-		return p.ShowGrants(n)
+		return p.ShowGrants(ctx, n)
 	case *parser.ShowIndex:
-		return p.ShowIndex(n)
+		return p.ShowIndex(ctx, n)
+	case *parser.ShowQueries:
+		return p.ShowQueries(ctx, n)
+	case *parser.ShowJobs:
+		return p.ShowJobs(ctx, n)
+	case *parser.ShowSessions:
+		return p.ShowSessions(ctx, n)
 	case *parser.ShowTables:
-		return p.ShowTables(n)
+		return p.ShowTables(ctx, n)
+	case *parser.ShowTrace:
+		return p.ShowTrace(ctx, n)
+	case *parser.ShowTransactionStatus:
+		return p.ShowTransactionStatus(ctx)
 	case *parser.ShowUsers:
-		return p.ShowUsers(n)
+		return p.ShowUsers(ctx, n)
+	case *parser.ShowRanges:
+		return p.ShowRanges(ctx, n)
+	case *parser.ShowFingerprints:
+		return p.ShowFingerprints(ctx, n)
 	case *parser.Split:
-		return p.Split(n)
+		return p.Split(ctx, n)
 	case *parser.Truncate:
-		return p.Truncate(n)
+		if err := p.txn.SetSystemConfigTrigger(); err != nil {
+			return nil, err
+		}
+		return p.Truncate(ctx, n)
 	case *parser.UnionClause:
-		return p.UnionClause(n, desiredTypes, autoCommit)
+		return p.UnionClause(ctx, n, desiredTypes)
 	case *parser.Update:
-		return p.Update(n, desiredTypes, autoCommit)
+		return p.Update(ctx, n, desiredTypes)
 	case *parser.ValuesClause:
-		return p.ValuesClause(n, desiredTypes)
+		return p.ValuesClause(ctx, n, desiredTypes)
 	default:
 		return nil, errors.Errorf("unknown statement type: %T", stmt)
 	}
 }
 
-func (p *planner) prepare(stmt parser.Statement) (planNode, error) {
+// prepare constructs the logical plan for the statement.  This is
+// needed both to type placeholders and to inform pgwire of the types
+// of the result columns. All statements that either support
+// placeholders or have result columns must be handled here.
+func (p *planner) prepare(ctx context.Context, stmt parser.Statement) (planNode, error) {
+	if plan, err := p.maybePlanHook(ctx, stmt); plan != nil || err != nil {
+		return plan, err
+	}
+
 	switch n := stmt.(type) {
 	case *parser.Delete:
-		return p.Delete(n, nil, false)
+		return p.Delete(ctx, n, nil)
+	case *parser.Explain:
+		return p.Explain(ctx, n)
 	case *parser.Help:
-		return p.Help(n)
+		return p.Help(ctx, n)
 	case *parser.Insert:
-		return p.Insert(n, nil, false)
+		return p.Insert(ctx, n, nil)
 	case *parser.Select:
-		return p.Select(n, nil, false)
+		return p.Select(ctx, n, nil)
 	case *parser.SelectClause:
-		return p.SelectClause(n, nil, nil, nil, publicColumns)
+		return p.SelectClause(ctx, n, nil, nil, nil, publicColumns)
 	case *parser.Show:
-		return p.Show(n)
+		return p.Show(ctx, n)
 	case *parser.ShowCreateTable:
-		return p.ShowCreateTable(n)
+		return p.ShowCreateTable(ctx, n)
 	case *parser.ShowCreateView:
-		return p.ShowCreateView(n)
+		return p.ShowCreateView(ctx, n)
 	case *parser.ShowColumns:
-		return p.ShowColumns(n)
+		return p.ShowColumns(ctx, n)
 	case *parser.ShowDatabases:
-		return p.ShowDatabases(n)
+		return p.ShowDatabases(ctx, n)
 	case *parser.ShowGrants:
-		return p.ShowGrants(n)
+		return p.ShowGrants(ctx, n)
 	case *parser.ShowIndex:
-		return p.ShowIndex(n)
+		return p.ShowIndex(ctx, n)
 	case *parser.ShowConstraints:
-		return p.ShowConstraints(n)
+		return p.ShowConstraints(ctx, n)
+	case *parser.ShowQueries:
+		return p.ShowQueries(ctx, n)
+	case *parser.ShowJobs:
+		return p.ShowJobs(ctx, n)
+	case *parser.ShowSessions:
+		return p.ShowSessions(ctx, n)
 	case *parser.ShowTables:
-		return p.ShowTables(n)
+		return p.ShowTables(ctx, n)
+	case *parser.ShowTrace:
+		return p.ShowTrace(ctx, n)
 	case *parser.ShowUsers:
-		return p.ShowUsers(n)
+		return p.ShowUsers(ctx, n)
+	case *parser.ShowTransactionStatus:
+		return p.ShowTransactionStatus(ctx)
+	case *parser.ShowRanges:
+		return p.ShowRanges(ctx, n)
 	case *parser.Split:
-		return p.Split(n)
+		return p.Split(ctx, n)
+	case *parser.TestingRelocate:
+		return p.TestingRelocate(ctx, n)
+	case *parser.Scatter:
+		return p.Scatter(ctx, n)
 	case *parser.Update:
-		return p.Update(n, nil, false)
+		return p.Update(ctx, n, nil)
 	default:
-		// Other statement types do not support placeholders so there is no need
-		// for any special handling here.
+		// Other statement types do not have result columns and do not
+		// support placeholders so there is no need for any special
+		// handling here.
 		return nil, nil
 	}
 }
